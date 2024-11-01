@@ -148,9 +148,6 @@ type State struct {
 
 	// offline state sync height indicating to which height the node synced offline
 	offlineStateSyncHeight int64
-
-	// run tasks asynchronously to avoid blocking block executor, currently mainly for firing tx/block events.
-	taskRunner *TaskRunner
 }
 
 // StateOption sets an optional parameter on the State.
@@ -166,8 +163,7 @@ func NewState(
 	evpool evidencePool,
 	options ...StateOption,
 ) *State {
-	taskRunner := StartTaskRunner(taskQueueSize)
-	blockExec.SetTaskRunner(taskRunner.RunTask)
+	blockExec.SetTaskRunner(StartTaskRunner(taskQueueSize))
 	cs := &State{
 		config:           config,
 		blockExec:        blockExec,
@@ -183,7 +179,6 @@ func NewState(
 		evpool:           evpool,
 		evsw:             cmtevents.NewEventSwitch(),
 		metrics:          NopMetrics(),
-		taskRunner:       taskRunner,
 	}
 	for _, option := range options {
 		option(cs)
@@ -447,9 +442,6 @@ func (cs *State) OnStop() {
 		cs.Logger.Error("failed trying to stop timeoutTicket", "error", err)
 	}
 	// WAL is stopped in receiveRoutine.
-
-	// Stop the task runner
-	cs.taskRunner.StopAndWait()
 }
 
 // Wait waits for the the main routine to return.

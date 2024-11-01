@@ -1,31 +1,14 @@
 package consensus
 
-import "sync"
-
-type TaskRunner struct {
-	wg     sync.WaitGroup
-	taskCh chan func()
-}
-
-func StartTaskRunner(buf int) *TaskRunner {
-	tr := &TaskRunner{
-		taskCh: make(chan func(), buf),
-	}
-	tr.wg.Add(1)
+// StartTaskRunner spawn a single goroutine to run tasks in FIFO order.
+func StartTaskRunner(buf int) func(func()) {
+	taskCh := make(chan func(), buf)
 	go func() {
-		defer tr.wg.Done()
-		for f := range tr.taskCh {
+		for f := range taskCh {
 			f()
 		}
 	}()
-	return tr
-}
-
-func (tr *TaskRunner) StopAndWait() {
-	close(tr.taskCh)
-	tr.wg.Wait()
-}
-
-func (tr *TaskRunner) RunTask(f func()) {
-	tr.taskCh <- f
+	return func(f func()) {
+		taskCh <- f
+	}
 }
