@@ -225,6 +225,22 @@ func (mem *CListMempool) CheckTx(
 	cb func(*abci.ResponseCheckTx),
 	txInfo TxInfo,
 ) error {
+	if err := mem.addTxToCache(tx, txInfo); err != nil {
+		return err
+	}
+
+	reqRes, err := mem.proxyAppConn.CheckTxAsync(context.TODO(), &abci.RequestCheckTx{Tx: tx})
+	if err != nil {
+		panic(fmt.Errorf("CheckTx request for tx %s failed: %w", log.NewLazySprintf("%v", tx.Hash()), err))
+	}
+	reqRes.SetCallback(mem.reqResCb(tx, txInfo, cb))
+	return nil
+}
+
+func (mem *CListMempool) addTxToCache(
+	tx types.Tx,
+	txInfo TxInfo,
+) error {
 	mem.updateMtx.RLock()
 	// use defer to unlock mutex because application (*local client*) might panic
 	defer mem.updateMtx.RUnlock()
@@ -267,12 +283,6 @@ func (mem *CListMempool) CheckTx(
 		}
 		return ErrTxInCache
 	}
-
-	reqRes, err := mem.proxyAppConn.CheckTxAsync(context.TODO(), &abci.RequestCheckTx{Tx: tx})
-	if err != nil {
-		panic(fmt.Errorf("CheckTx request for tx %s failed: %w", log.NewLazySprintf("%v", tx.Hash()), err))
-	}
-	reqRes.SetCallback(mem.reqResCb(tx, txInfo, cb))
 
 	return nil
 }
