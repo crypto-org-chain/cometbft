@@ -163,7 +163,7 @@ func NewState(
 	evpool evidencePool,
 	options ...StateOption,
 ) *State {
-	blockExec.SetTaskRunner(StartTaskRunner(taskQueueSize))
+	blockExec.SetTaskRunner(spawnTaskRunner(taskQueueSize))
 	cs := &State{
 		config:           config,
 		blockExec:        blockExec,
@@ -2588,4 +2588,17 @@ func repairWalFile(src, dst string) error {
 	}
 
 	return nil
+}
+
+// spawnTaskRunner spawn a single goroutine to run tasks in FIFO order.
+func spawnTaskRunner(buf int) func(func()) {
+	taskCh := make(chan func(), buf)
+	go func() {
+		for f := range taskCh {
+			f()
+		}
+	}()
+	return func(f func()) {
+		taskCh <- f
+	}
 }
