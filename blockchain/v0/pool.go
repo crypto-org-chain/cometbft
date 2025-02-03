@@ -293,6 +293,11 @@ func (pool *BlockPool) SetPeerRange(peerID p2p.ID, base int64, height int64) {
 
 	peer := pool.peers[peerID]
 	if peer != nil {
+		// Check if peer is lowering its height. This is not allowed.
+		if height < peer.height {
+			pool.RemovePeer(peerID)
+			return
+		}
 		peer.base = base
 		peer.height = height
 	} else {
