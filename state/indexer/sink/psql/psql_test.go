@@ -39,7 +39,6 @@ var (
 const (
 	user     = "postgres"
 	password = "secret"
-	port     = "5432"
 	dsn      = "postgres://%s:%s@localhost:%s/%s?sslmode=disable"
 	dbName   = "postgres"
 	chainID  = "test-chainID"
@@ -66,7 +65,6 @@ func TestMain(m *testing.M) {
 			"POSTGRES_DB=" + dbName,
 			"listen_addresses = '*'",
 		},
-		ExposedPorts: []string{port},
 	}, func(config *docker.HostConfig) {
 		// set AutoRemove to true so that stopped container goes away by itself
 		config.AutoRemove = true
@@ -88,7 +86,7 @@ func TestMain(m *testing.M) {
 
 	// Connect to the database, clear any leftover data, and install the
 	// indexing schema.
-	conn := fmt.Sprintf(dsn, user, password, resource.GetPort(port+"/tcp"), dbName)
+	conn := fmt.Sprintf(dsn, user, password, resource.GetPort("5432/tcp"), dbName)
 	var db *sql.DB
 
 	if err := pool.Retry(func() error {
