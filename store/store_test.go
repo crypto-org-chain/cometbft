@@ -449,9 +449,9 @@ func TestLoadBlockExtendedCommit(t *testing.T) {
 			state, bs, cleanup := makeStateAndBlockStore()
 			defer cleanup()
 			h := bs.Height() + 1
-			block, err :=  state.MakeBlock(h, test.MakeNTxs(h, 10), new(types.Commit), nil, state.Validators.GetProposer().Address)
+			block, err := state.MakeBlock(h, test.MakeNTxs(h, 10), new(types.Commit), nil, state.Validators.GetProposer().Address)
 			require.NoError(t, err)
-			seenCommit := makeTestExtCommit(block.Header.Height, cmttime.Now())
+			seenCommit := makeTestExtCommit(block.Height, cmttime.Now())
 			ps, err := block.MakePartSet(types.BlockPartSizeBytes)
 			require.NoError(t, err)
 			if testCase.saveExtended {
@@ -720,7 +720,10 @@ func TestBlockFetchAtHeight(t *testing.T) {
 	defer cleanup()
 	require.Equal(t, bs.Height(), int64(0), "initially the height should be zero")
 	block, err := state.MakeBlock(bs.Height()+1, nil, new(types.Commit), nil, state.Validators.GetProposer().Address)
+<<<<<<< HEAD
 	require.NoError(t, err)
+=======
+>>>>>>> f27ef5176 (patch)
 
 	partSet, err := block.MakePartSet(types.BlockPartSizeBytes)
 	require.NoError(t, err)
