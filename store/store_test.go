@@ -720,10 +720,7 @@ func TestBlockFetchAtHeight(t *testing.T) {
 	defer cleanup()
 	require.Equal(t, bs.Height(), int64(0), "initially the height should be zero")
 	block, err := state.MakeBlock(bs.Height()+1, nil, new(types.Commit), nil, state.Validators.GetProposer().Address)
-<<<<<<< HEAD
 	require.NoError(t, err)
-=======
->>>>>>> f27ef5176 (patch)
 
 	partSet, err := block.MakePartSet(types.BlockPartSizeBytes)
 	require.NoError(t, err)
