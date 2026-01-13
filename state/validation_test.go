@@ -195,11 +195,7 @@ func TestValidateBlockCommit(t *testing.T) {
 			/*
 				#2589: test len(block.LastCommit.Signatures) == state.LastValidators.Size()
 			*/
-<<<<<<< HEAD
 			_, err = makeBlock(state, height, wrongSigsCommit)
-=======
-			block, err = makeBlock(state, height, wrongSigsCommit)
->>>>>>> 8f97878ba (add test and fix a test)
 			require.Error(t, err)
 			require.ErrorContains(t, err, "error making block")
 		}
