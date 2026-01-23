@@ -2,15 +2,15 @@
 name: Check documentation ToC
 on:
   pull_request:
-    push:
-      branches:
-        - v0.38.x
+  push:
+    branches:
+      - v0.38.x
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: technote-space/get-diff-action@v6
         with:
           PATTERNS: |
