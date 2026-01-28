@@ -1,5 +1,127 @@
 # CHANGELOG
 
+## UNRELEASED
+
+### DEPENDENCIES
+
+### BUG FIXES
+
+### IMPROVEMENTS
+- `[statesync]` Add configurable `max-snapshot-chunks` parameter to validate max amount of chunks in a `SnapshotResponse`.
+  ([\#5548](https://github.com/cometbft/cometbft/pull/5548))
+
+### FEATURES
+
+### BUG-FIXES
+
+### STATE-BREAKING
+
+### API-BREAKING
+
+## v0.38.19
+
+*October 14, 2025*
+
+This release fixes two security issues, including ([ASA-2025-003](https://github.com/cometbft/cometbft/security/advisories/GHSA-hrhf-2vcr-ghch)).
+Users are encouraged to upgrade as soon as possible.
+
+Additionally included is a bug fix to properly prune extended commits (with
+vote extensions).
+
+### BUG-FIXES
+
+- `[consensus]` Reject oversized proposals
+  ([\#5324](https://github.com/cometbft/cometbft/pull/5324))
+- `[store]` Prune extended commits properly
+  ([5275](https://github.com/cometbft/cometbft/issues/5275))
+- `[bits]` Validate BitArray mismatched Bits and Elems length
+  ([ASA-2025-003](https://github.com/cometbft/cometbft/security/advisories/GHSA-hrhf-2vcr-ghch))
+
+## v0.38.18
+
+*July 3, 2025*
+
+Adds precommit metrics and reindex CLI command.
+
+### IMPROVEMENTS
+
+- Adds metrics that emit precommit data; precommit quorum delay from proposal, and precommit vote count and stake weight within timeout commit period.
+  ([\#5251](https://github.com/cometbft/cometbft/issues/5251))
+
+## v0.38.17
+
+*February 3, 2025*
+
+This release fixes two security issues (ASA-2025-001, ASA-2025-002). Users are
+encouraged to upgrade as soon as possible.
+
+### BUG FIXES
+
+- `[blocksync]` Ban peer if it reports height lower than what was previously reported
+  ([ASA-2025-001](https://github.com/cometbft/cometbft/security/advisories/GHSA-22qq-3xwm-r5x4))
+- `[types]` Check that `Part.Index` equals `Part.Proof.Index`
+  ([ASA-2025-001](https://github.com/cometbft/cometbft/security/advisories/GHSA-r3r4-g7hq-pq4f))
+
+### DEPENDENCIES
+
+- `[go/runtime]` Bump minimum Go version to 1.22.11
+  ([\#4891](https://github.com/cometbft/cometbft/pull/4891))
+
+## v0.38.16
+
+*December 20 2024*
+
+This release:
+- fixes a bug that caused a node produce errors caused by the sending of next PEX requests too soon.
+As a consequence of this incorrect behavior a node would be marked as BAD.
+- Adds a proper description of `ExtendedVoteInfo` and `VoteInfo` in the spec.
+
+### BUG FIXES
+
+- `[mocks]` Mockery `v2.49.0` broke the mocks. We had to add a `.mockery.yaml` to
+properly handle this change.
+  ([\#4521](https://github.com/cometbft/cometbft/pull/4521))
+
+## v0.38.15
+
+*November 6, 2024*
+
+This release supersedes [`v0.38.14`](#v03814), which mistakenly updated the Go version to
+`1.23`, introducing an unintended breaking change. It sets the Go version back
+to `1.22.7` by reverting [\#4297](https://github.com/cometbft/cometbft/pull/4297).
+
+The release includes the bug fixes, performance improvements, and importantly,
+the fix for the security vulnerability in the vote extensions (VE) validation
+logic that were part of `v0.38.14`. For more details, please refer to [ASA-2024-011](https://github.com/cometbft/cometbft/security/advisories/GHSA-p7mv-53f2-4cwj).
+
+## v0.38.14
+
+*November 6, 2024*
+
+This release fixes a security vulnerability in the vote extensions (VE)
+validation logic. For more details, please refer to
+[ASA-2024-011](https://github.com/cometbft/cometbft/security/advisories/GHSA-p7mv-53f2-4cwj).
+
+We recommend upgrading ASAP if you’re using vote extensions (VE).
+
+### BUG FIXES
+
+- `[consensus]` Do not panic if the validator index of a `Vote` message is out
+  of bounds, when vote extensions are enabled
+  ([\#ABC-0021](https://github.com/cometbft/cometbft/security/advisories/GHSA-p7mv-53f2-4cwj))
+
+### DEPENDENCIES
+
+- Bump cometbft-db version to v0.15.0
+  ([\#4297](https://github.com/cometbft/cometbft/pull/4297))
+- `[go/runtime]` Bump Go version to 1.23
+  ([\#4297](https://github.com/cometbft/cometbft/pull/4297))
+
+### IMPROVEMENTS
+
+- `[p2p]` fix exponential backoff logic to increase reconnect retries close to 24 hours
+ ([\#3519](https://github.com/cometbft/cometbft/issues/3519))
+
 ## v0.38.13
 
 *October 24, 2024*
