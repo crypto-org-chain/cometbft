@@ -67,17 +67,22 @@ func TestMain(m *testing.M) {
 			"listen_addresses = '*'",
 		},
 		ExposedPorts: []string{port},
+		// Bind container port to a random available host port to avoid
+		// "address already in use" when port 5432 is taken by a local
+		// PostgreSQL or a parallel test run.
+		PortBindings: map[docker.Port][]docker.PortBinding{
+			docker.Port(port + "/tcp"): {{HostPort: ""}},
+		},
 	}, func(config *docker.HostConfig) {
 		// set AutoRemove to true so that stopped container goes away by itself
 		config.AutoRemove = true
 		config.RestartPolicy = docker.RestartPolicy{
 			Name: "no",
 		}
-		// Bind container port to a random available host port to avoid
-		// conflicts with a local PostgreSQL or parallel test runs.
-		config.PortBindings = map[docker.Port][]docker.PortBinding{
-			docker.Port(port + "/tcp"): {{HostPort: "0"}},
-		}
+		// Disable PublishAllPorts so Docker only uses our explicit
+		// random-port binding above instead of also trying to publish
+		// all exposed ports (which can race on CI).
+		config.PublishAllPorts = false
 	})
 	if err != nil {
 		log.Fatalf("Starting docker pool: %v", err)
