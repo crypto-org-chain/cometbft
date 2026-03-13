@@ -12,10 +12,14 @@ type ClientCreator struct {
 	mock.Mock
 }
 
-// NewABCIConsensusClient provides a mock function with given fields:
+// NewABCIConsensusClient provides a mock function with no fields
 func (_m *ClientCreator) NewABCIConsensusClient() (abcicli.Client, error) {
 	ret := _m.Called()
 
+	if len(ret) == 0 {
+		panic("no return value specified for NewABCIConsensusClient")
+	}
+
 	var r0 abcicli.Client
 	var r1 error
 	if rf, ok := ret.Get(0).(func() (abcicli.Client, error)); ok {
@@ -38,10 +42,14 @@ func (_m *ClientCreator) NewABCIConsensusClient() (abcicli.Client, error) {
 	return r0, r1
 }
 
-// NewABCIMempoolClient provides a mock function with given fields:
+// NewABCIMempoolClient provides a mock function with no fields
 func (_m *ClientCreator) NewABCIMempoolClient() (abcicli.Client, error) {
 	ret := _m.Called()
 
+	if len(ret) == 0 {
+		panic("no return value specified for NewABCIMempoolClient")
+	}
+
 	var r0 abcicli.Client
 	var r1 error
 	if rf, ok := ret.Get(0).(func() (abcicli.Client, error)); ok {
@@ -64,10 +72,14 @@ func (_m *ClientCreator) NewABCIMempoolClient() (abcicli.Client, error) {
 	return r0, r1
 }
 
-// NewABCIQueryClient provides a mock function with given fields:
+// NewABCIQueryClient provides a mock function with no fields
 func (_m *ClientCreator) NewABCIQueryClient() (abcicli.Client, error) {
 	ret := _m.Called()
 
+	if len(ret) == 0 {
+		panic("no return value specified for NewABCIQueryClient")
+	}
+
 	var r0 abcicli.Client
 	var r1 error
 	if rf, ok := ret.Get(0).(func() (abcicli.Client, error)); ok {
@@ -90,12 +102,12 @@ func (_m *ClientCreator) NewABCIQueryClient() (abcicli.Client, error) {
 	return r0, r1
 }
 
-// NewABCISnapshotClient provides a mock function with given fields:
+// NewABCISnapshotClient provides a mock function with no fields
 func (_m *ClientCreator) NewABCISnapshotClient() (abcicli.Client, error) {
 	ret := _m.Called()
 
 	if len(ret) == 0 {
-		panic("no return value specified for NewABCIClient")
+		panic("no return value specified for NewABCISnapshotClient")
 	}
 
 	var r0 abcicli.Client
