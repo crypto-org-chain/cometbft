@@ -832,6 +832,10 @@ func (cs *State) receiveRoutine(maxSteps int) {
 			cs.handleTxsAvailable()
 
 		case mi = <-cs.peerMsgQueue:
+			// Peer messages use buffered Write (no fsync). Peer messages are not
+			// self-signed, so losing them on crash just causes a round timeout.
+			// Self-generated signed messages arrive via internalMsgQueue and get
+			// WriteSync for double-signing prevention.
 			if err := cs.wal.Write(mi); err != nil {
 				cs.Logger.Error("failed writing to WAL", "err", err)
 			}
@@ -840,12 +844,30 @@ func (cs *State) receiveRoutine(maxSteps int) {
 			cs.handleMsg(mi)
 
 		case mi = <-cs.internalMsgQueue:
-			err := cs.wal.WriteSync(mi) // NOTE: fsync
-			if err != nil {
-				panic(fmt.Sprintf(
-					"failed to write %v msg to consensus WAL due to %v; check your file system and restart the node",
-					mi, err,
-				))
+			switch mi.Msg.(type) {
+			case *VoteMessage, *ProposalMessage:
+				// Safety-critical: signed messages must be fsynced before
+				// processing to prevent double-signing on crash recovery.
+				if err := cs.wal.WriteSync(mi); err != nil {
+					panic(fmt.Sprintf(
+						"failed to write %v msg to consensus WAL due to %v; check your file system and restart the node",
+						mi, err,
+					))
+				}
+			case *BlockPartMessage:
+				// Unsigned messages: write to WAL buffer without fsync.
+				// Flushed by periodic 2s tick, next WriteSync, or next
+				// pre-sign FlushAndSync.
+				if err := cs.wal.Write(mi); err != nil {
+					panic(fmt.Sprintf(
+						"failed to write %v msg to consensus WAL due to %v; check your file system and restart the node",
+						mi, err,
+					))
+				}
+			default:
+				// SAFETY: If you add a new message type that carries a validator's
+				// signature, it MUST be added to the WriteSync case above.
+				panic(fmt.Sprintf("unexpected internal message type: %T", mi.Msg))
 			}
 
 			if _, ok := mi.Msg.(*VoteMessage); ok {
