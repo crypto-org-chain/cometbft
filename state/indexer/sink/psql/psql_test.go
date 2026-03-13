@@ -73,6 +73,11 @@ func TestMain(m *testing.M) {
 		config.RestartPolicy = docker.RestartPolicy{
 			Name: "no",
 		}
+		// Bind container port to a random available host port to avoid
+		// conflicts with a local PostgreSQL or parallel test runs.
+		config.PortBindings = map[docker.Port][]docker.PortBinding{
+			docker.Port(port + "/tcp"): {{HostPort: "0"}},
+		}
 	})
 	if err != nil {
 		log.Fatalf("Starting docker pool: %v", err)

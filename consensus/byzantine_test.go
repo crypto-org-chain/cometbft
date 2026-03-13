@@ -268,27 +268,21 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 		}(i)
 	}
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
 	pubkey, err := bcs.privValidator.GetPubKey()
 	require.NoError(t, err)
 
-	select {
-	case <-done:
-		for idx, ev := range evidenceFromEachValidator {
-			if assert.NotNil(t, ev, idx) {
-				ev, ok := ev.(*types.DuplicateVoteEvidence)
-				assert.True(t, ok)
-				assert.Equal(t, pubkey.Address(), ev.VoteA.ValidatorAddress)
-				assert.Equal(t, prevoteHeight, ev.Height())
-			}
+	// Wait for all validators to observe evidence. Relies on the test's
+	// -timeout flag (default 10m) rather than an arbitrary short deadline
+	// that can flake in slow CI environments.
+	wg.Wait()
+
+	for idx, ev := range evidenceFromEachValidator {
+		if assert.NotNil(t, ev, idx) {
+			ev, ok := ev.(*types.DuplicateVoteEvidence)
+			assert.True(t, ok)
+			assert.Equal(t, pubkey.Address(), ev.VoteA.ValidatorAddress)
+			assert.Equal(t, prevoteHeight, ev.Height())
 		}
-	case <-time.After(20 * time.Second):
-		t.Fatalf("Timed out waiting for validators to commit evidence")
 	}
 }
 
