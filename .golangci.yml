@@ -73,6 +73,8 @@ linters-settings:
           - github.com/stretchr/testify/require
           - github.com/syndtr/goleveldb
           - github.com/decred/dcrd/dcrec/secp256k1/v4
+          - golang.org/x/crypto
+          - golang.org/x/net
       test:
         files:
           - "$test"
@@ -94,6 +96,8 @@ linters-settings:
           - github.com/spf13
           - github.com/stretchr/testify
           - github.com/decred/dcrd/dcrec/secp256k1/v4
+          - golang.org/x/crypto
+          - google.golang.org/protobuf
 
   revive:
     enable-all-rules: true
