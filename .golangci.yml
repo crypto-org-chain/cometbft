@@ -75,6 +75,10 @@ linters-settings:
           - github.com/decred/dcrd/dcrec/secp256k1/v4
           - golang.org/x/crypto
           - golang.org/x/net
+          - golang.org/x/sync
+          - gonum.org/v1/gonum
+          - google.golang.org/grpc
+          - google.golang.org/protobuf
       test:
         files:
           - "$test"
@@ -97,6 +101,8 @@ linters-settings:
           - github.com/stretchr/testify
           - github.com/decred/dcrd/dcrec/secp256k1/v4
           - golang.org/x/crypto
+          - golang.org/x/net
+          - google.golang.org/grpc
           - google.golang.org/protobuf
 
   revive:
