@@ -126,8 +126,8 @@ type State struct {
 	// closed when we finish shutting down
 	done chan struct{}
 
-	// synchronous pubsub between consensus state and reactor.
-	// state only emits EventNewRoundStep and EventVote
+	// synchronous pubsub between consensus state and reactor. state emits
+	// EventNewRoundStep, EventVote, and EventNewConsensusParams
 	evsw cmtevents.EventSwitch
 
 	// for reporting metrics
@@ -749,8 +749,9 @@ func (cs *State) updateToState(state sm.State) {
 
 	cs.state = state
 
-	// Finally, broadcast RoundState
+	// Finally fire events, broadcast RoundState and ConsensusParams
 	cs.newStep()
+	cs.newConsensusParams()
 }
 
 func (cs *State) newStep() {
@@ -769,6 +770,12 @@ func (cs *State) newStep() {
 
 		cs.evsw.FireEvent(types.EventNewRoundStep, cs.RoundState)
 	}
+}
+
+// newConsensusParams notifies event switch subscribers of the current consensus
+// params
+func (cs *State) newConsensusParams() {
+	cs.evsw.FireEvent(types.EventNewConsensusParams, cs.state.ConsensusParams)
 }
 
 //-----------------------------------------
@@ -839,12 +846,21 @@ func (cs *State) receiveRoutine(maxSteps int) {
 		case mi = <-cs.internalMsgQueue:
 			cs.Logger.Debug("Received message from cs.internalMsgQueue", "peer_id", mi.PeerID)
 
-			err := cs.wal.WriteSync(mi) // NOTE: fsync
-			if err != nil {
-				panic(fmt.Sprintf(
-					"failed to write %v msg to consensus WAL due to %v; check your file system and restart the node",
-					mi, err,
-				))
+			writeWal := true
+
+			// avoid writing WAL for ingested verified blocks coming from blocksync
+			if _, ok := mi.Msg.(*ingestVerifiedBlockRequest); ok {
+				writeWal = false
+			}
+
+			if writeWal {
+				// NOTE: fsync
+				if err := cs.wal.WriteSync(mi); err != nil {
+					panic(fmt.Errorf(
+						"failed to write %v msg to consensus WAL; check your file system and restart the node: %w",
+						mi, err,
+					))
+				}
 			}
 
 			if _, ok := mi.Msg.(*VoteMessage); ok {
@@ -952,6 +968,8 @@ func (cs *State) handleMsg(mi msgInfo) {
 		// the peer is sending us CatchupCommit precommits.
 		// We could make note of this and help filter in broadcastHasVoteMessage().
 
+	case *ingestVerifiedBlockRequest:
+		cs.handleIngestVerifiedBlockRequest(msg)
 	default:
 		cs.Logger.Error("unknown msg type", "type", fmt.Sprintf("%T", msg))
 		return
@@ -1099,6 +1117,10 @@ func (cs *State) enterNewRound(height int64, round int32) {
 		"previous", log.NewLazySprintf("%v/%v/%v", prevHeight, prevRound, prevStep),
 		"proposer", propAddress,
 	)
+
+	if round > 0 && !cs.replayMode {
+		cs.metrics.MarkRoundIncremented(prevStep)
+	}
 
 	cs.Votes.SetRound(cmtmath.SafeAddInt32(round, 1)) // also track next round (round+1) to allow round-skipping
 	cs.TriggeredTimeoutPrecommit = false

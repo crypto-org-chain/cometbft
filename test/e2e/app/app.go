@@ -133,8 +133,11 @@ func NewApplication(cfg *Config) (*Application, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	logger := log.NewTMLogger(log.NewSyncWriter(os.Stdout))
+
 	return &Application{
-		logger:    log.NewTMLogger(log.NewSyncWriter(os.Stdout)),
+		logger:    logger,
 		state:     state,
 		snapshots: snapshots,
 		cfg:       cfg,
@@ -390,6 +393,8 @@ func (app *Application) ApplySnapshotChunk(_ context.Context, req *abci.RequestA
 //
 // The special vote extension-generated transaction must fit within an empty block
 // and takes precedence over all other transactions coming from the mempool.
+//
+// It also simulates app-side mempool block-building behavior by reaping transactions from the mempool (if enabled)
 func (app *Application) PrepareProposal(
 	_ context.Context, req *abci.RequestPrepareProposal,
 ) (*abci.ResponsePrepareProposal, error) {

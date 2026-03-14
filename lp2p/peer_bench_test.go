@@ -80,22 +80,18 @@ func testBenchLP2PUnidirectional(t *testing.T, cfg lp2pUnidirectionalConfig) {
 	// Given 2 hosts
 	ports := utils.GetFreePorts(t, 2)
 
-	host1 := makeTestHost(t, ports[0], []config.LibP2PBootstrapPeer{}, false)
-	host2 := makeTestHost(t, ports[1], []config.LibP2PBootstrapPeer{
+	host1 := makeTestHost(t, ports[0])
+	host2 := makeTestHost(t, ports[1], withBootstrapPeers([]config.LibP2PBootstrapPeer{
 		{
 			Host: fmt.Sprintf("127.0.0.1:%d", ports[0]),
 			ID:   host1.ID().String(),
 		},
-	}, false)
+	}))
 
 	t.Logf("host1: %+v", host1.AddrInfo().String())
 	t.Logf("host2: %+v", host2.AddrInfo().String())
 
 	connectBootstrapPeers(t, ctx, host2, host2.BootstrapPeers())
-	t.Cleanup(func() {
-		host2.Close()
-		host1.Close()
-	})
 
 	type record struct {
 		payload     []byte
