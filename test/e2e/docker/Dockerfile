@@ -9,6 +9,10 @@ RUN apt-get -qq update -y && apt-get -qq upgrade -y >/dev/null
 ENV COMETBFT_BUILD_OPTIONS badgerdb,boltdb,cleveldb,rocksdb
 WORKDIR /src/cometbft
 
+# Allow Go to download the toolchain version required by go.mod (1.24.13),
+# since the base image ships Go 1.23.1 with GOTOOLCHAIN=local.
+ENV GOTOOLCHAIN=auto
+
 # Fetch dependencies separately (for layer caching)
 COPY go.mod go.sum ./
 RUN go mod download
