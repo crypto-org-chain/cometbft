@@ -17,7 +17,8 @@ require (
 	github.com/gorilla/websocket v1.5.3
 	github.com/informalsystems/tm-load-test v1.3.0
 	github.com/lib/pq v1.12.0
-	github.com/minio/highwayhash v1.0.3
+	github.com/minio/highwayhash v1.0.4
+	github.com/oasisprotocol/curve25519-voi v0.0.0-20220708102147-0a8a51822cae
 	github.com/ory/dockertest v3.3.5+incompatible
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.20.5
@@ -45,7 +46,6 @@ require (
 	github.com/gofrs/uuid v4.4.0+incompatible
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
-	github.com/oasisprotocol/curve25519-voi v0.0.0-20220708102147-0a8a51822cae
 	golang.org/x/sync v0.8.0
 	gonum.org/v1/gonum v0.15.1
 	google.golang.org/protobuf v1.35.1
