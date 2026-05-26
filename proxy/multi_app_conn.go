@@ -181,7 +181,22 @@ func (app *multiAppConn) stopAllClients() {
 }
 
 func (app *multiAppConn) abciClientFor(conn string) (abcicli.Client, error) {
-	c, err := app.clientCreator.NewABCIClient()
+	var (
+		c   abcicli.Client
+		err error
+	)
+	switch conn {
+	case connConsensus:
+		c, err = app.clientCreator.NewABCIConsensusClient()
+	case connMempool:
+		c, err = app.clientCreator.NewABCIMempoolClient()
+	case connQuery:
+		c, err = app.clientCreator.NewABCIQueryClient()
+	case connSnapshot:
+		c, err = app.clientCreator.NewABCISnapshotClient()
+	default:
+		return nil, fmt.Errorf("unknown ABCI connection type %q", conn)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("error creating ABCI client (%s connection): %w", conn, err)
 	}
