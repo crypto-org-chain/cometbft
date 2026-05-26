@@ -13,6 +13,8 @@
 
 - `[consensus]` perf(consensus): dispatch fireEvents off the consensus thread via a buffered task runner
   ([\#45](https://github.com/crypto-org-chain/cometbft/pull/45))
+- `[abci]` perf(abci): add lock-free `unsyncLocalClient` and split `ClientCreator` into per-conn methods
+  ([\#46](https://github.com/crypto-org-chain/cometbft/pull/46))
 - `[blocksync]` validate blocksync response sender and signature count
   ([\#5860](https://github.com/cometbft/cometbft/pull/5860))
 
