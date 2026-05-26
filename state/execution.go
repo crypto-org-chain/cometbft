@@ -50,6 +50,10 @@ type BlockExecutor struct {
 
 	// blockTimeTolerance is the maximum allowed difference between proposed block time and wall clock.
 	blockTimeTolerance time.Duration
+
+	// asyncRunner, if set, dispatches non-critical post-commit work
+	// (e.g. fireEvents) off the consensus thread.
+	asyncRunner func(func())
 }
 
 type BlockExecutorOption func(executor *BlockExecutor)
@@ -103,6 +107,13 @@ func (blockExec *BlockExecutor) Store() Store {
 // If not called, it defaults to types.NopEventBus.
 func (blockExec *BlockExecutor) SetEventBus(eventBus types.BlockEventPublisher) {
 	blockExec.eventBus = eventBus
+}
+
+// SetTaskRunner installs a runner that executes non-critical post-commit
+// work (currently fireEvents) off the consensus thread. Must be called
+// before Start; passing nil reverts to synchronous execution.
+func (blockExec *BlockExecutor) SetTaskRunner(runner func(func())) {
+	blockExec.asyncRunner = runner
 }
 
 // CreateProposalBlock calls state.MakeBlock with evidence from the evpool
@@ -374,7 +385,14 @@ func (blockExec *BlockExecutor) applyBlock(state State, blockID types.BlockID, b
 
 	// Events are fired after everything else.
 	// NOTE: if we crash between Commit and Save, events wont be fired during replay
-	fireEvents(blockExec.logger, blockExec.eventBus, block, blockID, abciResponse, validatorUpdates)
+	fire := func() {
+		fireEvents(blockExec.logger, blockExec.eventBus, block, blockID, abciResponse, validatorUpdates)
+	}
+	if blockExec.asyncRunner != nil {
+		blockExec.asyncRunner(fire)
+	} else {
+		fire()
+	}
 
 	return state, nil
 }

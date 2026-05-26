@@ -63,7 +63,7 @@ x * TestHalt1 - if we see +2/3 precommits after timing out into new round, we sh
 // ProposeSuite
 
 func TestStateProposerSelection0(t *testing.T) {
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	height, round := cs1.Height, cs1.Round
 
 	newRoundCh := subscribe(cs1.eventBus, types.EventQueryNewRound)
@@ -102,7 +102,7 @@ func TestStateProposerSelection0(t *testing.T) {
 
 // Now let's do it all again, but starting from round 2 instead of 0
 func TestStateProposerSelection2(t *testing.T) {
-	cs1, vss := randState(4) // test needs more work for more than 3 validators
+	cs1, vss := randState(t, 4) // test needs more work for more than 3 validators
 	height := cs1.Height
 	newRoundCh := subscribe(cs1.eventBus, types.EventQueryNewRound)
 
@@ -138,7 +138,7 @@ func TestStateProposerSelection2(t *testing.T) {
 
 // a non-validator should timeout into the prevote round
 func TestStateEnterProposeNoPrivValidator(t *testing.T) {
-	cs, _ := randState(1)
+	cs, _ := randState(t, 1)
 	cs.SetPrivValidator(nil)
 	height, round := cs.Height, cs.Round
 
@@ -157,7 +157,7 @@ func TestStateEnterProposeNoPrivValidator(t *testing.T) {
 
 // a validator should not timeout of the prevote round (TODO: unless the block is really big!)
 func TestStateEnterProposeYesPrivValidator(t *testing.T) {
-	cs, _ := randState(1)
+	cs, _ := randState(t, 1)
 	height, round := cs.Height, cs.Round
 
 	// Listen for propose timeout event
@@ -189,7 +189,7 @@ func TestStateEnterProposeYesPrivValidator(t *testing.T) {
 func TestStateBadProposal(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(2)
+	cs1, vss := randState(t, 2)
 	height, round := cs1.Height, cs1.Round
 	vs2 := vss[1]
 
@@ -271,7 +271,7 @@ func TestStateOversizedBlock(t *testing.T) {
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			cs1, vss := randState(2)
+			cs1, vss := randState(t, 2)
 			cs1.state.ConsensusParams.Block.MaxBytes = maxBytes
 			height, round := cs1.Height, cs1.Round
 			vs2 := vss[1]
@@ -356,7 +356,7 @@ func TestStateOversizedBlock(t *testing.T) {
 
 // propose, prevote, and precommit a block
 func TestStateFullRound1(t *testing.T) {
-	cs, vss := randState(1)
+	cs, vss := randState(t, 1)
 	height, round := cs.Height, cs.Round
 
 	// NOTE: buffer capacity of 0 ensures we can validate prevote and last commit
@@ -395,7 +395,7 @@ func TestStateFullRound1(t *testing.T) {
 
 // nil is proposed, so prevote and precommit nil
 func TestStateFullRoundNil(t *testing.T) {
-	cs, _ := randState(1)
+	cs, _ := randState(t, 1)
 	height, round := cs.Height, cs.Round
 
 	voteCh := subscribeUnBuffered(cs.eventBus, types.EventQueryVote)
@@ -410,7 +410,7 @@ func TestStateFullRoundNil(t *testing.T) {
 // run through propose, prevote, precommit commit with two validators
 // where the first validator has to wait for votes from the second
 func TestStateFullRound2(t *testing.T) {
-	cs1, vss := randState(2)
+	cs1, vss := randState(t, 2)
 	vs2 := vss[1]
 	height, round := cs1.Height, cs1.Round
 
@@ -452,7 +452,7 @@ func TestStateFullRound2(t *testing.T) {
 func TestStateLockNoPOL(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(2)
+	cs1, vss := randState(t, 2)
 	vs2 := vss[1]
 	height, round := cs1.Height, cs1.Round
 
@@ -596,7 +596,7 @@ func TestStateLockNoPOL(t *testing.T) {
 
 	ensureNewTimeout(timeoutWaitCh, height, round, cs1.config.Precommit(round).Nanoseconds())
 
-	cs2, _ := randState(2) // needed so generated block is different than locked block
+	cs2, _ := randState(t, 2) // needed so generated block is different than locked block
 	// before we time out into new round, set next proposal block
 	prop, propBlock := decideProposal(ctx, t, cs2, vs2, vs2.Height, vs2.Round+1)
 	if prop == nil || propBlock == nil {
@@ -655,7 +655,7 @@ func TestStateLockNoPOL(t *testing.T) {
 func TestStateLockPOLRelock(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -698,7 +698,7 @@ func TestStateLockPOLRelock(t *testing.T) {
 	signAddVotes(cs1, cmtproto.PrecommitType, nil, types.PartSetHeader{}, true, vs2, vs3, vs4)
 
 	// before we timeout to the new round set the new proposal
-	cs2 := newState(cs1.state, vs2, kvstore.NewInMemoryApplication())
+	cs2 := newState(t, cs1.state, vs2, kvstore.NewInMemoryApplication())
 	prop, propBlock := decideProposal(ctx, t, cs2, vs2, vs2.Height, vs2.Round+1)
 	if prop == nil || propBlock == nil {
 		t.Fatal("Failed to create proposal block with vs2")
@@ -755,7 +755,7 @@ func TestStateLockPOLRelock(t *testing.T) {
 func TestStateLockPOLUnlock(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -849,7 +849,7 @@ func TestStateLockPOLUnlock(t *testing.T) {
 func TestStateLockPOLUnlockOnUnknownBlock(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -888,7 +888,7 @@ func TestStateLockPOLUnlockOnUnknownBlock(t *testing.T) {
 	signAddVotes(cs1, cmtproto.PrecommitType, nil, types.PartSetHeader{}, true, vs2, vs3, vs4)
 
 	// before we timeout to the new round set the new proposal
-	cs2 := newState(cs1.state, vs2, kvstore.NewInMemoryApplication())
+	cs2 := newState(t, cs1.state, vs2, kvstore.NewInMemoryApplication())
 	prop, propBlock := decideProposal(ctx, t, cs2, vs2, vs2.Height, vs2.Round+1)
 	if prop == nil || propBlock == nil {
 		t.Fatal("Failed to create proposal block with vs2")
@@ -934,7 +934,7 @@ func TestStateLockPOLUnlockOnUnknownBlock(t *testing.T) {
 	signAddVotes(cs1, cmtproto.PrecommitType, nil, types.PartSetHeader{}, true, vs2, vs3, vs4)
 
 	// before we timeout to the new round set the new proposal
-	cs3 := newState(cs1.state, vs3, kvstore.NewInMemoryApplication())
+	cs3 := newState(t, cs1.state, vs3, kvstore.NewInMemoryApplication())
 	prop, propBlock = decideProposal(ctx, t, cs3, vs3, vs3.Height, vs3.Round+1)
 	if prop == nil || propBlock == nil {
 		t.Fatal("Failed to create proposal block with vs2")
@@ -979,7 +979,7 @@ func TestStateLockPOLUnlockOnUnknownBlock(t *testing.T) {
 func TestStateLockPOLSafety1(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -1104,7 +1104,7 @@ func TestStateLockPOLSafety1(t *testing.T) {
 func TestStateLockPOLSafety2(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -1202,7 +1202,7 @@ func TestStateLockPOLSafety2(t *testing.T) {
 // What we want:
 // P0 proposes B0 at R3.
 func TestProposeValidBlock(t *testing.T) {
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -1294,7 +1294,7 @@ func TestProposeValidBlock(t *testing.T) {
 // What we want:
 // P0 miss to lock B but set valid block to B after receiving delayed prevote.
 func TestSetValidBlockOnDelayedPrevote(t *testing.T) {
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -1359,7 +1359,7 @@ func TestSetValidBlockOnDelayedPrevote(t *testing.T) {
 func TestSetValidBlockOnDelayedProposal(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -1437,7 +1437,7 @@ func TestProcessProposalAccept(t *testing.T) {
 			}
 			m.On("ProcessProposal", mock.Anything, mock.Anything).Return(&abci.ResponseProcessProposal{Status: status}, nil)
 			m.On("PrepareProposal", mock.Anything, mock.Anything).Return(&abci.ResponsePrepareProposal{}, nil).Maybe()
-			cs1, _ := randStateWithApp(4, m)
+			cs1, _ := randStateWithApp(t, 4, m)
 			height, round := cs1.Height, cs1.Round
 
 			proposalCh := subscribe(cs1.eventBus, types.EventQueryCompleteProposal)
@@ -1494,7 +1494,7 @@ func TestExtendVoteCalledWhenEnabled(t *testing.T) {
 			if !testCase.enabled {
 				height = 0
 			}
-			cs1, vss := randStateWithAppWithHeight(4, m, height)
+			cs1, vss := randStateWithAppWithHeight(t, 4, m, height)
 
 			height, round := cs1.Height, cs1.Round
 
@@ -1576,7 +1576,7 @@ func TestVerifyVoteExtensionNotCalledOnAbsentPrecommit(t *testing.T) {
 	}, nil)
 	m.On("FinalizeBlock", mock.Anything, mock.Anything).Return(&abci.ResponseFinalizeBlock{}, nil).Maybe()
 	m.On("Commit", mock.Anything, mock.Anything).Return(&abci.ResponseCommit{}, nil).Maybe()
-	cs1, vss := randStateWithApp(4, m)
+	cs1, vss := randStateWithApp(t, 4, m)
 	height, round := cs1.Height, cs1.Round
 	cs1.state.ConsensusParams.ABCI.VoteExtensionsEnableHeight = cs1.Height
 
@@ -1663,7 +1663,7 @@ func TestPrepareProposalReceivesVoteExtensions(t *testing.T) {
 	m.On("Commit", mock.Anything, mock.Anything).Return(&abci.ResponseCommit{}, nil).Maybe()
 	m.On("FinalizeBlock", mock.Anything, mock.Anything).Return(&abci.ResponseFinalizeBlock{}, nil)
 
-	cs1, vss := randStateWithApp(4, m)
+	cs1, vss := randStateWithApp(t, 4, m)
 	height, round := cs1.Height, cs1.Round
 
 	newRoundCh := subscribe(cs1.eventBus, types.EventQueryNewRound)
@@ -1763,7 +1763,7 @@ func TestFinalizeBlockCalled(t *testing.T) {
 			m.On("FinalizeBlock", mock.Anything, mock.Anything).Return(r, nil).Maybe()
 			m.On("Commit", mock.Anything, mock.Anything).Return(&abci.ResponseCommit{}, nil).Maybe()
 
-			cs1, vss := randStateWithApp(4, m)
+			cs1, vss := randStateWithApp(t, 4, m)
 			height, round := cs1.Height, cs1.Round
 
 			proposalCh := subscribe(cs1.eventBus, types.EventQueryCompleteProposal)
@@ -1877,7 +1877,7 @@ func TestVoteExtensionEnableHeight(t *testing.T) {
 			}
 			m.On("FinalizeBlock", mock.Anything, mock.Anything).Return(&abci.ResponseFinalizeBlock{}, nil).Maybe()
 			m.On("Commit", mock.Anything, mock.Anything).Return(&abci.ResponseCommit{}, nil).Maybe()
-			cs1, vss := randStateWithAppWithHeight(numValidators, m, testCase.enableHeight)
+			cs1, vss := randStateWithAppWithHeight(t, numValidators, m, testCase.enableHeight)
 			cs1.state.ConsensusParams.ABCI.VoteExtensionsEnableHeight = testCase.enableHeight
 			height, round := cs1.Height, cs1.Round
 
@@ -1924,7 +1924,7 @@ func TestVoteExtensionEnableHeight(t *testing.T) {
 // receiving an invalid vote. In particular, one with the incorrect
 // ValidatorIndex.
 func TestStateDoesntCrashOnInvalidVote(t *testing.T) {
-	cs, vss := randState(2)
+	cs, vss := randState(t, 2)
 	height, round := cs.Height, cs.Round
 	// create dummy peer
 	peer := p2pmock.NewPeer(nil)
@@ -1955,8 +1955,8 @@ func TestStateDoesntCrashOnInvalidVote(t *testing.T) {
 // 4 vals, 3 Nil Precommits at P0
 // What we want:
 // P0 waits for timeoutPrecommit before starting next round
-func TestWaitingTimeoutOnNilPolka(*testing.T) {
-	cs1, vss := randState(4)
+func TestWaitingTimeoutOnNilPolka(t *testing.T) {
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -1977,7 +1977,7 @@ func TestWaitingTimeoutOnNilPolka(*testing.T) {
 // What we want:
 // P0 waits for timeoutPropose in the next round before entering prevote
 func TestWaitingTimeoutProposeOnNewRound(t *testing.T) {
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -2013,7 +2013,7 @@ func TestWaitingTimeoutProposeOnNewRound(t *testing.T) {
 // What we want:
 // P0 jump to higher round, precommit and start precommit wait
 func TestRoundSkipOnNilPolkaFromHigherRound(t *testing.T) {
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 
@@ -2049,7 +2049,7 @@ func TestRoundSkipOnNilPolkaFromHigherRound(t *testing.T) {
 // What we want:
 // P0 wait for timeoutPropose to expire before sending prevote.
 func TestWaitTimeoutProposeOnNilPolkaForTheCurrentRound(t *testing.T) {
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, int32(1)
 
@@ -2078,7 +2078,7 @@ func TestWaitTimeoutProposeOnNilPolkaForTheCurrentRound(t *testing.T) {
 func TestEmitNewValidBlockEventOnCommitWithoutBlock(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, int32(1)
 
@@ -2114,7 +2114,7 @@ func TestEmitNewValidBlockEventOnCommitWithoutBlock(t *testing.T) {
 func TestCommitFromPreviousRound(t *testing.T) {
 	ctx := t.Context()
 
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, int32(1)
 
@@ -2169,7 +2169,7 @@ func (n *fakeTxNotifier) Notify() {
 // start of the next round
 func TestStartNextHeightCorrectlyAfterTimeout(t *testing.T) {
 	config.Consensus.SkipTimeoutCommit = false
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	cs1.txNotifier = &fakeTxNotifier{ch: make(chan struct{})}
 
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
@@ -2231,7 +2231,7 @@ func TestResetTimeoutPrecommitUponNewHeight(t *testing.T) {
 	ctx := t.Context()
 
 	config.Consensus.SkipTimeoutCommit = false
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
@@ -2292,7 +2292,7 @@ func TestResetTimeoutPrecommitUponNewHeight(t *testing.T) {
 
 /*
 func TestStateSlashingPrevotes(t *testing.T) {
-	cs1, vss := randState(2)
+	cs1, vss := randState(t, 2)
 	vs2 := vss[1]
 
 
@@ -2327,7 +2327,7 @@ func TestStateSlashingPrevotes(t *testing.T) {
 }
 
 func TestStateSlashingPrecommits(t *testing.T) {
-	cs1, vss := randState(2)
+	cs1, vss := randState(t, 2)
 	vs2 := vss[1]
 
 
@@ -2372,7 +2372,7 @@ func TestStateSlashingPrecommits(t *testing.T) {
 // 4 vals.
 // we receive a final precommit after going into next round, but others might have gone to commit already!
 func TestStateHalt1(t *testing.T) {
-	cs1, vss := randState(4)
+	cs1, vss := randState(t, 4)
 	vs2, vs3, vs4 := vss[1], vss[2], vss[3]
 	height, round := cs1.Height, cs1.Round
 	partSize := types.BlockPartSizeBytes
@@ -2441,7 +2441,7 @@ func TestStateHalt1(t *testing.T) {
 
 func TestStateOutputsBlockPartsStats(t *testing.T) {
 	// create dummy peer
-	cs, _ := randState(1)
+	cs, _ := randState(t, 1)
 	peer := p2pmock.NewPeer(nil)
 
 	// 1) new block part
@@ -2482,7 +2482,7 @@ func TestStateOutputsBlockPartsStats(t *testing.T) {
 }
 
 func TestProposalBlockPartsHeightConsistency(t *testing.T) {
-	cs, _ := randState(1)
+	cs, _ := randState(t, 1)
 
 	block, err := cs.state.MakeBlock(
 		cs.Height+1,
@@ -2516,7 +2516,7 @@ func TestProposalBlockPartsHeightConsistency(t *testing.T) {
 }
 
 func TestStateOutputVoteStats(t *testing.T) {
-	cs, vss := randState(2)
+	cs, vss := randState(t, 2)
 	// create dummy peer
 	peer := p2pmock.NewPeer(nil)
 
@@ -2548,7 +2548,7 @@ func TestStateOutputVoteStats(t *testing.T) {
 }
 
 func TestSignSameVoteTwice(t *testing.T) {
-	_, vss := randState(2)
+	_, vss := randState(t, 2)
 
 	randBytes := cmtrand.Bytes(tmhash.Size)
 
@@ -2683,4 +2683,67 @@ func TestWALSelectiveFsyncUnexpectedTypePanics(t *testing.T) {
 	require.Panics(t, func() {
 		cs.writeInternalMsgToWAL(unknown)
 	})
+}
+
+// TestSpawnTaskRunnerExecutesInOrder verifies that spawnTaskRunner runs
+// submitted closures sequentially on a single goroutine and preserves
+// submission order.
+func TestSpawnTaskRunnerExecutesInOrder(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	run := spawnTaskRunner(ctx, 8)
+
+	const n = 16
+	results := make(chan int, n)
+	for i := 0; i < n; i++ {
+		run(func() { results <- i })
+	}
+
+	for i := 0; i < n; i++ {
+		select {
+		case got := <-results:
+			require.Equal(t, i, got, "tasks must execute in submission order")
+		case <-time.After(time.Second):
+			t.Fatalf("task %d did not run", i)
+		}
+	}
+}
+
+// TestSpawnTaskRunnerBackpressure verifies that submissions block once the
+// internal buffer fills, providing natural backpressure rather than dropping
+// tasks.
+func TestSpawnTaskRunnerBackpressure(t *testing.T) {
+	const buf = 2
+	block := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	run := spawnTaskRunner(ctx, buf)
+
+	// First task occupies the worker and blocks indefinitely until released.
+	run(func() { <-block })
+	// Fill the buffer.
+	for i := 0; i < buf; i++ {
+		run(func() {})
+	}
+
+	// Next submission must block: worker is busy, buffer is full.
+	submitted := make(chan struct{})
+	go func() {
+		run(func() {})
+		close(submitted)
+	}()
+
+	select {
+	case <-submitted:
+		t.Fatal("submission did not block when buffer was full")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Releasing the worker drains the buffer and unblocks the submitter.
+	close(block)
+	select {
+	case <-submitted:
+	case <-time.After(time.Second):
+		t.Fatal("submission did not unblock after worker drained")
+	}
 }

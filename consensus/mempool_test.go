@@ -34,7 +34,7 @@ func TestMempoolNoProgressUntilTxsAvailable(t *testing.T) {
 	resp, err := app.Info(context.Background(), proxy.RequestInfo)
 	require.NoError(t, err)
 	state.AppHash = resp.LastBlockAppHash
-	cs := newStateWithConfig(config, state, privVals[0], app)
+	cs := newStateWithConfig(t, config, state, privVals[0], app)
 	assertMempool(cs.txNotifier).EnableTxsAvailable()
 	height, round := cs.Height, cs.Round
 	newBlockCh := subscribe(cs.eventBus, types.EventQueryNewBlock)
@@ -58,7 +58,7 @@ func TestMempoolProgressAfterCreateEmptyBlocksInterval(t *testing.T) {
 	resp, err := app.Info(context.Background(), proxy.RequestInfo)
 	require.NoError(t, err)
 	state.AppHash = resp.LastBlockAppHash
-	cs := newStateWithConfig(config, state, privVals[0], app)
+	cs := newStateWithConfig(t, config, state, privVals[0], app)
 
 	assertMempool(cs.txNotifier).EnableTxsAvailable()
 
@@ -75,7 +75,7 @@ func TestMempoolProgressInHigherRound(t *testing.T) {
 	defer os.RemoveAll(config.RootDir)
 	config.Consensus.CreateEmptyBlocks = false
 	state, privVals := randGenesisState(1, false, 10, nil)
-	cs := newStateWithConfig(config, state, privVals[0], kvstore.NewInMemoryApplication())
+	cs := newStateWithConfig(t, config, state, privVals[0], kvstore.NewInMemoryApplication())
 	assertMempool(cs.txNotifier).EnableTxsAvailable()
 	height, round := cs.Height, cs.Round
 	newBlockCh := subscribe(cs.eventBus, types.EventQueryNewBlock)
@@ -119,7 +119,7 @@ func TestMempoolTxConcurrentWithCommit(t *testing.T) {
 	state, privVals := randGenesisState(1, false, 10, nil)
 	blockDB := dbm.NewMemDB()
 	stateStore := sm.NewStore(blockDB, sm.StoreOptions{DiscardABCIResponses: false})
-	cs := newStateWithConfigAndBlockStore(config, state, privVals[0], kvstore.NewInMemoryApplication(), blockDB)
+	cs := newStateWithConfigAndBlockStore(t, config, state, privVals[0], kvstore.NewInMemoryApplication(), blockDB)
 	err := stateStore.Save(state)
 	require.NoError(t, err)
 	newBlockEventsCh := subscribe(cs.eventBus, types.EventQueryNewBlockEvents)
@@ -145,7 +145,7 @@ func TestMempoolRmBadTx(t *testing.T) {
 	app := kvstore.NewInMemoryApplication()
 	blockDB := dbm.NewMemDB()
 	stateStore := sm.NewStore(blockDB, sm.StoreOptions{DiscardABCIResponses: false})
-	cs := newStateWithConfigAndBlockStore(config, state, privVals[0], app, blockDB)
+	cs := newStateWithConfigAndBlockStore(t, config, state, privVals[0], app, blockDB)
 	err := stateStore.Save(state)
 	require.NoError(t, err)
 

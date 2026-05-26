@@ -74,6 +74,7 @@ func startNewStateAndWaitForBlock(
 	state, _ := stateStore.LoadFromDBOrGenesisFile(consensusReplayConfig.GenesisFile())
 	privValidator := loadPrivValidator(consensusReplayConfig)
 	cs := newStateWithConfigAndBlockStore(
+		t,
 		consensusReplayConfig,
 		state,
 		privValidator,
@@ -173,6 +174,7 @@ func TestWALCrashOnInternalBlockPartWrite(t *testing.T) {
 
 	privValidator := loadPrivValidator(consensusReplayConfig)
 	cs := newStateWithConfigAndBlockStore(
+		t,
 		consensusReplayConfig,
 		state,
 		privValidator,
@@ -227,6 +229,7 @@ LOOP:
 		require.NoError(t, err)
 		privValidator := loadPrivValidator(consensusReplayConfig)
 		cs := newStateWithConfigAndBlockStore(
+			t,
 			consensusReplayConfig,
 			state,
 			privValidator,

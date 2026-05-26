@@ -373,22 +373,24 @@ func subscribeToVoter(cs *State, addr []byte) <-chan cmtpubsub.Message {
 //-------------------------------------------------------------------------------
 // consensus states
 
-func newState(state sm.State, pv types.PrivValidator, app abci.Application) *State {
+func newState(t *testing.T, state sm.State, pv types.PrivValidator, app abci.Application) *State {
 	config := test.ResetTestRoot("consensus_state_test")
-	return newStateWithConfig(config, state, pv, app)
+	return newStateWithConfig(t, config, state, pv, app)
 }
 
 func newStateWithConfig(
+	t *testing.T,
 	thisConfig *cfg.Config,
 	state sm.State,
 	pv types.PrivValidator,
 	app abci.Application,
 ) *State {
 	blockDB := dbm.NewMemDB()
-	return newStateWithConfigAndBlockStore(thisConfig, state, pv, app, blockDB)
+	return newStateWithConfigAndBlockStore(t, thisConfig, state, pv, app, blockDB)
 }
 
 func newStateWithConfigAndBlockStore(
+	t *testing.T,
 	thisConfig *cfg.Config,
 	state sm.State,
 	pv types.PrivValidator,
@@ -442,6 +444,7 @@ func newStateWithConfigAndBlockStore(
 		panic(err)
 	}
 	cs.SetEventBus(eventBus)
+	t.Cleanup(cs.stopTaskRunner)
 	return cs
 }
 
@@ -454,26 +457,28 @@ func loadPrivValidator(config *cfg.Config) *privval.FilePV {
 	return privValidator
 }
 
-func randState(nValidators int) (*State, []*validatorStub) {
-	return randStateWithApp(nValidators, kvstore.NewInMemoryApplication())
+func randState(t *testing.T, nValidators int) (*State, []*validatorStub) {
+	return randStateWithApp(t, nValidators, kvstore.NewInMemoryApplication())
 }
 
 func randStateWithAppWithHeight(
+	t *testing.T,
 	nValidators int,
 	app abci.Application,
 	height int64,
 ) (*State, []*validatorStub) {
 	c := test.ConsensusParams()
 	c.ABCI.VoteExtensionsEnableHeight = height
-	return randStateWithAppImpl(nValidators, app, c)
+	return randStateWithAppImpl(t, nValidators, app, c)
 }
 
-func randStateWithApp(nValidators int, app abci.Application) (*State, []*validatorStub) {
+func randStateWithApp(t *testing.T, nValidators int, app abci.Application) (*State, []*validatorStub) {
 	c := test.ConsensusParams()
-	return randStateWithAppImpl(nValidators, app, c)
+	return randStateWithAppImpl(t, nValidators, app, c)
 }
 
 func randStateWithAppImpl(
+	t *testing.T,
 	nValidators int,
 	app abci.Application,
 	consensusParams *types.ConsensusParams,
@@ -483,7 +488,7 @@ func randStateWithAppImpl(
 
 	vss := make([]*validatorStub, nValidators)
 
-	cs := newState(state, privVals[0], app)
+	cs := newState(t, state, privVals[0], app)
 
 	for i := 0; i < nValidators; i++ {
 		vss[i] = newValidatorStub(privVals[i], int32(i))
@@ -792,7 +797,7 @@ func randConsensusNet(t *testing.T, nValidators int, testName string, tickerFunc
 		_, err := app.InitChain(context.Background(), &abci.RequestInitChain{Validators: vals})
 		require.NoError(t, err)
 
-		css[i] = newStateWithConfigAndBlockStore(thisConfig, state, privVals[i], app, stateDB)
+		css[i] = newStateWithConfigAndBlockStore(t, thisConfig, state, privVals[i], app, stateDB)
 		css[i].SetTimeoutTicker(tickerFunc())
 		css[i].SetLogger(logger.With("validator", i, "module", "consensus"))
 	}
@@ -856,7 +861,7 @@ func randConsensusNetWithPeers(
 		_, err := app.InitChain(context.Background(), &abci.RequestInitChain{Validators: vals})
 		require.NoError(t, err)
 
-		css[i] = newStateWithConfig(thisConfig, state, privVal, app)
+		css[i] = newStateWithConfig(t, thisConfig, state, privVal, app)
 		css[i].SetTimeoutTicker(tickerFunc())
 		css[i].SetLogger(logger.With("validator", i, "module", "consensus"))
 	}

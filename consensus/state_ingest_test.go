@@ -387,7 +387,7 @@ type ingestTestSuite struct {
 }
 
 func newIngestTestSuite(t *testing.T) *ingestTestSuite {
-	cs, validators := randState(4)
+	cs, validators := randState(t, 4)
 
 	return &ingestTestSuite{
 		t:          t,
