@@ -42,7 +42,7 @@ func (app *unsyncLocalClient) SetResponseCallback(cb Callback) {
 }
 
 func (app *unsyncLocalClient) CheckTxAsync(ctx context.Context, req *types.RequestCheckTx) (*ReqRes, error) {
-	res, err := app.Application.CheckTx(ctx, req)
+	res, err := app.CheckTx(ctx, req)
 	if err != nil {
 		return nil, err
 	}
