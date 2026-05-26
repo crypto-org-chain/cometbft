@@ -354,7 +354,7 @@ func TestSwitchToConsensusVoteExtensions(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			ctx := t.Context()
 
-			cs, vs := randState(1)
+			cs, vs := randState(t, 1)
 			validator := vs[0]
 			validator.Height = testCase.storedHeight
 
@@ -1145,7 +1145,7 @@ func TestMarshalJSONPeerState(t *testing.T) {
 }
 
 func TestVoteMessageValidateBasic(t *testing.T) {
-	_, vss := randState(2)
+	_, vss := randState(t, 2)
 
 	randBytes := cmtrand.Bytes(tmhash.Size)
 	blockID := types.BlockID{

@@ -80,6 +80,96 @@ func TestApplyBlock(t *testing.T) {
 	assert.EqualValues(t, 1, state.Version.Consensus.App, "App version wasn't updated")
 }
 
+// TestApplyBlockAsyncRunner verifies that when SetTaskRunner is configured,
+// fireEvents is dispatched via the runner (off the consensus thread) rather
+// than executed synchronously inside ApplyBlock.
+func TestApplyBlockAsyncRunner(t *testing.T) {
+	app := &testApp{}
+	cc := proxy.NewLocalClientCreator(app)
+	proxyApp := proxy.NewAppConns(cc, proxy.NopMetrics())
+	err := proxyApp.Start()
+	require.NoError(t, err)
+	defer proxyApp.Stop() //nolint:errcheck // ignore for tests
+
+	state, stateDB, _ := makeState(1, 1)
+	stateStore := sm.NewStore(stateDB, sm.StoreOptions{
+		DiscardABCIResponses: false,
+	})
+	blockStore := store.NewBlockStore(dbm.NewMemDB())
+
+	mp := &mpmocks.Mempool{}
+	mp.On("Lock").Return()
+	mp.On("Unlock").Return()
+	mp.On("FlushAppConn", mock.Anything).Return(nil)
+	mp.On("Update",
+		mock.Anything, mock.Anything, mock.Anything,
+		mock.Anything, mock.Anything, mock.Anything).Return(nil)
+
+	blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyApp.Consensus(),
+		mp, sm.EmptyEvidencePool{}, blockStore)
+
+	eventBus := types.NewEventBus()
+	require.NoError(t, eventBus.Start())
+	defer eventBus.Stop() //nolint:errcheck // ignore for tests
+	blockExec.SetEventBus(eventBus)
+
+	// Subscribe to validator-set updates so we can observe whether fireEvents
+	// has run yet.
+	updatesSub, err := eventBus.Subscribe(
+		context.Background(),
+		"TestApplyBlockAsyncRunner",
+		types.EventQueryValidatorSetUpdates,
+	)
+	require.NoError(t, err)
+
+	// Force a validator update so fireEvents emits an event we can observe.
+	pubkey := ed25519.GenPrivKey().PubKey()
+	pk, err := cryptoenc.PubKeyToProto(pubkey)
+	require.NoError(t, err)
+	app.ValidatorUpdates = []abci.ValidatorUpdate{{PubKey: pk, Power: 10}}
+
+	// Capture submitted closures instead of running them. ApplyBlock must not
+	// block waiting for the closure to execute.
+	tasks := make(chan func(), 1)
+	blockExec.SetTaskRunner(func(task func()) {
+		tasks <- task
+	})
+
+	block, err := makeBlock(state, 1, new(types.Commit))
+	require.NoError(t, err)
+	bps, err := block.MakePartSet(testPartSize)
+	require.NoError(t, err)
+	blockID := types.BlockID{Hash: block.Hash(), PartSetHeader: bps.Header()}
+
+	_, err = blockExec.ApplyBlock(state, blockID, block)
+	require.NoError(t, err)
+
+	// fireEvents should have been deferred to the runner — no event yet.
+	select {
+	case <-updatesSub.Out():
+		t.Fatal("fireEvents ran synchronously; expected dispatch via task runner")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Drain and run the deferred closure.
+	var task func()
+	select {
+	case task = <-tasks:
+	case <-time.After(time.Second):
+		t.Fatal("task runner was not invoked")
+	}
+	task()
+
+	// Now the event must arrive.
+	select {
+	case <-updatesSub.Out():
+	case <-updatesSub.Canceled():
+		t.Fatalf("updatesSub canceled: %v", updatesSub.Err())
+	case <-time.After(time.Second):
+		t.Fatal("did not receive EventValidatorSetUpdates after running task")
+	}
+}
+
 // TestFinalizeBlockDecidedLastCommit ensures we correctly send the
 // DecidedLastCommit to the application. The test ensures that the
 // DecidedLastCommit properly reflects which validators signed the preceding

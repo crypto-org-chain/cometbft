@@ -34,6 +34,11 @@ import (
 
 var msgQueueSize = 1000
 
+// taskQueueSize bounds the number of pending fireEvents tasks queued for the
+// async runner. Sized to absorb subscriber lag without applying backpressure
+// on the consensus thread.
+const taskQueueSize = 128
+
 // msgs from the reactor which may update the state
 type msgInfo struct {
 	Msg    Message `json:"msg"`
@@ -135,6 +140,10 @@ type State struct {
 
 	// offline state sync height indicating to which height the node synced offline
 	offlineStateSyncHeight int64
+
+	// taskRunnerCancel stops the goroutine spawned by spawnTaskRunner. Called
+	// from OnStop so consensus shutdown does not leak goroutines.
+	taskRunnerCancel context.CancelFunc
 }
 
 // StateOption sets an optional parameter on the State.
@@ -173,6 +182,11 @@ func NewState(
 	cs.decideProposal = cs.defaultDecideProposal
 	cs.doPrevote = cs.defaultDoPrevote
 	cs.setProposal = cs.defaultSetProposal
+
+	// Dispatch fireEvents off the consensus thread.
+	runnerCtx, cancel := context.WithCancel(context.Background())
+	cs.taskRunnerCancel = cancel
+	blockExec.SetTaskRunner(spawnTaskRunner(runnerCtx, taskQueueSize))
 
 	// We have no votes, so reconstruct LastCommit from SeenCommit.
 	if state.LastBlockHeight > 0 {
@@ -435,7 +449,17 @@ func (cs *State) OnStop() {
 	if err := cs.timeoutTicker.Stop(); err != nil {
 		cs.Logger.Error("failed trying to stop timeoutTicket", "error", err)
 	}
+	cs.stopTaskRunner()
 	// WAL is stopped in receiveRoutine.
+}
+
+// stopTaskRunner cancels the task-runner goroutine spawned by NewState. Safe
+// to call multiple times and on an unstarted State; intended for OnStop and
+// for test cleanup paths that bypass Start/Stop.
+func (cs *State) stopTaskRunner() {
+	if cs.taskRunnerCancel != nil {
+		cs.taskRunnerCancel()
+	}
 }
 
 // Wait waits for the main routine to return.
@@ -2706,4 +2730,30 @@ func repairWalFile(src, dst string) error {
 	}
 
 	return nil
+}
+
+// spawnTaskRunner returns a runner that executes submitted closures on a
+// single dedicated goroutine. Tasks are buffered in a channel of the given
+// size; submitters block once the buffer is full, providing natural
+// backpressure if the consumer falls behind. The goroutine and any blocked
+// submitter exit when ctx is canceled; tasks submitted after cancel are
+// dropped.
+func spawnTaskRunner(ctx context.Context, size int) func(func()) {
+	ch := make(chan func(), size)
+	go func() {
+		for {
+			select {
+			case task := <-ch:
+				task()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return func(task func()) {
+		select {
+		case ch <- task:
+		case <-ctx.Done():
+		}
+	}
 }
