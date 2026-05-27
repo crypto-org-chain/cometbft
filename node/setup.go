@@ -125,8 +125,8 @@ func createAndStartProxyAppConns(clientCreator proxy.ClientCreator, logger log.L
 	return proxyApp, nil
 }
 
-func createAndStartEventBus(logger log.Logger) (*types.EventBus, error) {
-	eventBus := types.NewEventBus()
+func createAndStartEventBus(logger log.Logger, bufferCapacity int) (*types.EventBus, error) {
+	eventBus := types.NewEventBusWithBufferCapacity(bufferCapacity)
 	eventBus.SetLogger(logger.With("module", "events"))
 	if err := eventBus.Start(); err != nil {
 		return nil, err
@@ -258,6 +258,17 @@ func createMempoolAndMempoolReactor(
 		// Strictly speaking, there's no need to have a `mempl.NopMempoolReactor`, but
 		// adding it leads to a cleaner code.
 		return &mempl.NopMempool{}, mempl.NewNopMempoolReactor()
+	case cfg.MempoolTypeApp:
+		mp := mempl.NewAppMempool(
+			config.Mempool,
+			proxyApp.Mempool(),
+			mempl.WithAMLogger(logger),
+			mempl.WithAMMetrics(memplMetrics),
+		)
+		reactor := mempl.NewAppReactor(config.Mempool, mp, waitForSync)
+		reactor.SetLogger(logger)
+
+		return mp, reactor
 	default:
 		panic(fmt.Sprintf("unknown mempool type: %q", config.Mempool.Type))
 	}
