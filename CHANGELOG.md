@@ -6,6 +6,8 @@
 
 ### BUG FIXES
 
+- `[blocksync]` tolerate late BlockResponse from honest peers after switching to consensus
+  ([\#5959](https://github.com/cometbft/cometbft/pull/5959))
 - `[blocksync]` fix flaky `TestBlockPoolBasic` deadlock under `-race`
   ([\#5867](https://github.com/cometbft/cometbft/pull/5867))
 - `[mempool]` fix setRecheckFull/setDone race causing spurious ErrRecheckFull.
