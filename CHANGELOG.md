@@ -16,6 +16,9 @@
   ([\#5868](https://github.com/cometbft/cometbft/pull/5868))
 - `[node]` close partial listeners on startRPC failure
   ([\#5869](https://github.com/cometbft/cometbft/pull/5869))
+- `[lp2p]` cap per-reactor priority queue to prevent memory-exhaustion DoS;
+  drops counted in new `p2p_messages_reactor_dropped` metric
+  ([\#5955](https://github.com/cometbft/cometbft/pull/5955))
 - `[consensus]` release cs.mtx before sending to statsMsgQueue
   ([\#5813](https://github.com/cometbft/cometbft/pull/5813))
 - `[mempool]` truncate proto field number to int32 in filter's ReadTag
