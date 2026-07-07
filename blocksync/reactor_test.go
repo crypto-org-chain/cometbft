@@ -555,9 +555,8 @@ func TestFilterMsgBytes(t *testing.T) {
 			expectErr: "blocksync not active",
 		},
 		{
-			// After catching up, the pool stops but in-flight responses from our
-			// own requests arrive after the switch to consensus. The peer is
-			// honest and must not be disconnected.
+			// Our own in-flight request, arriving after the pool stopped for
+			// the consensus switch — not unsolicited, must not disconnect.
 			name: "allows late BlockResponse after pool stops for consensus switch",
 			setup: func(t *testing.T) *Reactor {
 				r := newFilterReactor(t, true)
@@ -567,6 +566,19 @@ func TestFilterMsgBytes(t *testing.T) {
 			chID:    BlocksyncChannel,
 			peer:    unexpected,
 			bytesFn: blockResponseBytes,
+		},
+		{
+			// Sig-count guard must still apply once the pool is stopped.
+			name: "rejects oversized BlockResponse after pool stops for consensus switch",
+			setup: func(t *testing.T) *Reactor {
+				r := newFilterReactor(t, true)
+				require.NoError(t, r.pool.Stop())
+				return r
+			},
+			chID:      BlocksyncChannel,
+			peer:      unexpected,
+			bytesFn:   func(t *testing.T) []byte { return blockResponseBytesWithSigs(t, types.MaxVotesCount+1, 0) },
+			expectErr: "too many commit signatures",
 		},
 		{
 			name:      "rejects unsolicited BlockResponse with no requesters",
@@ -972,9 +984,7 @@ func TestPeerNotDisconnectedOnLateBlockResponseAfterConsensusSwitch(t *testing.T
 		return !syncingPair.reactor.pool.IsRunning()
 	}, 30*time.Second, 5*time.Millisecond, "syncing pool did not stop")
 
-	// Pool stopped (consensus switch). Simulate a late in-flight response by
-	// sending block 1 from the serving node — exercises the onReceive →
-	// FilterMsgBytes path in p2p/peer.go.
+	// Exercises onReceive -> FilterMsgBytes in p2p/peer.go with a late response.
 	block := servingPair.reactor.store.LoadBlock(1)
 	require.NotNil(t, block)
 	bl, err := block.ToProto()
@@ -987,8 +997,8 @@ func TestPeerNotDisconnectedOnLateBlockResponseAfterConsensusSwitch(t *testing.T
 		Message:   &bcproto.BlockResponse{Block: bl},
 	}), "message must be queued to exercise the filter path")
 
-	time.Sleep(200 * time.Millisecond)
-
-	assert.Equal(t, 1, switches[0].Peers().Size(),
+	require.Never(t, func() bool {
+		return switches[0].Peers().Size() != 1
+	}, 200*time.Millisecond, 5*time.Millisecond,
 		"serving peer was incorrectly disconnected by a late in-flight BlockResponse")
 }

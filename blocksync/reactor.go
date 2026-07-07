@@ -370,11 +370,11 @@ func (r *Reactor) FilterMsgBytes(chID byte, src p2p.Peer, msgBytes []byte) error
 	if !r.enabled.Load() {
 		return errors.New("unsolicited BlockResponse: blocksync not active")
 	}
-	// Pool has stopped (switched to consensus). Requests we sent before the
-	// transition are still in flight; the peers are honest and must not be
-	// disconnected for answering our own requests.
+	// Pool stopped for consensus switch: our own in-flight requests land here,
+	// so don't disconnect honest peers, but any peer can reach this path now,
+	// so still check the sig count.
 	if !r.pool.IsRunning() {
-		return nil
+		return validateMaxVotes(stub.BlockResponse)
 	}
 
 	// ensure we have an outstanding request to this peer
