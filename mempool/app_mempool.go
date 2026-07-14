@@ -261,24 +261,22 @@ func (m *AppMempool) CheckTx(tx types.Tx, callback func(res *abci.ResponseCheckT
 
 		res, err := m.app.CheckTx(ctx, req)
 		if err != nil {
-			// note that other ABCI methods panic if err is not nil
+			// note that other ABCI methods panic if err is not nil.
+			// Tx stays in the seen-guard, so the response code must not be
+			// CodeTypeRetry: that tells the client to resubmit, but a resubmit
+			// would just be rejected as already-seen.
 			m.logger.Error("AppMempool.CheckTx: error inserting tx", "error", err, "tx", txHash(tx))
-			// Release the seen-guard before the callback: a panicking callback must not
-			// leave the tx stuck in the guard.
-			m.forgetTx(tx, true)
 			if callback != nil {
-				callback(&abci.ResponseCheckTx{Code: abci.CodeTypeRetry, Log: err.Error()})
+				callback(&abci.ResponseCheckTx{Code: 1, Log: err.Error()})
 			}
 			return
 		}
 
 		if res == nil {
-			// nil response, no error: treat like a transport failure so the tx isn't
-			// wedged in the seen-guard and RPC callers don't block until timeout.
+			// nil response, no error: same reasoning as the err != nil case above.
 			m.logger.Error("AppMempool.CheckTx: nil response", "tx", txHash(tx))
-			m.forgetTx(tx, true)
 			if callback != nil {
-				callback(&abci.ResponseCheckTx{Code: abci.CodeTypeRetry, Log: "nil CheckTx response"})
+				callback(&abci.ResponseCheckTx{Code: 1, Log: "nil CheckTx response"})
 			}
 			return
 		}

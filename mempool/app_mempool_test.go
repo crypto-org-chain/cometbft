@@ -225,11 +225,14 @@ func TestAppMempoolCheckTx_AppError(t *testing.T) {
 	require.Eventually(t, func() bool { return result.Load() != nil }, time.Second, 10*time.Millisecond)
 
 	res := result.Load()
-	require.Equal(t, abci.CodeTypeRetry, res.Code)
+	// must not be CodeTypeRetry: the tx stays in the seen-guard, so telling
+	// the client to retry would just get the resubmit rejected as already-seen.
+	require.NotEqual(t, abci.CodeTypeRetry, res.Code)
+	require.NotEqual(t, abci.CodeTypeOK, res.Code)
 	require.Contains(t, res.Log, appErr.Error())
 
-	// seen-guard must clear so the tx can be resubmitted
-	require.Eventually(t, func() bool { return !m.guard.Has(tx.Key()) }, m.checkTxRetryDelay, 10*time.Millisecond)
+	// seen-guard must stay set so a repeat submission is rejected in-memory.
+	require.True(t, m.guard.Has(tx.Key()))
 }
 
 func TestAppMempoolCheckTx_NilResponse(t *testing.T) {
@@ -249,27 +252,39 @@ func TestAppMempoolCheckTx_NilResponse(t *testing.T) {
 
 	// callback must fire — RPC callers block on this
 	require.Eventually(t, func() bool { return result.Load() != nil }, time.Second, 10*time.Millisecond)
-	require.Equal(t, abci.CodeTypeRetry, result.Load().Code)
+	// must not be CodeTypeRetry — same reasoning as the app-error case.
+	require.NotEqual(t, abci.CodeTypeRetry, result.Load().Code)
+	require.NotEqual(t, abci.CodeTypeOK, result.Load().Code)
 
-	// seen-guard must clear so the tx can be resubmitted
-	require.Eventually(t, func() bool { return !m.guard.Has(tx.Key()) }, m.checkTxRetryDelay, 10*time.Millisecond)
+	// seen-guard must stay set, same as the app-error case.
+	require.True(t, m.guard.Has(tx.Key()))
 }
 
-func TestAppMempoolCheckTx_AppErrorForgetsTxEvenIfCallbackPanics(t *testing.T) {
-	cfg := config.TestMempoolConfig()
-	cfg.CheckTxRetryDelay = 50 * time.Millisecond
+func TestAppMempoolCheckTx_AppErrorKeepsTxInGuardEvenIfCallbackPanics(t *testing.T) {
+	called := make(chan struct{})
 
 	app := abcimock.NewClient(t)
 	app.On("CheckTx", mock.Anything, mock.Anything).
-		Return((*abci.ResponseCheckTx)(nil), fmt.Errorf("connection reset by peer"))
+		Return(func(_ context.Context, _ *abci.RequestCheckTx) (*abci.ResponseCheckTx, error) {
+			close(called)
+			return nil, fmt.Errorf("connection reset by peer")
+		})
 
-	m := NewAppMempool(cfg, app)
+	m := NewAppMempool(config.TestMempoolConfig(), app)
 	tx := types.Tx("panic-tx")
 
 	require.NoError(t, m.CheckTx(tx, func(_ *abci.ResponseCheckTx) { panic("callback panic") }, TxInfo{}))
-	require.Eventually(t, func() bool {
-		return !m.guard.Has(tx.Key())
-	}, cfg.CheckTxRetryDelay, 5*time.Millisecond)
+
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("CheckTx not called")
+	}
+
+	// the panic must be recovered and the tx must remain in the seen-guard
+	// (no forgetTx call on this path).
+	time.Sleep(20 * time.Millisecond)
+	require.True(t, m.guard.Has(tx.Key()))
 }
 
 func TestAppMempool_UsesConfigValues(t *testing.T) {
