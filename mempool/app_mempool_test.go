@@ -232,6 +232,46 @@ func TestAppMempoolCheckTx_AppError(t *testing.T) {
 	require.Eventually(t, func() bool { return !m.guard.Has(tx.Key()) }, m.checkTxRetryDelay, 10*time.Millisecond)
 }
 
+func TestAppMempoolCheckTx_NilResponse(t *testing.T) {
+	tx := types.Tx("nil-tx")
+
+	app := abcimock.NewClient(t)
+	app.On("CheckTx", mock.Anything, mock.Anything).
+		Return((*abci.ResponseCheckTx)(nil), nil)
+
+	m := NewAppMempool(config.DefaultMempoolConfig(), app)
+
+	var result atomic.Pointer[abci.ResponseCheckTx]
+	require.NotPanics(t, func() {
+		err := m.CheckTx(tx, func(res *abci.ResponseCheckTx) { result.Store(res) }, TxInfo{})
+		require.NoError(t, err)
+	})
+
+	// callback must fire — RPC callers block on this
+	require.Eventually(t, func() bool { return result.Load() != nil }, time.Second, 10*time.Millisecond)
+	require.Equal(t, abci.CodeTypeRetry, result.Load().Code)
+
+	// seen-guard must clear so the tx can be resubmitted
+	require.Eventually(t, func() bool { return !m.guard.Has(tx.Key()) }, m.checkTxRetryDelay, 10*time.Millisecond)
+}
+
+func TestAppMempoolCheckTx_AppErrorForgetsTxEvenIfCallbackPanics(t *testing.T) {
+	cfg := config.TestMempoolConfig()
+	cfg.CheckTxRetryDelay = 50 * time.Millisecond
+
+	app := abcimock.NewClient(t)
+	app.On("CheckTx", mock.Anything, mock.Anything).
+		Return((*abci.ResponseCheckTx)(nil), fmt.Errorf("connection reset by peer"))
+
+	m := NewAppMempool(cfg, app)
+	tx := types.Tx("panic-tx")
+
+	require.NoError(t, m.CheckTx(tx, func(_ *abci.ResponseCheckTx) { panic("callback panic") }, TxInfo{}))
+	require.Eventually(t, func() bool {
+		return !m.guard.Has(tx.Key())
+	}, cfg.CheckTxRetryDelay, 5*time.Millisecond)
+}
+
 func TestAppMempool_UsesConfigValues(t *testing.T) {
 	t.Run("ReapTxs receives MaxBytes and MaxGas from config", func(t *testing.T) {
 		cfg := config.TestMempoolConfig()
