@@ -290,18 +290,17 @@ func (rs *reactorSet) newReactorPriorityQueue(
 		concurrentPoolCapacity = 512
 	)
 
-	// priority queue max: use reactor-specific override if set, else global config.
-	// 0 means unbounded — only acceptable in tests.
+	// override MaxQueueSize == nil means unset (old/partial config); non-nil
+	// (including *0) is an explicit choice, e.g. an intentional unbounded reactor.
 	scalerCfg := rs.switchRef.host.config.Scaler
 	maxQueueSize := scalerCfg.MaxQueueSize
 	for _, override := range scalerCfg.Overrides {
-		if strings.EqualFold(override.Reactor, reactorName) && override.MaxQueueSize > 0 {
-			maxQueueSize = override.MaxQueueSize
+		if strings.EqualFold(override.Reactor, reactorName) {
+			if override.MaxQueueSize != nil {
+				maxQueueSize = *override.MaxQueueSize
+			}
 			break
 		}
-	}
-	if maxQueueSize == 0 {
-		rs.switchRef.Logger.Error("Reactor priority queue is unbounded; node is vulnerable to memory-exhaustion DoS", "reactor", reactorName)
 	}
 
 	concurrencyCounter := rs.
