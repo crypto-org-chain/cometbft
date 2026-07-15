@@ -6,7 +6,7 @@
 
 ### BUG FIXES
 
-- `[mempool]` fire callback and keep tx in seen-guard on app.CheckTx error
+- `[mempool]` fire callback on app.CheckTx error
   ([\#5952](https://github.com/cometbft/cometbft/pull/5952))
 - `[blocksync]` fix flaky `TestBlockPoolBasic` deadlock under `-race`
   ([\#5867](https://github.com/cometbft/cometbft/pull/5867))

@@ -262,9 +262,7 @@ func (m *AppMempool) CheckTx(tx types.Tx, callback func(res *abci.ResponseCheckT
 		res, err := m.app.CheckTx(ctx, req)
 		if err != nil {
 			// note that other ABCI methods panic if err is not nil.
-			// Tx stays in the seen-guard, so the response code must not be
-			// CodeTypeRetry: that tells the client to resubmit, but a resubmit
-			// would just be rejected as already-seen.
+			// Tx stays in the seen-guard still.
 			m.logger.Error("AppMempool.CheckTx: error inserting tx", "error", err, "tx", txHash(tx))
 			if callback != nil {
 				callback(&abci.ResponseCheckTx{Code: 1, Log: err.Error()})
