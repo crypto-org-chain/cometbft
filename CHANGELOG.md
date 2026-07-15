@@ -6,6 +6,9 @@
 
 ### BUG FIXES
 
+- `[mempool]` include proto framing overhead in AppReactor batch size to prevent peer teardown
+  ([\#5956](https://github.com/cometbft/cometbft/pull/5956))
+
 ### IMPROVEMENTS
 
 ### FEATURES
