@@ -184,7 +184,7 @@ func (p *Pool[T]) Push(msg T) {
 }
 
 // PushPriority adds a message to the priority queue first.
-// Non-blocking as priority queue is a linked-list
+// Non-blocking; returns ErrQueueFull when a capped queue is full and has no lower-priority item to evict.
 func (p *Pool[T]) PushPriority(msg T, priority int) error {
 	return p.priorityQueue.Push(msg, priority)
 }
