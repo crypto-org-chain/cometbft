@@ -6,6 +6,8 @@
 
 ### BUG FIXES
 
+- `[consensus]` correct loop condition in checkDoubleSigningRisk for height=1
+  ([\#5668](https://github.com/cometbft/cometbft/pull/5668))
 - `[lp2p]` cap per-reactor priority queue to prevent memory-exhaustion DoS
   ([\#5955](https://github.com/cometbft/cometbft/pull/5955))
 - `[mempool]` include proto framing overhead in AppReactor batch size to prevent peer teardown
