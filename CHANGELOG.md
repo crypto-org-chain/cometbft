@@ -6,6 +6,8 @@
 
 ### BUG FIXES
 
+- `[lp2p]` bound reactor queue by bytes and stop default override pinning queue size
+  ([\#63](https://github.com/crypto-org-chain/cometbft/pull/63))
 - `[blocksync]` tolerate late BlockResponse from honest peers after switching to consensus
   ([\#5959](https://github.com/cometbft/cometbft/pull/5959))
 - `[consensus]` correct loop condition in checkDoubleSigningRisk for height=1
