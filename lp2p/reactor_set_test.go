@@ -153,7 +153,7 @@ func TestReactorSet(t *testing.T) {
 		}
 
 		// ACT #1: receive for known reactor A
-		rs.Receive("A", "PexRequest", envelopeA, 5)
+		rs.Receive("A", "PexRequest", envelopeA, 5, 1)
 
 		// ASSERT #1: envelope is processed by reactor A
 		require.Eventually(t, func() bool {
@@ -167,7 +167,7 @@ func TestReactorSet(t *testing.T) {
 		assert.Len(t, reactorB.receivedEnvelopes(), 0)
 
 		// ACT #2: receive for unknown reactor name
-		rs.Receive("unknown", "FooBar", envelopeUnknown, 1)
+		rs.Receive("unknown", "FooBar", envelopeUnknown, 1, 1)
 
 		// ASSERT #2: no additional messages are processed
 		assert.Len(t, reactorA.receivedEnvelopes(), 1)
@@ -202,7 +202,7 @@ func TestReactorSet(t *testing.T) {
 		// Must exceed the total buffer depth (~inbound_cap + workers + pq_cap) to
 		// guarantee drops regardless of goroutine scheduling.
 		for i := 0; i < 1000; i++ {
-			rs.Receive("A", "PexRequest", envelope, 1)
+			rs.Receive("A", "PexRequest", envelope, 1, 1)
 		}
 
 		// ASSERT: the queue-full drop path is reached and logged.
@@ -242,7 +242,7 @@ func TestReactorSet(t *testing.T) {
 		}
 
 		for i := 0; i < 1000; i++ { // exceeds smallCap + inbound(512)
-			rs.Receive("A", "PexRequest", envelope, 1)
+			rs.Receive("A", "PexRequest", envelope, 1, 1)
 		}
 
 		require.Eventually(t, func() bool {
@@ -251,7 +251,7 @@ func TestReactorSet(t *testing.T) {
 	})
 
 	t.Run("receiveNeverDropsWithExplicitUnboundedOverride", func(t *testing.T) {
-		// override explicitly sets MaxQueueSize to 0 — must mean "unbounded for
+		// override explicitly sets both bounds to 0 — must mean "unbounded for
 		// this reactor", not "inherit the global cap" (nil would mean that).
 		const smallCap = 16
 		explicitUnbounded := 0
@@ -259,8 +259,9 @@ func TestReactorSet(t *testing.T) {
 			cfg.Scaler.MaxQueueSize = smallCap
 			cfg.Scaler.Overrides = []config.LibP2PScalerOverride{
 				{
-					Reactor:      "A",
-					MaxQueueSize: &explicitUnbounded,
+					Reactor:       "A",
+					MaxQueueSize:  &explicitUnbounded,
+					MaxQueueBytes: &explicitUnbounded,
 				},
 			}
 		}
@@ -282,10 +283,70 @@ func TestReactorSet(t *testing.T) {
 		}
 
 		for i := 0; i < 1000; i++ { // far more than smallCap
-			rs.Receive("A", "PexRequest", envelope, 1)
+			rs.Receive("A", "PexRequest", envelope, 1, 1)
 		}
 
 		require.False(t, ts.logBuffer.HasMatchingLine("Reactor queue full, dropping message", "reactor=A"))
+	})
+
+	t.Run("receiveDropsWhenByteBoundReachedBelowItemCap", func(t *testing.T) {
+		// The item cap stays generous; only the byte bound can stop a flood of
+		// large messages, which is the case an item-only cap misses.
+		const largePayload = 64 * 1024
+		configOverride := func(cfg *config.LibP2PConfig) {
+			cfg.Scaler.MaxQueueSize = 1_000_000
+			cfg.Scaler.MaxQueueBytes = 8 * largePayload
+		}
+		ts := newReactorSetTestSuite(t, withLogging(), withModifiedConfig(configOverride))
+		rs := newReactorSet(ts.sw)
+
+		reactorA := ts.newReactor([]*conn.ChannelDescriptor{{ID: 0xF4}})
+		require.NoError(t, rs.Add(reactorA, "A"))
+		require.NoError(t, rs.Start(func(protocol.ID) {}))
+		t.Cleanup(rs.Stop)
+
+		blocked := make(chan struct{})
+		t.Cleanup(func() { close(blocked) })
+		reactorA.OnReceive(func(p2p.Envelope) { <-blocked })
+
+		envelope := p2p.Envelope{
+			ChannelID: 0xF4,
+			Message:   &tmp2p.PexRequest{},
+		}
+
+		for i := 0; i < 1000; i++ {
+			rs.Receive("A", "PexRequest", envelope, 1, largePayload)
+		}
+
+		require.Eventually(t, func() bool {
+			return ts.logBuffer.HasMatchingLine("Reactor queue full, dropping message", "reactor=A")
+		}, 2*time.Second, 10*time.Millisecond)
+	})
+
+	t.Run("warnsWhenQueueIsFullyUnbounded", func(t *testing.T) {
+		configOverride := func(cfg *config.LibP2PConfig) {
+			cfg.Scaler.MaxQueueSize = 0
+			cfg.Scaler.MaxQueueBytes = 0
+		}
+		ts := newReactorSetTestSuite(t, withLogging(), withModifiedConfig(configOverride))
+		rs := newReactorSet(ts.sw)
+
+		require.NoError(t, rs.Add(ts.newReactor([]*conn.ChannelDescriptor{{ID: 0xF5}}), "A"))
+
+		require.True(t, ts.logBuffer.HasMatchingLine("Reactor priority queue is unbounded", "reactor=A"))
+	})
+
+	t.Run("doesNotWarnWhenOnlyOneBoundIsSet", func(t *testing.T) {
+		configOverride := func(cfg *config.LibP2PConfig) {
+			cfg.Scaler.MaxQueueSize = 0
+			cfg.Scaler.MaxQueueBytes = 1024
+		}
+		ts := newReactorSetTestSuite(t, withLogging(), withModifiedConfig(configOverride))
+		rs := newReactorSet(ts.sw)
+
+		require.NoError(t, rs.Add(ts.newReactor([]*conn.ChannelDescriptor{{ID: 0xF6}}), "A"))
+
+		require.False(t, ts.logBuffer.HasMatchingLine("Reactor priority queue is unbounded", "reactor=A"))
 	})
 
 	t.Run("recover", func(t *testing.T) {
@@ -311,7 +372,7 @@ func TestReactorSet(t *testing.T) {
 			Message:   &tmp2p.PexRequest{},
 		}
 
-		rs.Receive("A", "PexRequest", envelopeA, 5)
+		rs.Receive("A", "PexRequest", envelopeA, 5, 1)
 
 		// ASSERT
 		// No panic the in the background workers

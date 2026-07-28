@@ -6,6 +6,12 @@
 
 ### BUG FIXES
 
+- `[lp2p]` bound reactor queue by bytes and stop default override pinning queue size
+  ([\#63](https://github.com/crypto-org-chain/cometbft/pull/63))
+- `[blocksync]` tolerate late BlockResponse from honest peers after switching to consensus
+  ([\#5959](https://github.com/cometbft/cometbft/pull/5959))
+- `[consensus]` correct loop condition in checkDoubleSigningRisk for height=1
+  ([\#5668](https://github.com/cometbft/cometbft/pull/5668))
 - `[lp2p]` cap per-reactor priority queue to prevent memory-exhaustion DoS
   ([\#5955](https://github.com/cometbft/cometbft/pull/5955))
 - `[mempool]` include proto framing overhead in AppReactor batch size to prevent peer teardown

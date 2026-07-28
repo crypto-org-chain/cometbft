@@ -2,9 +2,11 @@ package config_test
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -204,6 +206,28 @@ func TestP2PConfigValidateBasic(t *testing.T) {
 				errContains: "p2p.libp2p.scaler.overrides.0.threshold_latency can't be negative",
 			},
 			{
+				name: "rejectsNegativeScalerMaxQueueBytes",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.Scaler.MaxQueueBytes = -1
+				},
+				errContains: "p2p.libp2p.scaler.max_queue_bytes can't be negative",
+			},
+			{
+				name: "rejectsNegativeOverrideMaxQueueBytes",
+				mutate: func(cfg *config.P2PConfig) {
+					negative := -1
+					cfg.LibP2PConfig.Scaler.Overrides = []config.LibP2PScalerOverride{
+						{
+							Reactor:       "MEMPOOL",
+							MinWorkers:    1,
+							MaxWorkers:    2,
+							MaxQueueBytes: &negative,
+						},
+					}
+				},
+				errContains: "p2p.libp2p.scaler.overrides.0.max_queue_bytes can't be negative",
+			},
+			{
 				name: "disabledLimits",
 				mutate: func(cfg *config.P2PConfig) {
 					cfg.LibP2PConfig.Limits.Mode = config.LibP2PLimitsModeDisabled
@@ -382,4 +406,44 @@ func TestInstrumentationConfigValidateBasic(t *testing.T) {
 	// tamper with maximum open connections
 	cfg.MaxOpenConnections = -1
 	assert.Error(t, cfg.ValidateBasic())
+}
+
+// A default override carrying a non-nil queue bound is merged into the
+// operator's first override block by mapstructure, so the operator's global
+// value is silently replaced by the shipped default.
+func TestLibP2PScalerOverrideInheritsGlobalQueueBounds(t *testing.T) {
+	const configTOML = `
+[p2p.libp2p.scaler]
+max_queue_size = 50000
+max_queue_bytes = 52428800
+
+[[p2p.libp2p.scaler.overrides]]
+reactor = "BLOCKSYNC"
+min_workers = 2
+max_workers = 16
+`
+
+	v := viper.New()
+	v.SetConfigType("toml")
+	require.NoError(t, v.ReadConfig(strings.NewReader(configTOML)))
+
+	cfg := config.DefaultConfig()
+	require.NoError(t, v.Unmarshal(cfg))
+
+	scaler := cfg.P2P.LibP2PConfig.Scaler
+	require.Equal(t, 50000, scaler.MaxQueueSize)
+	require.Equal(t, 52428800, scaler.MaxQueueBytes)
+
+	require.Len(t, scaler.Overrides, 1)
+	override := scaler.Overrides[0]
+	require.Equal(t, "BLOCKSYNC", override.Reactor)
+	assert.Nil(t, override.MaxQueueSize, "omitted bound must stay nil so it inherits the global value")
+	assert.Nil(t, override.MaxQueueBytes, "omitted bound must stay nil so it inherits the global value")
+}
+
+func TestDefaultLibP2PScalerOverridesLeaveQueueBoundsUnset(t *testing.T) {
+	for _, override := range config.DefaultLibP2PScaler().Overrides {
+		assert.Nil(t, override.MaxQueueSize, "default override %q must not pin max_queue_size", override.Reactor)
+		assert.Nil(t, override.MaxQueueBytes, "default override %q must not pin max_queue_bytes", override.Reactor)
+	}
 }
