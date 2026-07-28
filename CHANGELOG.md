@@ -6,6 +6,8 @@
 
 ### BUG FIXES
 
+- `[blocksync]` tolerate late BlockResponse from honest peers after switching to consensus
+  ([\#5959](https://github.com/cometbft/cometbft/pull/5959))
 - `[consensus]` correct loop condition in checkDoubleSigningRisk for height=1
   ([\#5668](https://github.com/cometbft/cometbft/pull/5668))
 - `[lp2p]` cap per-reactor priority queue to prevent memory-exhaustion DoS
