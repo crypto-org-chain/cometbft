@@ -43,6 +43,10 @@ type pendingEnvelope struct {
 	p2p.Envelope
 	messageType string
 	addedAt     time.Time
+	// payloadBytes is the wire size of the message as received, used for the
+	// queue's byte bound. Taken from the raw frame rather than re-measured off
+	// the decoded message, which would cost a second proto walk per envelope.
+	payloadBytes int
 }
 
 func newReactorSet(switchRef *Switch) *reactorSet {
@@ -185,7 +189,7 @@ func (rs *reactorSet) getReactorWithProtocol(id protocol.ID) (reactorProtocol, r
 // - All messages are sorted by priority, most important are processed first
 // - We can process as many concurrent messages as possible
 // - In case of latency degradation, the system is downscale to preserve processing speed.
-func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Envelope, priority int) {
+func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Envelope, priority, payloadBytes int) {
 	idx, ok := rs.reactorNames[reactorName]
 	if !ok {
 		rs.switchRef.Logger.Error("Receive: reactor not found", "reactor", reactorName)
@@ -205,9 +209,10 @@ func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Enve
 	now := time.Now()
 
 	pq := pendingEnvelope{
-		Envelope:    envelope,
-		messageType: messageType,
-		addedAt:     now,
+		Envelope:     envelope,
+		messageType:  messageType,
+		addedAt:      now,
+		payloadBytes: payloadBytes,
 	}
 
 	err := reactor.consumerQueue.PushPriority(pq, priority)
@@ -291,27 +296,55 @@ func (rs *reactorSet) newReactorPriorityQueue(
 		concurrentPoolCapacity = 512
 	)
 
-	// override MaxQueueSize == nil means unset (old/partial config); non-nil
-	// (including *0) is an explicit choice, e.g. an intentional unbounded reactor.
+	// An override bound of nil means unset (old/partial config) and inherits the
+	// global value; non-nil (including 0) is an explicit choice, e.g. an
+	// intentionally unbounded reactor.
 	scalerCfg := rs.switchRef.host.config.Scaler
 	maxQueueSize := scalerCfg.MaxQueueSize
-	if override, ok := findScalerOverride(scalerCfg.Overrides, reactorName); ok && override.MaxQueueSize != nil {
-		maxQueueSize = *override.MaxQueueSize
+	maxQueueBytes := scalerCfg.MaxQueueBytes
+	if override, ok := findScalerOverride(scalerCfg.Overrides, reactorName); ok {
+		if override.MaxQueueSize != nil {
+			maxQueueSize = *override.MaxQueueSize
+		}
+		if override.MaxQueueBytes != nil {
+			maxQueueBytes = *override.MaxQueueBytes
+		}
+	}
+
+	if maxQueueSize <= 0 && maxQueueBytes <= 0 {
+		rs.switchRef.Logger.Error(
+			"Reactor priority queue is unbounded, node can be driven out of memory by a single fast peer",
+			"reactor", reactorName,
+			"max_queue_size", maxQueueSize,
+			"max_queue_bytes", maxQueueBytes,
+		)
 	}
 
 	concurrencyCounter := rs.
 		switchRef.metrics.MessageReactorQueueConcurrency.
 		With("reactor", reactorName)
 
-	priorityQueue := autopool.NewPriorityQueueWithMax(priorities, maxQueueSize, autopool.WithOnEvict(func(v any) {
-		e, ok := v.(pendingEnvelope)
-		if !ok {
-			return
-		}
-		labels := []string{"reactor", reactorName, "message_type", e.messageType}
-		rs.switchRef.metrics.MessagesReactorInFlight.With(labels...).Add(-1)
-		rs.switchRef.metrics.MessagesReactorDropped.With(labels...).Add(1)
-	}))
+	priorityQueue := autopool.NewPriorityQueueWithMax(
+		priorities,
+		maxQueueSize,
+		autopool.WithMaxBytes(maxQueueBytes),
+		autopool.WithSizeOf(func(v any) int {
+			e, ok := v.(pendingEnvelope)
+			if !ok {
+				return 0
+			}
+			return e.payloadBytes
+		}),
+		autopool.WithOnEvict(func(v any) {
+			e, ok := v.(pendingEnvelope)
+			if !ok {
+				return
+			}
+			labels := []string{"reactor", reactorName, "message_type", e.messageType}
+			rs.switchRef.metrics.MessagesReactorInFlight.With(labels...).Add(-1)
+			rs.switchRef.metrics.MessagesReactorDropped.With(labels...).Add(1)
+		}),
+	)
 
 	return autopool.New(
 		scaler,

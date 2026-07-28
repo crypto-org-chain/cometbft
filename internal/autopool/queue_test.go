@@ -239,3 +239,122 @@ func genRandomData(count int, priorities uint64) []testData {
 
 	return out
 }
+
+// sizedValue measures as its own byte weight for the byte-bound tests.
+type sizedValue struct {
+	name  string
+	bytes int
+}
+
+func sizeOfSizedValue(v any) int {
+	sv, ok := v.(sizedValue)
+	if !ok {
+		return 0
+	}
+	return sv.bytes
+}
+
+func TestPriorityQueueWithMaxBytes(t *testing.T) {
+	const oneMB = 1024 * 1024
+
+	newQueue := func(maxSize, maxBytes int) *PriorityQueue {
+		return NewPriorityQueueWithMax(3, maxSize,
+			WithMaxBytes(maxBytes),
+			WithSizeOf(sizeOfSizedValue),
+		)
+	}
+
+	t.Run("boundsMemoryWhileItemCapIsFarFromReached", func(t *testing.T) {
+		// The scenario the item cap alone misses: 1MB messages under a 200k
+		// item cap reach 200MB after only ~200 pushes.
+		q := newQueue(200_000, 8*oneMB)
+
+		for i := 0; i < 8; i++ {
+			require.NoError(t, q.Push(sizedValue{name: "big", bytes: oneMB}, 1))
+		}
+		require.Equal(t, 8*oneMB, q.Bytes())
+		require.Equal(t, 8, q.size)
+
+		require.ErrorIs(t, q.Push(sizedValue{name: "overflow", bytes: oneMB}, 1), ErrQueueFull)
+		require.Equal(t, 8, q.size, "item cap was never close to full")
+	})
+
+	t.Run("popReleasesBytes", func(t *testing.T) {
+		q := newQueue(0, 4*oneMB)
+
+		for i := 0; i < 4; i++ {
+			require.NoError(t, q.Push(sizedValue{name: "big", bytes: oneMB}, 1))
+		}
+		require.ErrorIs(t, q.Push(sizedValue{name: "overflow", bytes: oneMB}, 1), ErrQueueFull)
+
+		_, ok := q.Pop()
+		require.True(t, ok)
+		require.Equal(t, 3*oneMB, q.Bytes())
+
+		require.NoError(t, q.Push(sizedValue{name: "after-pop", bytes: oneMB}, 1))
+		require.ErrorIs(t, q.Push(sizedValue{name: "still-full", bytes: oneMB}, 1), ErrQueueFull)
+	})
+
+	t.Run("evictsUntilNewcomerFits", func(t *testing.T) {
+		// One high-priority 4MB value needs four 1MB low-priority evictions,
+		// so a single eviction per push would not be enough.
+		q := newQueue(0, 4*oneMB)
+
+		for i := 0; i < 4; i++ {
+			require.NoError(t, q.Push(sizedValue{name: "small", bytes: oneMB}, 1))
+		}
+
+		require.NoError(t, q.Push(sizedValue{name: "big", bytes: 4 * oneMB}, 3))
+		require.Equal(t, 4*oneMB, q.Bytes())
+		require.Equal(t, 1, q.size)
+
+		v, ok := q.Pop()
+		require.True(t, ok)
+		require.Equal(t, "big", v.(sizedValue).name)
+		require.Zero(t, q.Bytes())
+	})
+
+	t.Run("rejectsValueLargerThanBound", func(t *testing.T) {
+		q := newQueue(0, oneMB)
+
+		// Evicting everything still cannot make room, so this must reject
+		// rather than loop forever.
+		require.NoError(t, q.Push(sizedValue{name: "small", bytes: 1}, 1))
+		require.ErrorIs(t, q.Push(sizedValue{name: "huge", bytes: 2 * oneMB}, 3), ErrQueueFull)
+	})
+
+	t.Run("evictedValuesAreReportedOnce", func(t *testing.T) {
+		var evicted []string
+		q := NewPriorityQueueWithMax(3, 0,
+			WithMaxBytes(2*oneMB),
+			WithSizeOf(sizeOfSizedValue),
+			WithOnEvict(func(v any) {
+				evicted = append(evicted, v.(sizedValue).name)
+			}),
+		)
+
+		require.NoError(t, q.Push(sizedValue{name: "low-1", bytes: oneMB}, 1))
+		require.NoError(t, q.Push(sizedValue{name: "low-2", bytes: oneMB}, 1))
+		require.NoError(t, q.Push(sizedValue{name: "high", bytes: 2 * oneMB}, 3))
+
+		require.Equal(t, []string{"low-1", "low-2"}, evicted)
+		require.Equal(t, 2*oneMB, q.Bytes())
+	})
+
+	t.Run("byteBoundInertWithoutSizeOf", func(t *testing.T) {
+		q := NewPriorityQueueWithMax(3, 0, WithMaxBytes(1))
+
+		for i := 0; i < 100; i++ {
+			require.NoError(t, q.Push(sizedValue{name: "unmeasured", bytes: oneMB}, 1))
+		}
+		require.Zero(t, q.Bytes())
+	})
+
+	t.Run("itemCapStillEnforcedAlongsideByteCap", func(t *testing.T) {
+		q := newQueue(2, 100*oneMB)
+
+		require.NoError(t, q.Push(sizedValue{name: "a", bytes: 1}, 1))
+		require.NoError(t, q.Push(sizedValue{name: "b", bytes: 1}, 1))
+		require.ErrorIs(t, q.Push(sizedValue{name: "c", bytes: 1}, 1), ErrQueueFull)
+	})
+}

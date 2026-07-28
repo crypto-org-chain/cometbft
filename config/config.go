@@ -682,6 +682,7 @@ type LibP2PScaler struct {
 	MaxWorkers       int                    `mapstructure:"max_workers"`
 	ThresholdLatency time.Duration          `mapstructure:"threshold_latency"`
 	MaxQueueSize     int                    `mapstructure:"max_queue_size"`
+	MaxQueueBytes    int                    `mapstructure:"max_queue_bytes"`
 	Overrides        []LibP2PScalerOverride `mapstructure:"overrides"`
 }
 
@@ -692,6 +693,7 @@ type LibP2PScalerOverride struct {
 	MaxWorkers       int           `mapstructure:"max_workers"`
 	ThresholdLatency time.Duration `mapstructure:"threshold_latency"`
 	MaxQueueSize     *int          `mapstructure:"max_queue_size"`
+	MaxQueueBytes    *int          `mapstructure:"max_queue_bytes"`
 }
 
 // LibP2PLimits parameters for lib-p2p resource manager.
@@ -815,20 +817,28 @@ func (cfg *LibP2PConfig) ValidateBasic() error {
 	return nil
 }
 
+// DefaultLibP2PMaxQueueBytes bounds a reactor's queued message footprint. An
+// item cap cannot do this alone: consensus-sized messages reach hundreds of MB
+// in a few hundred entries.
+const DefaultLibP2PMaxQueueBytes = 200 * 1024 * 1024
+
 func DefaultLibP2PScaler() LibP2PScaler {
-	defaultOverrideMaxQueueSize := 200_000
 	return LibP2PScaler{
 		MinWorkers:       4,
 		MaxWorkers:       32,
 		ThresholdLatency: 100 * time.Millisecond,
 		MaxQueueSize:     200_000,
+		MaxQueueBytes:    DefaultLibP2PMaxQueueBytes,
 		Overrides: []LibP2PScalerOverride{
 			{
 				Reactor:          "MEMPOOL",
 				MinWorkers:       8,
 				MaxWorkers:       512,
 				ThresholdLatency: 500 * time.Millisecond,
-				MaxQueueSize:     &defaultOverrideMaxQueueSize,
+				// Leave the queue bounds nil so they track the global values.
+				// A non-nil default here would be merged into the operator's
+				// first override block by mapstructure, silently pinning their
+				// reactors to this value instead of their configured global.
 			},
 		},
 	}
@@ -853,6 +863,8 @@ func (s *LibP2PScaler) ValidateBasic() error {
 		return cmterrors.ErrNegativeField{Field: key("threshold_latency")}
 	case s.MaxQueueSize < 0:
 		return cmterrors.ErrNegativeField{Field: key("max_queue_size")}
+	case s.MaxQueueBytes < 0:
+		return cmterrors.ErrNegativeField{Field: key("max_queue_bytes")}
 	case len(s.Overrides) > 0:
 		for i, item := range s.Overrides {
 			switch {
@@ -871,6 +883,8 @@ func (s *LibP2PScaler) ValidateBasic() error {
 				return cmterrors.ErrNegativeField{Field: key("overrides.%d.threshold_latency", i)}
 			case item.MaxQueueSize != nil && *item.MaxQueueSize < 0:
 				return cmterrors.ErrNegativeField{Field: key("overrides.%d.max_queue_size", i)}
+			case item.MaxQueueBytes != nil && *item.MaxQueueBytes < 0:
+				return cmterrors.ErrNegativeField{Field: key("overrides.%d.max_queue_bytes", i)}
 			}
 		}
 	}

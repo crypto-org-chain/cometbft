@@ -68,7 +68,15 @@ type PriorityQueue struct {
 	// size mirrors sum(levels[i].Len()); kept as a counter so Push doesn't need
 	// to scan all levels (and their locks) to check capacity.
 	size int
-	mu   sync.Mutex
+	// maxBytes bounds the total footprint of queued values; 0 means unlimited.
+	// An item cap alone cannot bound memory: reactors carrying multi-MB messages
+	// reach hundreds of MB long before a 200k item cap trips.
+	maxBytes int
+	bytes    int
+	// sizeOf reports the byte footprint of a value. Must be deterministic for a
+	// given value: Pop and evict recompute it to decrement the counter.
+	sizeOf func(value any) int
+	mu     sync.Mutex
 
 	// onEvict, if set, is called with the value dropped by evictLowerPriority.
 	onEvict func(value any)
@@ -85,6 +93,18 @@ type PriorityQueueOption func(*PriorityQueue)
 // evicts a lower-priority item to make room.
 func WithOnEvict(onEvict func(value any)) PriorityQueueOption {
 	return func(q *PriorityQueue) { q.onEvict = onEvict }
+}
+
+// WithMaxBytes bounds the total byte footprint of queued values (0 means
+// unbounded). Requires WithSizeOf; without it every value measures 0 and the
+// bound never trips.
+func WithMaxBytes(maxBytes int) PriorityQueueOption {
+	return func(q *PriorityQueue) { q.maxBytes = maxBytes }
+}
+
+// WithSizeOf sets how a value's byte footprint is measured for WithMaxBytes.
+func WithSizeOf(sizeOf func(value any) int) PriorityQueueOption {
+	return func(q *PriorityQueue) { q.sizeOf = sizeOf }
 }
 
 func NewPriorityQueue(priorities int) *PriorityQueue {
@@ -128,13 +148,20 @@ func (q *PriorityQueue) Push(value any, priority int) error {
 	defer q.mu.Unlock()
 
 	idx := priority - 1
+	n := q.valueBytes(value)
 
-	if q.maxSize > 0 && q.size >= q.maxSize && !q.evictLowerPriority(idx) {
-		return ErrQueueFull
+	// Drain lower-priority items until both bounds admit the newcomer. A value
+	// larger than maxBytes on its own can never fit, so this terminates by
+	// running out of evictable items rather than by satisfying the bound.
+	for q.exceeds(n) {
+		if !q.evictLowerPriority(idx) {
+			return ErrQueueFull
+		}
 	}
 
 	q.levels[idx].Push(value)
 	q.size++
+	q.bytes += n
 
 	if idx > q.highestNonEmptyLevel {
 		q.highestNonEmptyLevel = idx
@@ -145,11 +172,34 @@ func (q *PriorityQueue) Push(value any, priority int) error {
 	return nil
 }
 
+// exceeds reports whether admitting n more bytes would break either bound.
+func (q *PriorityQueue) exceeds(n int) bool {
+	if q.maxSize > 0 && q.size+1 > q.maxSize {
+		return true
+	}
+
+	return q.maxBytes > 0 && q.bytes+n > q.maxBytes
+}
+
+// valueBytes is 0 when no sizeOf was configured, which disables the byte bound.
+func (q *PriorityQueue) valueBytes(value any) int {
+	if q.sizeOf == nil {
+		return 0
+	}
+
+	n := q.sizeOf(value)
+	if n < 0 {
+		return 0
+	}
+
+	return n
+}
+
 // evictLowerPriority drops the oldest item from the lowest occupied level below newIdx; false if none to evict.
 func (q *PriorityQueue) evictLowerPriority(newIdx int) bool {
 	for i := 0; i < newIdx; i++ {
 		if v, ok := q.levels[i].Pop(); ok {
-			q.size--
+			q.discount(v)
 			if q.onEvict != nil {
 				q.onEvict(v)
 			}
@@ -157,6 +207,15 @@ func (q *PriorityQueue) evictLowerPriority(newIdx int) bool {
 		}
 	}
 	return false
+}
+
+// discount reverses the counters Push applied for value.
+func (q *PriorityQueue) discount(value any) {
+	q.size--
+	q.bytes -= q.valueBytes(value)
+	if q.bytes < 0 {
+		q.bytes = 0
+	}
 }
 
 // notifyValuesAvailable notifies callers waiting on the channel returned by
@@ -179,13 +238,21 @@ func (q *PriorityQueue) Pop() (any, bool) {
 	// highest priority first
 	for i := q.highestNonEmptyLevel; i >= 0; i-- {
 		if v, ok := q.levels[i].Pop(); ok {
-			q.size--
+			q.discount(v)
 			q.updateHighestNonEmpty(i)
 			return v, ok
 		}
 	}
 
 	return nil, false
+}
+
+// Bytes is the tracked footprint of queued values; 0 unless WithSizeOf is set.
+func (q *PriorityQueue) Bytes() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return q.bytes
 }
 
 // updateHighestNonEmpty for empty PriorityQueue it will set highestNonEmptyLevel to -1

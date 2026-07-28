@@ -376,6 +376,12 @@ threshold_latency = "{{ .P2P.LibP2PConfig.Scaler.ThresholdLatency }}"
 # 0 means unlimited (risks OOM under a sustained flood from a fast peer).
 max_queue_size = {{ .P2P.LibP2PConfig.Scaler.MaxQueueSize }}
 
+# Maximum total size of messages buffered per-reactor before drops begin (default: 209715200, ~200MB).
+# This is the bound that actually caps memory: max_queue_size counts messages, so reactors carrying
+# multi-MB payloads (consensus block parts, evidence) exhaust memory long before the message count trips.
+# 0 means unlimited (risks OOM under a sustained flood from a fast peer).
+max_queue_bytes = {{ .P2P.LibP2PConfig.Scaler.MaxQueueBytes }}
+
 # Override a specific reactor (case-insensitive), for example:
 # [[p2p.libp2p.scaler.overrides]]
 # reactor = "BLOCKSYNC"
@@ -383,6 +389,9 @@ max_queue_size = {{ .P2P.LibP2PConfig.Scaler.MaxQueueSize }}
 # max_workers = 16
 # threshold_latency = "250ms"
 # max_queue_size = 200000
+# max_queue_bytes = 209715200
+#
+# Omitted queue bounds inherit the global values above.
 #
 # By default, MEMPOOL reactor is overridden to have increased throughput
 # If you want to disable this, explicitly set override to an empty list:
@@ -395,6 +404,9 @@ max_workers = {{ .MaxWorkers }}
 threshold_latency = "{{ .ThresholdLatency }}"
 {{- if .MaxQueueSize }}
 max_queue_size = {{ DerefIntOrZero .MaxQueueSize }}
+{{- end }}
+{{- if .MaxQueueBytes }}
+max_queue_bytes = {{ DerefIntOrZero .MaxQueueBytes }}
 {{- end }}
 {{- end }}
 
