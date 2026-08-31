@@ -272,7 +272,7 @@ func createEvidenceReactor(config *cfg.Config, dbProvider cfg.DBProvider,
 		return nil, nil, err
 	}
 	evidenceLogger := logger.With("module", "evidence")
-	enabled := true
+	enabled := false
 	if config.Evidence != nil {
 		enabled = config.Evidence.Enabled
 	}

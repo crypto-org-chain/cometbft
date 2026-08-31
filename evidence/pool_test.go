@@ -102,6 +102,10 @@ func TestEvidencePoolDisabled(t *testing.T) {
 	)
 
 	valSet, privVals := types.RandValidatorSet(1, 10)
+	blockStore.On("LoadBlockMeta", mock.AnythingOfType("int64")).Return(
+		&types.BlockMeta{Header: types.Header{Time: defaultEvidenceTime}},
+	)
+	stateStore.On("LoadValidators", mock.AnythingOfType("int64")).Return(valSet, nil)
 	stateStore.On("Load").Return(createState(height+1, valSet), nil)
 
 	pool, err := evidence.NewPoolWithEnabled(evidenceDB, stateStore, blockStore, false)
@@ -120,6 +124,17 @@ func TestEvidencePoolDisabled(t *testing.T) {
 
 	pool.ReportConflictingVotes(ev.VoteA, ev.VoteB)
 	assert.Zero(t, pool.Size())
+
+	// CheckEvidence still verifies for consensus but does not buffer for gossip/proposal.
+	require.NoError(t, pool.CheckEvidence(types.EvidenceList{ev}))
+	pending, size = pool.PendingEvidence(defaultEvidenceMaxBytes)
+	assert.Empty(t, pending)
+	assert.Zero(t, size)
+	assert.Zero(t, pool.Size())
+
+	badEv, err := types.NewMockDuplicateVoteEvidenceWithValidator(height, defaultEvidenceTime.Add(time.Minute), privVals[0], evidenceChainID)
+	require.NoError(t, err)
+	assert.Error(t, pool.CheckEvidence(types.EvidenceList{badEv}))
 }
 
 // Tests inbound evidence for the right time and height
