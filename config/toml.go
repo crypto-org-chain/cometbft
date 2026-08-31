@@ -511,6 +511,16 @@ peer_gossip_sleep_duration = "{{ .Consensus.PeerGossipSleepDuration }}"
 peer_query_maj23_sleep_duration = "{{ .Consensus.PeerQueryMaj23SleepDuration }}"
 
 #######################################################
+###         Evidence Configuration Options          ###
+#######################################################
+[evidence]
+
+# If false: no P2P gossip, no local proposal of evidence, and no accepting or
+# buffering of new evidence. Blocks that include evidence are still verified
+# so consensus remains safe. Default is false.
+enabled = {{ .Evidence.Enabled }}
+
+#######################################################
 ###         Storage Configuration Options           ###
 #######################################################
 [storage]

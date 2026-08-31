@@ -25,6 +25,9 @@ const (
 	baseKeyPending   = byte(0x01)
 )
 
+// ErrDisabled is returned when evidence handling is disabled via config.
+var ErrDisabled = errors.New("evidence is disabled")
+
 // Pool maintains a pool of valid evidence to be broadcasted and committed
 type Pool struct {
 	logger log.Logger
@@ -38,6 +41,9 @@ type Pool struct {
 	// needed to load headers and commits to verify evidence
 	blockStore BlockStore
 
+	// enabled controls gossip, proposal, and acceptance of new evidence.
+	enabled bool
+
 	mtx sync.Mutex
 	// latest state
 	state sm.State
@@ -50,9 +56,16 @@ type Pool struct {
 	pruningTime   time.Time
 }
 
-// NewPool creates an evidence pool. If using an existing evidence store,
-// it will add all pending evidence to the concurrent list.
+// NewPool creates an evidence pool with evidence handling enabled.
+// If using an existing evidence store, it will add all pending evidence to the concurrent list.
 func NewPool(evidenceDB dbm.DB, stateDB sm.Store, blockStore BlockStore) (*Pool, error) {
+	return NewPoolWithEnabled(evidenceDB, stateDB, blockStore, true)
+}
+
+// NewPoolWithEnabled creates an evidence pool. When enabled is false, the pool
+// does not gossip, propose, accept, or buffer evidence. Existing pending evidence
+// in the DB is not loaded onto the gossip list.
+func NewPoolWithEnabled(evidenceDB dbm.DB, stateDB sm.Store, blockStore BlockStore, enabled bool) (*Pool, error) {
 	state, err := stateDB.Load()
 	if err != nil {
 		return nil, fmt.Errorf("cannot load state: %w", err)
@@ -66,6 +79,11 @@ func NewPool(evidenceDB dbm.DB, stateDB sm.Store, blockStore BlockStore) (*Pool,
 		evidenceStore:   evidenceDB,
 		evidenceList:    clist.New(),
 		consensusBuffer: make([]duplicateVoteSet, 0),
+		enabled:         enabled,
+	}
+
+	if !enabled {
+		return pool, nil
 	}
 
 	// if pending evidence already in db, in event of prior failure, then check for expiration,
@@ -83,8 +101,16 @@ func NewPool(evidenceDB dbm.DB, stateDB sm.Store, blockStore BlockStore) (*Pool,
 	return pool, nil
 }
 
+// IsEnabled reports whether evidence handling is enabled on this pool.
+func (evpool *Pool) IsEnabled() bool {
+	return evpool.enabled
+}
+
 // PendingEvidence is used primarily as part of block proposal and returns up to maxNum of uncommitted evidence.
 func (evpool *Pool) PendingEvidence(maxBytes int64) ([]types.Evidence, int64) {
+	if !evpool.enabled {
+		return []types.Evidence{}, 0
+	}
 	if evpool.Size() == 0 {
 		return []types.Evidence{}, 0
 	}
@@ -132,6 +158,10 @@ func (evpool *Pool) Update(state sm.State, ev types.EvidenceList) {
 
 // AddEvidence checks the evidence is valid and adds it to the pool.
 func (evpool *Pool) AddEvidence(ev types.Evidence) error {
+	if !evpool.enabled {
+		return ErrDisabled
+	}
+
 	evpool.logger.Info("Attempting to add evidence", "ev", ev)
 
 	// We have already verified this piece of evidence - no need to do it again
@@ -177,6 +207,9 @@ func (evpool *Pool) AddEvidence(ev types.Evidence) error {
 //
 // Votes are not verified.
 func (evpool *Pool) ReportConflictingVotes(voteA, voteB *types.Vote) {
+	if !evpool.enabled {
+		return
+	}
 	evpool.mtx.Lock()
 	defer evpool.mtx.Unlock()
 	evpool.consensusBuffer = append(evpool.consensusBuffer, duplicateVoteSet{
@@ -208,10 +241,13 @@ func (evpool *Pool) CheckEvidence(evList types.EvidenceList) error {
 				return err
 			}
 
-			if err := evpool.addPendingEvidence(ev); err != nil {
-				// Something went wrong with adding the evidence but we already know it is valid
-				// hence we log an error and continue
-				evpool.logger.Error("Can't add evidence to pending list", "err", err, "ev", ev)
+			// When disabled, verify for consensus but do not persist for re-gossip/proposal.
+			if evpool.enabled {
+				if err := evpool.addPendingEvidence(ev); err != nil {
+					// Something went wrong with adding the evidence but we already know it is valid
+					// hence we log an error and continue
+					evpool.logger.Error("Can't add evidence to pending list", "err", err, "ev", ev)
+				}
 			}
 
 			evpool.logger.Info("Check evidence: verified evidence of byzantine behavior", "evidence", ev)

@@ -93,6 +93,35 @@ func TestEvidencePoolBasic(t *testing.T) {
 	assert.Equal(t, 1, len(evs))
 }
 
+func TestEvidencePoolDisabled(t *testing.T) {
+	var (
+		height     = int64(1)
+		stateStore = &smmocks.Store{}
+		evidenceDB = dbm.NewMemDB()
+		blockStore = &mocks.BlockStore{}
+	)
+
+	valSet, privVals := types.RandValidatorSet(1, 10)
+	stateStore.On("Load").Return(createState(height+1, valSet), nil)
+
+	pool, err := evidence.NewPoolWithEnabled(evidenceDB, stateStore, blockStore, false)
+	require.NoError(t, err)
+	assert.False(t, pool.IsEnabled())
+
+	ev, err := types.NewMockDuplicateVoteEvidenceWithValidator(height, defaultEvidenceTime, privVals[0], evidenceChainID)
+	require.NoError(t, err)
+
+	assert.ErrorIs(t, pool.AddEvidence(ev), evidence.ErrDisabled)
+
+	pending, size := pool.PendingEvidence(defaultEvidenceMaxBytes)
+	assert.Empty(t, pending)
+	assert.Zero(t, size)
+	assert.Zero(t, pool.Size())
+
+	pool.ReportConflictingVotes(ev.VoteA, ev.VoteB)
+	assert.Zero(t, pool.Size())
+}
+
 // Tests inbound evidence for the right time and height
 func TestAddExpiredEvidence(t *testing.T) {
 	var (

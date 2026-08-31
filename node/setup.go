@@ -272,12 +272,19 @@ func createEvidenceReactor(config *cfg.Config, dbProvider cfg.DBProvider,
 		return nil, nil, err
 	}
 	evidenceLogger := logger.With("module", "evidence")
-	evidencePool, err := evidence.NewPool(evidenceDB, stateStore, blockStore)
+	enabled := true
+	if config.Evidence != nil {
+		enabled = config.Evidence.Enabled
+	}
+	evidencePool, err := evidence.NewPoolWithEnabled(evidenceDB, stateStore, blockStore, enabled)
 	if err != nil {
 		return nil, nil, err
 	}
 	evidenceReactor := evidence.NewReactor(evidencePool)
 	evidenceReactor.SetLogger(evidenceLogger)
+	if !enabled {
+		evidenceLogger.Info("Evidence handling disabled via config; gossip and proposal of evidence are off")
+	}
 	return evidenceReactor, evidencePool, nil
 }
 

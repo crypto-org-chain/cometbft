@@ -34,7 +34,7 @@ type Reactor struct {
 	eventBus *types.EventBus
 }
 
-// NewReactor returns a new Reactor with the given config and evpool.
+// NewReactor returns a new Reactor with the given evpool.
 func NewReactor(evpool *Pool) *Reactor {
 	evR := &Reactor{
 		evpool: evpool,
@@ -64,12 +64,20 @@ func (evR *Reactor) GetChannels() []*p2p.ChannelDescriptor {
 
 // AddPeer implements Reactor.
 func (evR *Reactor) AddPeer(peer p2p.Peer) {
+	if !evR.evpool.IsEnabled() {
+		return
+	}
 	go evR.broadcastEvidenceRoutine(peer)
 }
 
 // Receive implements Reactor.
 // It adds any received evidence to the evpool.
 func (evR *Reactor) Receive(e p2p.Envelope) {
+	if !evR.evpool.IsEnabled() {
+		evR.Logger.Debug("Ignoring evidence message; evidence is disabled", "src", e.Src)
+		return
+	}
+
 	evis, err := evidenceListFromProto(e.Message)
 	if err != nil {
 		evR.Logger.Error("Error decoding message", "src", e.Src, "chId", e.ChannelID, "err", err)

@@ -78,6 +78,7 @@ type Config struct {
 	StateSync       *StateSyncConfig       `mapstructure:"statesync"`
 	BlockSync       *BlockSyncConfig       `mapstructure:"blocksync"`
 	Consensus       *ConsensusConfig       `mapstructure:"consensus"`
+	Evidence        *EvidenceConfig        `mapstructure:"evidence"`
 	Storage         *StorageConfig         `mapstructure:"storage"`
 	TxIndex         *TxIndexConfig         `mapstructure:"tx_index"`
 	Instrumentation *InstrumentationConfig `mapstructure:"instrumentation"`
@@ -93,6 +94,7 @@ func DefaultConfig() *Config {
 		StateSync:       DefaultStateSyncConfig(),
 		BlockSync:       DefaultBlockSyncConfig(),
 		Consensus:       DefaultConsensusConfig(),
+		Evidence:        DefaultEvidenceConfig(),
 		Storage:         DefaultStorageConfig(),
 		TxIndex:         DefaultTxIndexConfig(),
 		Instrumentation: DefaultInstrumentationConfig(),
@@ -109,6 +111,7 @@ func TestConfig() *Config {
 		StateSync:       TestStateSyncConfig(),
 		BlockSync:       TestBlockSyncConfig(),
 		Consensus:       TestConsensusConfig(),
+		Evidence:        TestEvidenceConfig(),
 		Storage:         TestStorageConfig(),
 		TxIndex:         TestTxIndexConfig(),
 		Instrumentation: TestInstrumentationConfig(),
@@ -1133,6 +1136,32 @@ func (cfg *ConsensusConfig) ValidateBasic() error {
 		return errors.New("double_sign_check_height can't be negative")
 	}
 	return nil
+}
+
+//-----------------------------------------------------------------------------
+// EvidenceConfig
+
+// EvidenceConfig defines the configuration for the evidence reactor and pool.
+type EvidenceConfig struct {
+	// Enabled controls gossip, proposal, and acceptance of new evidence.
+	// When false, the node does not gossip evidence, propose evidence in blocks,
+	// or accept/buffer new evidence. Blocks that include evidence are still
+	// verified so consensus remains safe.
+	Enabled bool `mapstructure:"enabled"`
+}
+
+// DefaultEvidenceConfig returns a default configuration for evidence handling.
+func DefaultEvidenceConfig() *EvidenceConfig {
+	return &EvidenceConfig{
+		Enabled: false,
+	}
+}
+
+// TestEvidenceConfig returns an evidence configuration for testing.
+func TestEvidenceConfig() *EvidenceConfig {
+	return &EvidenceConfig{
+		Enabled: true,
+	}
 }
 
 //-----------------------------------------------------------------------------
