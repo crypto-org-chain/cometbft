@@ -312,17 +312,13 @@ func (txi *TxIndex) Search(
 	}
 
 	// filteredHashes holds one entry per matching event, so a tx can appear
-	// more than once.
+	// more than once; sorting puts its entries next to each other.
 	txs := make([]txInfo, 0, len(filteredHashes))
-	seen := make(map[string]struct{}, len(filteredHashes))
 	for _, info := range filteredHashes {
-		if _, ok := seen[string(info.hash)]; ok {
-			continue
-		}
-		seen[string(info.hash)] = struct{}{}
 		txs = append(txs, info)
 	}
 	sortTxInfos(txs, pagSettings.OrderDesc)
+	txs = dedupSortedTxInfos(txs)
 
 	totalCount := len(txs)
 	if pagSettings.IsPaginated {
@@ -332,7 +328,7 @@ func (txi *TxIndex) Search(
 	results := make([]*abci.TxResult, 0, len(txs))
 RESULTS_LOOP:
 	for _, info := range txs {
-		res, err := txi.Get(info.hash)
+		res, err := txi.Get([]byte(info.hash))
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to get Tx{%X}: %w", info.hash, err)
 		}
@@ -350,8 +346,9 @@ RESULTS_LOOP:
 }
 
 // txInfo identifies a matched tx by the position recorded in its event key.
+// hash shares memory with the key of the map it is stored in.
 type txInfo struct {
-	hash   []byte
+	hash   string
 	height int64
 	index  uint32
 }
@@ -362,11 +359,29 @@ func sortTxInfos(txs []txInfo, desc bool) {
 		if desc {
 			a, b = b, a
 		}
-		if a.height == b.height {
+		if a.height != b.height {
+			return a.height < b.height
+		}
+		if a.index != b.index {
 			return a.index < b.index
 		}
-		return a.height < b.height
+		return a.hash < b.hash
 	})
+}
+
+// dedupSortedTxInfos removes repeated hashes in place; txs must be sorted.
+func dedupSortedTxInfos(txs []txInfo) []txInfo {
+	if len(txs) == 0 {
+		return txs
+	}
+	n := 1
+	for _, info := range txs[1:] {
+		if info.hash != txs[n-1].hash {
+			txs[n] = info
+			n++
+		}
+	}
+	return txs[:n]
 }
 
 // paginate returns an empty page when page is out of range; the caller
@@ -404,11 +419,9 @@ func (txi *TxIndex) setTmpHashes(tmpHeights map[string]txInfo, key, value []byte
 	}
 	eventSeq := extractEventSeqFromKey(key)
 
-	// Copy the value because the iterator will be reused.
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
-
-	tmpHeights[string(valueCopy)+eventSeq] = txInfo{hash: valueCopy, height: height, index: index}
+	// Converting to string copies the value, which the iterator reuses.
+	k := string(value) + string(eventSeq)
+	tmpHeights[k] = txInfo{hash: k[:len(value)], height: height, index: index}
 }
 
 // match returns all matching txs by hash that meet a given condition and start
@@ -573,7 +586,7 @@ func (txi *TxIndex) match(
 REMOVE_LOOP:
 	for k, v := range filteredHashes {
 		tmpHash, ok := tmpHashes[k]
-		if !ok || !bytes.Equal(tmpHash.hash, v.hash) {
+		if !ok || tmpHash.hash != v.hash {
 			delete(filteredHashes, k)
 
 			// Potentially exit early.
@@ -700,7 +713,7 @@ LOOP:
 REMOVE_LOOP:
 	for k, v := range filteredHashes {
 		tmpHash, ok := tmpHashes[k]
-		if !ok || !bytes.Equal(tmpHash.hash, v.hash) {
+		if !ok || tmpHash.hash != v.hash {
 			delete(filteredHashes, k)
 
 			// Potentially exit early.
@@ -799,15 +812,14 @@ func extractValueFromKey(key []byte) string {
 	return string(value)
 }
 
-func extractEventSeqFromKey(key []byte) string {
-	parts := strings.Split(string(key), tagKeySeparator)
-
-	lastEl := parts[len(parts)-1]
-
-	if strings.Contains(lastEl, eventSeqSeparator) {
-		return strings.SplitN(lastEl, eventSeqSeparator, 2)[1]
+// extractEventSeqFromKey returns a subslice of key; keys indexed without an
+// event sequence yield "0".
+func extractEventSeqFromKey(key []byte) []byte {
+	lastElem := key[bytes.LastIndexByte(key, tagKeySeparatorRune)+1:]
+	if i := bytes.Index(lastElem, []byte(eventSeqSeparator)); i != -1 {
+		return lastElem[i+len(eventSeqSeparator):]
 	}
-	return "0"
+	return []byte("0")
 }
 
 func keyForEvent(key string, value string, result *abci.TxResult, eventSeq int64) []byte {

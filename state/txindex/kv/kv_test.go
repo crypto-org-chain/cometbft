@@ -408,6 +408,30 @@ func TestTxSearchPagination(t *testing.T) {
 	}
 }
 
+func TestSortAndDedupTxInfos(t *testing.T) {
+	a1 := txInfo{hash: "a", height: 1, index: 0}
+	b1 := txInfo{hash: "b", height: 1, index: 0} // same position as a1, e.g. corrupt index
+	c2 := txInfo{hash: "c", height: 2, index: 1}
+
+	testCases := []struct {
+		name     string
+		txs      []txInfo
+		desc     bool
+		expected []txInfo
+	}{
+		{"empty", nil, false, nil},
+		{"duplicates interleaved", []txInfo{c2, a1, b1, a1, c2, b1}, false, []txInfo{a1, b1, c2}},
+		{"descending", []txInfo{a1, c2, a1, b1}, true, []txInfo{c2, b1, a1}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sortTxInfos(tc.txs, tc.desc)
+			require.Equal(t, tc.expected, dedupSortedTxInfos(tc.txs))
+		})
+	}
+}
+
 func TestExtractHeightAndIndexFromKey(t *testing.T) {
 	testCases := []struct {
 		name   string
