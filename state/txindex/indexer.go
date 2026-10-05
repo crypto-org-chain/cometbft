@@ -26,8 +26,9 @@ type TxIndexer interface {
 	// or stored.
 	Get(hash []byte) (*abci.TxResult, error)
 
-	// Search allows you to query for transactions.
-	Search(ctx context.Context, q *query.Query) ([]*abci.TxResult, error)
+	// Search returns the transactions matching q, ordered by height and index,
+	// and the total number of matches before pagination.
+	Search(ctx context.Context, q *query.Query, pagSettings Pagination) ([]*abci.TxResult, int, error)
 
 	// Set Logger
 	SetLogger(l log.Logger)
@@ -37,6 +38,15 @@ type TxIndexer interface {
 // NOTE: Batch is NOT thread-safe and must not be modified after starting its execution.
 type Batch struct {
 	Ops []*abci.TxResult
+}
+
+// Pagination selects one page of Search results. Without IsPaginated all
+// matches are returned.
+type Pagination struct {
+	OrderDesc   bool
+	IsPaginated bool
+	Page        int
+	PerPage     int
 }
 
 // NewBatch creates a new Batch.

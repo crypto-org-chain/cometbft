@@ -141,7 +141,7 @@ func TestTxSearch(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
+			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
 			assert.NoError(t, err)
 
 			assert.Len(t, results, tc.resultsLength)
@@ -234,7 +234,7 @@ func TestTxSearchEventMatch(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
+			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
 			assert.NoError(t, err)
 
 			assert.Len(t, results, tc.resultsLength)
@@ -310,7 +310,7 @@ func TestTxSearchEventMatchByHeight(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
+			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
 			assert.NoError(t, err)
 
 			assert.Len(t, results, tc.resultsLength)
@@ -343,9 +343,100 @@ func TestTxSearchWithCancelation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	results, err := indexer.Search(ctx, query.MustCompile(`account.number = 1`))
+	results, _, err := indexer.Search(ctx, query.MustCompile(`account.number = 1`), txindex.Pagination{})
 	assert.NoError(t, err)
 	assert.Empty(t, results)
+}
+
+// getCountingDB counts point reads, which TxIndex.Get uses to load a tx.
+type getCountingDB struct {
+	db.DB
+	gets int
+}
+
+func (d *getCountingDB) Get(key []byte) ([]byte, error) {
+	d.gets++
+	return d.DB.Get(key)
+}
+
+func TestTxSearchPagination(t *testing.T) {
+	store := &getCountingDB{DB: db.NewMemDB()}
+	indexer := NewTxIndex(store)
+
+	// Each tx emits the queried event twice, so the index holds two keys per tx.
+	owner := abci.Event{Type: "account", Attributes: []abci.EventAttribute{{Key: "owner", Value: "Ivan", Index: true}}}
+	var txResults []*abci.TxResult
+	for height := int64(1); height <= 3; height++ {
+		for index := uint32(0); index < 2; index++ {
+			txResult := txResultWithEvents([]abci.Event{owner, owner})
+			txResult.Tx = types.Tx(fmt.Sprintf("tx-%d-%d", height, index))
+			txResult.Height = height
+			txResult.Index = index
+			require.NoError(t, indexer.Index(txResult))
+			txResults = append(txResults, txResult)
+		}
+	}
+
+	testCases := []struct {
+		name        string
+		pagSettings txindex.Pagination
+		expected    []int // positions in txResults, which is in ascending order
+	}{
+		{"all ascending", txindex.Pagination{}, []int{0, 1, 2, 3, 4, 5}},
+		{"all descending", txindex.Pagination{OrderDesc: true}, []int{5, 4, 3, 2, 1, 0}},
+		{"first page ascending", txindex.Pagination{IsPaginated: true, Page: 1, PerPage: 4}, []int{0, 1, 2, 3}},
+		{"last partial page", txindex.Pagination{IsPaginated: true, Page: 2, PerPage: 4}, []int{4, 5}},
+		{"first page descending", txindex.Pagination{OrderDesc: true, IsPaginated: true, Page: 1, PerPage: 4}, []int{5, 4, 3, 2}},
+		{"page out of range", txindex.Pagination{IsPaginated: true, Page: 3, PerPage: 4}, nil},
+		{"page zero", txindex.Pagination{IsPaginated: true, Page: 0, PerPage: 4}, nil},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			store.gets = 0
+
+			results, totalCount, err := indexer.Search(context.Background(), query.MustCompile(`account.owner = 'Ivan'`), tc.pagSettings)
+			require.NoError(t, err)
+			require.Equal(t, len(txResults), totalCount)
+			require.Len(t, results, len(tc.expected))
+			for i, pos := range tc.expected {
+				require.True(t, proto.Equal(txResults[pos], results[i]), "result %d", i)
+			}
+			// only the returned page is loaded from the store
+			require.Equal(t, len(tc.expected), store.gets)
+		})
+	}
+}
+
+func TestExtractHeightAndIndexFromKey(t *testing.T) {
+	testCases := []struct {
+		name   string
+		key    string
+		height int64
+		index  uint32
+		expErr bool
+	}{
+		{"event key", "account.owner/Ivan/12/3$es$7", 12, 3, false},
+		{"key without event sequence", "sender/addr1/12/3", 12, 3, false},
+		{"value containing separator", "account.owner/a/b/12/3$es$7", 12, 3, false},
+		{"height key", "tx.height/12/12/3$es$0", 12, 3, false},
+		{"non-numeric index", "account.owner/Ivan/12/x$es$7", 0, 0, true},
+		{"index overflows uint32", "account.owner/Ivan/12/4294967296$es$7", 0, 0, true},
+		{"no separator", "account.owner", 0, 0, true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			height, index, err := extractHeightAndIndexFromKey([]byte(tc.key))
+			if tc.expErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.height, height)
+			require.Equal(t, tc.index, index)
+		})
+	}
 }
 
 func TestTxSearchDeprecatedIndexing(t *testing.T) {
@@ -416,7 +507,7 @@ func TestTxSearchDeprecatedIndexing(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
+			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
 			require.NoError(t, err)
 			for _, txr := range results {
 				for _, tr := range tc.results {
@@ -499,7 +590,7 @@ func TestTxSearchOneTxWithMultipleSameTagsButDifferentValues(t *testing.T) {
 	ctx := context.Background()
 
 	for _, tc := range testCases {
-		results, err := indexer.Search(ctx, query.MustCompile(tc.q))
+		results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
 		assert.NoError(t, err)
 		n := 0
 		if tc.found {
@@ -656,7 +747,7 @@ func TestTxSearchMultipleTxs(t *testing.T) {
 
 	ctx := context.Background()
 
-	results, err := indexer.Search(ctx, query.MustCompile(`account.number >= 1`))
+	results, _, err := indexer.Search(ctx, query.MustCompile(`account.number >= 1`), txindex.Pagination{})
 	assert.NoError(t, err)
 
 	require.Len(t, results, 3)
@@ -785,7 +876,7 @@ func TestBigInt(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
+			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
 			assert.NoError(t, err)
 			assert.Len(t, results, tc.resultsLength)
 			if tc.resultsLength > 0 && tc.txRes != nil {

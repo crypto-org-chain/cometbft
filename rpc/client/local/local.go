@@ -189,23 +189,23 @@ func (c *Local) Tx(_ context.Context, hash []byte, prove bool) (*ctypes.ResultTx
 }
 
 func (c *Local) TxSearch(
-	_ context.Context,
+	ctx context.Context,
 	query string,
 	prove bool,
 	page,
 	perPage *int,
 	orderBy string,
 ) (*ctypes.ResultTxSearch, error) {
-	return c.env.TxSearch(c.ctx, query, prove, page, perPage, orderBy)
+	return c.env.TxSearch(&rpctypes.Context{Ctx: ctx}, query, prove, page, perPage, orderBy)
 }
 
 func (c *Local) BlockSearch(
-	_ context.Context,
+	ctx context.Context,
 	query string,
 	page, perPage *int,
 	orderBy string,
 ) (*ctypes.ResultBlockSearch, error) {
-	return c.env.BlockSearch(c.ctx, query, page, perPage, orderBy)
+	return c.env.BlockSearch(&rpctypes.Context{Ctx: ctx}, query, page, perPage, orderBy)
 }
 
 func (c *Local) BroadcastEvidence(_ context.Context, ev types.Evidence) (*ctypes.ResultBroadcastEvidence, error) {
