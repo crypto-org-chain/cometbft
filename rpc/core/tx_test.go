@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -47,6 +48,7 @@ func TestTxSearchPagination(t *testing.T) {
 		{"last partial page ascending", 3, 2, "", [][2]int64{{3, 0}}, false},
 		{"first page descending", 1, 3, "desc", [][2]int64{{3, 0}, {2, 1}, {2, 0}}, false},
 		{"page out of range", 4, 2, "asc", nil, true},
+		{"page overflows offset", math.MaxInt64, 100, "asc", nil, true},
 	}
 
 	indexers := map[string]txindex.TxIndexer{

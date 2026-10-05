@@ -59,7 +59,9 @@ type Pagination struct {
 // Paginate returns the requested page of s, or nil when page is out of range;
 // callers validate page against len(s).
 func Paginate[T any](s []T, page, perPage int) []T {
-	if page < 1 || perPage < 1 {
+	// page comes from the request; checking it before multiplying keeps
+	// (page-1)*perPage from overflowing.
+	if page < 1 || perPage < 1 || page-1 > len(s)/perPage {
 		return nil
 	}
 	start := (page - 1) * perPage
