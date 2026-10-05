@@ -26,9 +26,8 @@ type TxIndexer interface {
 	// or stored.
 	Get(hash []byte) (*abci.TxResult, error)
 
-	// Search returns the transactions matching q, ordered by height and index,
-	// and the total number of matches before pagination.
-	Search(ctx context.Context, q *query.Query, pagSettings Pagination) ([]*abci.TxResult, int, error)
+	// Search allows you to query for transactions.
+	Search(ctx context.Context, q *query.Query) ([]*abci.TxResult, error)
 
 	// Set Logger
 	SetLogger(l log.Logger)
@@ -40,13 +39,38 @@ type Batch struct {
 	Ops []*abci.TxResult
 }
 
-// Pagination selects one page of Search results. Without IsPaginated all
+// PageSearcher is implemented by indexers that can order and paginate matches
+// before loading them, so a page costs less than loading every match.
+type PageSearcher interface {
+	// SearchPage returns one page of the transactions matching q, ordered by
+	// height and index, and the total number of matches.
+	SearchPage(ctx context.Context, q *query.Query, pagSettings Pagination) ([]*abci.TxResult, int, error)
+}
+
+// Pagination selects one page of search results. Without IsPaginated all
 // matches are returned.
 type Pagination struct {
 	OrderDesc   bool
 	IsPaginated bool
 	Page        int
 	PerPage     int
+}
+
+// Paginate returns the requested page of s, or nil when page is out of range;
+// callers validate page against len(s).
+func Paginate[T any](s []T, page, perPage int) []T {
+	if page < 1 || perPage < 1 {
+		return nil
+	}
+	start := (page - 1) * perPage
+	if start >= len(s) {
+		return nil
+	}
+	end := start + perPage
+	if end > len(s) {
+		end = len(s)
+	}
+	return s[start:end]
 }
 
 // NewBatch creates a new Batch.

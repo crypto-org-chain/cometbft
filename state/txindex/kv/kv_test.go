@@ -141,7 +141,7 @@ func TestTxSearch(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
+			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
 			assert.NoError(t, err)
 
 			assert.Len(t, results, tc.resultsLength)
@@ -234,7 +234,7 @@ func TestTxSearchEventMatch(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
+			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
 			assert.NoError(t, err)
 
 			assert.Len(t, results, tc.resultsLength)
@@ -310,7 +310,7 @@ func TestTxSearchEventMatchByHeight(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
+			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
 			assert.NoError(t, err)
 
 			assert.Len(t, results, tc.resultsLength)
@@ -343,7 +343,7 @@ func TestTxSearchWithCancelation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	results, _, err := indexer.Search(ctx, query.MustCompile(`account.number = 1`), txindex.Pagination{})
+	results, err := indexer.Search(ctx, query.MustCompile(`account.number = 1`))
 	assert.NoError(t, err)
 	assert.Empty(t, results)
 }
@@ -395,7 +395,7 @@ func TestTxSearchPagination(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			store.gets = 0
 
-			results, totalCount, err := indexer.Search(context.Background(), query.MustCompile(`account.owner = 'Ivan'`), tc.pagSettings)
+			results, totalCount, err := indexer.SearchPage(context.Background(), query.MustCompile(`account.owner = 'Ivan'`), tc.pagSettings)
 			require.NoError(t, err)
 			require.Equal(t, len(txResults), totalCount)
 			require.Len(t, results, len(tc.expected))
@@ -531,7 +531,7 @@ func TestTxSearchDeprecatedIndexing(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
+			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
 			require.NoError(t, err)
 			for _, txr := range results {
 				for _, tr := range tc.results {
@@ -614,7 +614,7 @@ func TestTxSearchOneTxWithMultipleSameTagsButDifferentValues(t *testing.T) {
 	ctx := context.Background()
 
 	for _, tc := range testCases {
-		results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
+		results, err := indexer.Search(ctx, query.MustCompile(tc.q))
 		assert.NoError(t, err)
 		n := 0
 		if tc.found {
@@ -771,7 +771,7 @@ func TestTxSearchMultipleTxs(t *testing.T) {
 
 	ctx := context.Background()
 
-	results, _, err := indexer.Search(ctx, query.MustCompile(`account.number >= 1`), txindex.Pagination{})
+	results, err := indexer.Search(ctx, query.MustCompile(`account.number >= 1`))
 	assert.NoError(t, err)
 
 	require.Len(t, results, 3)
@@ -900,7 +900,7 @@ func TestBigInt(t *testing.T) {
 	for _, tc := range testCases {
 
 		t.Run(tc.q, func(t *testing.T) {
-			results, _, err := indexer.Search(ctx, query.MustCompile(tc.q), txindex.Pagination{})
+			results, err := indexer.Search(ctx, query.MustCompile(tc.q))
 			assert.NoError(t, err)
 			assert.Len(t, results, tc.resultsLength)
 			if tc.resultsLength > 0 && tc.txRes != nil {

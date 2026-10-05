@@ -32,7 +32,10 @@ const (
 	eventSeqSeparator   = "$es$"
 )
 
-var _ txindex.TxIndexer = (*TxIndex)(nil)
+var (
+	_ txindex.TxIndexer    = (*TxIndex)(nil)
+	_ txindex.PageSearcher = (*TxIndex)(nil)
+)
 
 // TxIndex is the simplest possible indexer, backed by key-value storage (levelDB).
 type TxIndex struct {
@@ -205,13 +208,20 @@ func (txi *TxIndex) indexEvents(result *abci.TxResult, hash []byte, store dbm.Ba
 // condition, it queries the DB index. One special use cases here: (1) if
 // "tx.hash" is found, it returns tx result for it (2) for range queries it is
 // better for the client to provide both lower and upper bounds, so we are not
-// performing a full scan. Results from querying indexes are then intersected,
-// ordered by height and index, and paginated before any tx is loaded, so only
-// the requested page is read from the store.
+// performing a full scan. Results from querying indexes are then intersected
+// and returned to the caller, ordered by height and index.
 //
 // Search will exit early and return any result fetched so far,
 // when a message is received on the context chan.
-func (txi *TxIndex) Search(
+func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResult, error) {
+	results, _, err := txi.SearchPage(ctx, q, txindex.Pagination{})
+	return results, err
+}
+
+// SearchPage works like Search but orders and paginates matches before any tx
+// is loaded, so only the requested page is read from the store. It also
+// returns the total number of matches.
+func (txi *TxIndex) SearchPage(
 	ctx context.Context,
 	q *query.Query,
 	pagSettings txindex.Pagination,
@@ -322,7 +332,7 @@ func (txi *TxIndex) Search(
 
 	totalCount := len(txs)
 	if pagSettings.IsPaginated {
-		txs = paginate(txs, pagSettings.Page, pagSettings.PerPage)
+		txs = txindex.Paginate(txs, pagSettings.Page, pagSettings.PerPage)
 	}
 
 	results := make([]*abci.TxResult, 0, len(txs))
@@ -382,23 +392,6 @@ func dedupSortedTxInfos(txs []txInfo) []txInfo {
 		}
 	}
 	return txs[:n]
-}
-
-// paginate returns an empty page when page is out of range; the caller
-// validates page against the total count.
-func paginate(txs []txInfo, page, perPage int) []txInfo {
-	if page < 1 || perPage < 1 {
-		return nil
-	}
-	start := (page - 1) * perPage
-	if start >= len(txs) {
-		return nil
-	}
-	end := start + perPage
-	if end > len(txs) {
-		end = len(txs)
-	}
-	return txs[start:end]
 }
 
 func lookForHash(conditions []syntax.Condition) (hash []byte, ok bool, err error) {

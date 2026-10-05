@@ -75,7 +75,7 @@ func BenchmarkTxSearch(b *testing.B) {
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				if _, _, err := indexer.Search(ctx, txQuery, bm.pagSettings); err != nil {
+				if _, _, err := indexer.SearchPage(ctx, txQuery, bm.pagSettings); err != nil {
 					b.Errorf("failed to query for txs: %s", err)
 				}
 			}

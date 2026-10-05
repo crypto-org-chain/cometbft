@@ -122,8 +122,8 @@ func TestTxSearch(t *testing.T) {
 	txIndexerMock.On("Search", mock.Anything,
 		mock.MatchedBy(func(q *query.Query) bool {
 			return testQuery == strings.ReplaceAll(q.String(), " ", "")
-		}), mock.Anything).
-		Return([]*abcitypes.TxResult{testTxResult}, 1, nil)
+		})).
+		Return([]*abcitypes.TxResult{testTxResult}, nil)
 
 	rpcConfig := config.TestRPCConfig()
 	d := inspect.New(rpcConfig, blockStoreMock, stateStoreMock, txIndexerMock, blkIdxMock)
