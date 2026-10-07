@@ -1,14 +1,16 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
 
-	cmtmath "github.com/cometbft/cometbft/libs/math"
+	abci "github.com/cometbft/cometbft/abci/types"
 	cmtquery "github.com/cometbft/cometbft/libs/pubsub/query"
 	ctypes "github.com/cometbft/cometbft/rpc/core/types"
 	rpctypes "github.com/cometbft/cometbft/rpc/jsonrpc/types"
+	"github.com/cometbft/cometbft/state/txindex"
 	"github.com/cometbft/cometbft/state/txindex/null"
 	"github.com/cometbft/cometbft/types"
 )
@@ -67,52 +69,41 @@ func (env *Environment) TxSearch(
 		return nil, errors.New("maximum query length exceeded")
 	}
 
+	var orderDesc bool
+	switch orderBy {
+	case "desc":
+		orderDesc = true
+	case "asc", "":
+	default:
+		return nil, errors.New("expected order_by to be either `asc` or `desc` or empty")
+	}
+
 	q, err := cmtquery.New(query)
 	if err != nil {
 		return nil, err
 	}
 
-	results, err := env.TxIndexer.Search(ctx.Context(), q)
-	if err != nil {
-		return nil, err
-	}
-
-	// sort results (must be done before pagination)
-	switch orderBy {
-	case "desc":
-		sort.Slice(results, func(i, j int) bool {
-			if results[i].Height == results[j].Height {
-				return results[i].Index > results[j].Index
-			}
-			return results[i].Height > results[j].Height
-		})
-	case "asc", "":
-		sort.Slice(results, func(i, j int) bool {
-			if results[i].Height == results[j].Height {
-				return results[i].Index < results[j].Index
-			}
-			return results[i].Height < results[j].Height
-		})
-	default:
-		return nil, errors.New("expected order_by to be either `asc` or `desc` or empty")
-	}
-
-	// paginate results
-	totalCount := len(results)
 	perPage := env.validatePerPage(perPagePtr)
+	page := 1
+	if pagePtr != nil {
+		page = *pagePtr
+	}
 
-	page, err := validatePage(pagePtr, perPage, totalCount)
+	results, totalCount, err := env.searchTxs(ctx.Context(), q, txindex.Pagination{
+		OrderDesc: orderDesc,
+		Page:      page,
+		PerPage:   perPage,
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	skipCount := validateSkipCount(page, perPage)
-	pageSize := cmtmath.MinInt(perPage, totalCount-skipCount)
+	if _, err := validatePage(pagePtr, perPage, totalCount); err != nil {
+		return nil, err
+	}
 
-	apiResults := make([]*ctypes.ResultTx, 0, pageSize)
-	for i := skipCount; i < skipCount+pageSize; i++ {
-		r := results[i]
-
+	apiResults := make([]*ctypes.ResultTx, 0, len(results))
+	for _, r := range results {
 		var proof types.TxProof
 		if prove {
 			block := env.BlockStore.LoadBlock(r.Height)
@@ -132,4 +123,32 @@ func (env *Environment) TxSearch(
 	}
 
 	return &ctypes.ResultTxSearch{Txs: apiResults, TotalCount: totalCount}, nil
+}
+
+// searchTxs falls back to loading every match when the indexer cannot
+// paginate on its own.
+func (env *Environment) searchTxs(
+	ctx context.Context,
+	q *cmtquery.Query,
+	pagSettings txindex.Pagination,
+) ([]*abci.TxResult, int, error) {
+	if ps, ok := env.TxIndexer.(txindex.PageSearcher); ok {
+		return ps.SearchPage(ctx, q, pagSettings)
+	}
+
+	results, err := env.TxIndexer.Search(ctx, q)
+	if err != nil {
+		return nil, 0, err
+	}
+	sort.Slice(results, func(i, j int) bool {
+		a, b := results[i], results[j]
+		if pagSettings.OrderDesc {
+			a, b = b, a
+		}
+		if a.Height == b.Height {
+			return a.Index < b.Index
+		}
+		return a.Height < b.Height
+	})
+	return txindex.Paginate(results, pagSettings.Page, pagSettings.PerPage), len(results), nil
 }

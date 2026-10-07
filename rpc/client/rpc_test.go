@@ -516,6 +516,25 @@ func TestTxSearchWithTimeout(t *testing.T) {
 	require.Greater(t, len(result.Txs), 0, "expected a lot of transactions")
 }
 
+func TestLocalTxSearchHonorsContext(t *testing.T) {
+	c := getLocalClient()
+
+	_, _, tx := MakeTxKV()
+	_, err := c.BroadcastTxCommit(context.Background(), tx)
+	require.NoError(t, err)
+
+	const q = "app.creator='Cosmoshi Netowoko'"
+	result, err := c.TxSearch(context.Background(), q, false, nil, nil, "asc")
+	require.NoError(t, err)
+	require.NotEmpty(t, result.Txs)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	result, err = c.TxSearch(ctx, q, false, nil, nil, "asc")
+	require.NoError(t, err)
+	require.Empty(t, result.Txs)
+}
+
 // This test does nothing if we do not call app.SetGenBlockEvents() within main_test.go
 // It will nevertheless pass as there are no events being generated.
 func TestBlockSearch(t *testing.T) {

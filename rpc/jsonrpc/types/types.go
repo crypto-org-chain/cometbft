@@ -273,6 +273,8 @@ type Context struct {
 	WSConn WSRPCConnection
 	// http request
 	HTTPReq *http.Request
+	// caller context for in-process calls, which have neither HTTPReq nor WSConn
+	Ctx context.Context
 }
 
 // RemoteAddr returns the remote address (usually a string "IP:port").
@@ -304,10 +306,13 @@ func (ctx *Context) RemoteAddr() string {
 //
 //	The context is canceled when the client's connections closes.
 func (ctx *Context) Context() context.Context {
-	if ctx.HTTPReq != nil {
+	switch {
+	case ctx.HTTPReq != nil:
 		return ctx.HTTPReq.Context()
-	} else if ctx.WSConn != nil {
+	case ctx.WSConn != nil:
 		return ctx.WSConn.Context()
+	case ctx.Ctx != nil:
+		return ctx.Ctx
 	}
 	return context.Background()
 }

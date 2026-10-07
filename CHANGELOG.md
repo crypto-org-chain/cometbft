@@ -8,6 +8,9 @@
 
 ### IMPROVEMENTS
 
+- `[indexer]` paginate tx search results before loading txs
+  ([\#69](https://github.com/crypto-org-chain/cometbft/pull/69))
+
 ### FEATURES
 
 ### API-BREAKING
