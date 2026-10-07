@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -31,7 +32,10 @@ const (
 	eventSeqSeparator   = "$es$"
 )
 
-var _ txindex.TxIndexer = (*TxIndex)(nil)
+var (
+	_ txindex.TxIndexer    = (*TxIndex)(nil)
+	_ txindex.PageSearcher = (*TxIndex)(nil)
+)
 
 // TxIndex is the simplest possible indexer, backed by key-value storage (levelDB).
 type TxIndex struct {
@@ -210,15 +214,36 @@ func (txi *TxIndex) indexEvents(result *abci.TxResult, hash []byte, store dbm.Ba
 // Search will exit early and return any result fetched so far,
 // when a message is received on the context chan.
 func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResult, error) {
+	results, _, err := txi.search(ctx, q, nil)
+	return results, err
+}
+
+// SearchPage works like Search but orders and paginates matches before any tx
+// is loaded, so only the requested page is read from the store. It also
+// returns the total number of matches.
+func (txi *TxIndex) SearchPage(
+	ctx context.Context,
+	q *query.Query,
+	pagSettings txindex.Pagination,
+) ([]*abci.TxResult, int, error) {
+	return txi.search(ctx, q, &pagSettings)
+}
+
+// search returns all matches unordered when pag is nil.
+func (txi *TxIndex) search(
+	ctx context.Context,
+	q *query.Query,
+	pag *txindex.Pagination,
+) ([]*abci.TxResult, int, error) {
 	select {
 	case <-ctx.Done():
-		return make([]*abci.TxResult, 0), nil
+		return make([]*abci.TxResult, 0), 0, nil
 
 	default:
 	}
 
 	var hashesInitialized bool
-	filteredHashes := make(map[string][]byte)
+	filteredHashes := make(map[string]txInfo)
 
 	// get a list of conditions (like "tx.height > 5")
 	conditions := q.Syntax()
@@ -226,16 +251,20 @@ func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResul
 	// if there is a hash condition, return the result immediately
 	hash, ok, err := lookForHash(conditions)
 	if err != nil {
-		return nil, fmt.Errorf("error during searching for a hash in the query: %w", err)
+		return nil, 0, fmt.Errorf("error during searching for a hash in the query: %w", err)
 	} else if ok {
 		res, err := txi.Get(hash)
 		switch {
 		case err != nil:
-			return []*abci.TxResult{}, fmt.Errorf("error while retrieving the result: %w", err)
+			return []*abci.TxResult{}, 0, fmt.Errorf("error while retrieving the result: %w", err)
 		case res == nil:
-			return []*abci.TxResult{}, nil
+			return []*abci.TxResult{}, 0, nil
 		default:
-			return []*abci.TxResult{res}, nil
+			results := []*abci.TxResult{res}
+			if pag != nil {
+				results = txindex.Paginate(results, pag.Page, pag.PerPage)
+			}
+			return results, 1, nil
 		}
 	}
 
@@ -305,20 +334,27 @@ func (txi *TxIndex) Search(ctx context.Context, q *query.Query) ([]*abci.TxResul
 		}
 	}
 
-	results := make([]*abci.TxResult, 0, len(filteredHashes))
-	resultMap := make(map[string]struct{})
-RESULTS_LOOP:
-	for _, h := range filteredHashes {
+	txs := uniqueTxInfos(filteredHashes)
+	totalCount := len(txs)
+	if pag != nil {
+		sortTxInfos(txs, pag.OrderDesc)
+		txs = txindex.Paginate(txs, pag.Page, pag.PerPage)
+	}
 
-		res, err := txi.Get(h)
+	results := make([]*abci.TxResult, 0, len(txs))
+RESULTS_LOOP:
+	for _, info := range txs {
+		res, err := txi.Get([]byte(info.hash))
 		if err != nil {
-			return nil, fmt.Errorf("failed to get Tx{%X}: %w", h, err)
+			return nil, 0, fmt.Errorf("failed to get Tx{%X}: %w", info.hash, err)
 		}
-		hashString := string(h)
-		if _, ok := resultMap[hashString]; !ok {
-			resultMap[hashString] = struct{}{}
-			results = append(results, res)
+		if res == nil {
+			// The event key outlived the tx it points to. It is still part of
+			// totalCount, as that is known only by loading every match.
+			continue
 		}
+		results = append(results, res)
+
 		// Potentially exit early.
 		select {
 		case <-ctx.Done():
@@ -327,7 +363,58 @@ RESULTS_LOOP:
 		}
 	}
 
-	return results, nil
+	return results, totalCount, nil
+}
+
+// txInfo identifies a matched tx by the position recorded in its event key.
+// hash shares memory with the key of the map it is stored in.
+type txInfo struct {
+	hash   string
+	height int64
+	index  uint32
+}
+
+// after reports whether a is at a higher position than b.
+func (a txInfo) after(b txInfo) bool {
+	return a.height > b.height || (a.height == b.height && a.index > b.index)
+}
+
+func sortTxInfos(txs []txInfo, desc bool) {
+	sort.Slice(txs, func(i, j int) bool {
+		a, b := txs[i], txs[j]
+		if desc {
+			a, b = b, a
+		}
+		if a.height != b.height {
+			return a.height < b.height
+		}
+		if a.index != b.index {
+			return a.index < b.index
+		}
+		return a.hash < b.hash
+	})
+}
+
+// uniqueTxInfos returns one entry per matched tx. filteredHashes holds one
+// entry per matching event key, and the keys of a tx normally share its height
+// and index. A tx indexed again at another position (see Index) keeps its old
+// keys though; for such a tx the highest matched position is kept. That can
+// still be a stale one, e.g. when only the old keys match the query, in which
+// case the tx is ordered by its old position rather than the stored result's.
+func uniqueTxInfos(filteredHashes map[string]txInfo) []txInfo {
+	byHash := make(map[string]int, len(filteredHashes))
+	txs := make([]txInfo, 0, len(filteredHashes))
+	for _, info := range filteredHashes {
+		i, ok := byHash[info.hash]
+		switch {
+		case !ok:
+			byHash[info.hash] = len(txs)
+			txs = append(txs, info)
+		case info.after(txs[i]):
+			txs[i] = info
+		}
+	}
+	return txs
 }
 
 func lookForHash(conditions []syntax.Condition) (hash []byte, ok bool, err error) {
@@ -340,14 +427,22 @@ func lookForHash(conditions []syntax.Condition) (hash []byte, ok bool, err error
 	return
 }
 
-func (*TxIndex) setTmpHashes(tmpHeights map[string][]byte, key, value []byte) {
-	eventSeq := extractEventSeqFromKey(key)
+func (txi *TxIndex) setTmpHashes(tmpHeights map[string]txInfo, key, value []byte, height int64) {
+	index, eventSeq, err := extractIndexAndEventSeqFromKey(key)
+	if err != nil {
+		txi.log.Error("failure to parse index from key:", err)
+		return
+	}
 
-	// Copy the value because the iterator will be reused.
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
-
-	tmpHeights[string(valueCopy)+eventSeq] = valueCopy
+	// Converting to string copies the value, which the iterator reuses.
+	k := string(value) + string(eventSeq)
+	info := txInfo{hash: k[:len(value)], height: height, index: index}
+	// Keys of a tx indexed again at another position can share k, e.g. its
+	// tx.height keys; keep the highest position, as uniqueTxInfos does.
+	if prev, ok := tmpHeights[k]; ok && prev.after(info) {
+		return
+	}
+	tmpHeights[k] = info
 }
 
 // match returns all matching txs by hash that meet a given condition and start
@@ -359,17 +454,17 @@ func (txi *TxIndex) match(
 	ctx context.Context,
 	c syntax.Condition,
 	startKeyBz []byte,
-	filteredHashes map[string][]byte,
+	filteredHashes map[string]txInfo,
 	firstRun bool,
 	heightInfo HeightInfo,
-) map[string][]byte {
+) map[string]txInfo {
 	// A previous match was attempted but resulted in no matches, so we return
 	// no matches (assuming AND operand).
 	if !firstRun && len(filteredHashes) == 0 {
 		return filteredHashes
 	}
 
-	tmpHashes := make(map[string][]byte)
+	tmpHashes := make(map[string]txInfo)
 
 	switch c.Op {
 	case syntax.TEq:
@@ -398,7 +493,7 @@ func (txi *TxIndex) match(
 			if !withinBounds {
 				continue
 			}
-			txi.setTmpHashes(tmpHashes, key, it.Value())
+			txi.setTmpHashes(tmpHashes, key, it.Value(), keyHeight)
 			// Potentially exit early.
 			select {
 			case <-ctx.Done():
@@ -435,7 +530,7 @@ func (txi *TxIndex) match(
 			if !withinBounds {
 				continue
 			}
-			txi.setTmpHashes(tmpHashes, key, it.Value())
+			txi.setTmpHashes(tmpHashes, key, it.Value(), keyHeight)
 
 			// Potentially exit early.
 			select {
@@ -479,7 +574,7 @@ func (txi *TxIndex) match(
 				if !withinBounds {
 					continue
 				}
-				txi.setTmpHashes(tmpHashes, key, it.Value())
+				txi.setTmpHashes(tmpHashes, key, it.Value(), keyHeight)
 			}
 
 			// Potentially exit early.
@@ -511,8 +606,8 @@ func (txi *TxIndex) match(
 	// match (tmpHashes).
 REMOVE_LOOP:
 	for k, v := range filteredHashes {
-		tmpHash := tmpHashes[k]
-		if tmpHash == nil || !bytes.Equal(tmpHash, v) {
+		tmpHash, ok := tmpHashes[k]
+		if !ok || tmpHash.hash != v.hash {
 			delete(filteredHashes, k)
 
 			// Potentially exit early.
@@ -536,17 +631,17 @@ func (txi *TxIndex) matchRange(
 	ctx context.Context,
 	qr indexer.QueryRange,
 	startKey []byte,
-	filteredHashes map[string][]byte,
+	filteredHashes map[string]txInfo,
 	firstRun bool,
 	heightInfo HeightInfo,
-) map[string][]byte {
+) map[string]txInfo {
 	// A previous match was attempted but resulted in no matches, so we return
 	// no matches (assuming AND operand).
 	if !firstRun && len(filteredHashes) == 0 {
 		return filteredHashes
 	}
 
-	tmpHashes := make(map[string][]byte)
+	tmpHashes := make(map[string]txInfo)
 
 	it, err := dbm.IteratePrefix(txi.store, startKey)
 	if err != nil {
@@ -576,12 +671,12 @@ LOOP:
 				}
 
 			}
+			keyHeight, err := extractHeightFromKey(key)
+			if err != nil {
+				txi.log.Error("failure to parse height from key:", err)
+				continue
+			}
 			if qr.Key != types.TxHeightKey {
-				keyHeight, err := extractHeightFromKey(key)
-				if err != nil {
-					txi.log.Error("failure to parse height from key:", err)
-					continue
-				}
 				withinBounds, err := checkHeightConditions(heightInfo, keyHeight)
 				if err != nil {
 					txi.log.Error("failure checking for height bounds:", err)
@@ -592,7 +687,6 @@ LOOP:
 				}
 			}
 			var withinBounds bool
-			var err error
 			if !ok {
 				withinBounds, err = idxutil.CheckBounds(qr, vF)
 			} else {
@@ -601,7 +695,7 @@ LOOP:
 			if err != nil {
 				txi.log.Error("failed to parse bounds:", err)
 			} else if withinBounds {
-				txi.setTmpHashes(tmpHashes, key, it.Value())
+				txi.setTmpHashes(tmpHashes, key, it.Value(), keyHeight)
 			}
 
 			// XXX: passing time in a ABCI Events is not yet implemented
@@ -638,8 +732,8 @@ LOOP:
 	// match (tmpHashes).
 REMOVE_LOOP:
 	for k, v := range filteredHashes {
-		tmpHash := tmpHashes[k]
-		if tmpHash == nil || !bytes.Equal(tmpHashes[k], v) {
+		tmpHash, ok := tmpHashes[k]
+		if !ok || tmpHash.hash != v.hash {
 			delete(filteredHashes, k)
 
 			// Potentially exit early.
@@ -695,6 +789,22 @@ func extractHeightFromKey(key []byte) (int64, error) {
 	return height, nil
 }
 
+// extractIndexAndEventSeqFromKey parses the last element of keys of the form
+// <key>/<value>/<height>/<index>[$es$<eventSeq>]. eventSeq is a subslice of
+// key; keys indexed without an event sequence yield "0".
+func extractIndexAndEventSeqFromKey(key []byte) (uint32, []byte, error) {
+	lastElem := key[bytes.LastIndexByte(key, tagKeySeparatorRune)+1:]
+	indexBz, eventSeq, found := bytes.Cut(lastElem, []byte(eventSeqSeparator))
+	if !found {
+		eventSeq = []byte("0")
+	}
+	index, err := strconv.ParseUint(string(indexBz), 10, 32)
+	if err != nil {
+		return 0, nil, err
+	}
+	return uint32(index), eventSeq, nil
+}
+
 func extractValueFromKey(key []byte) string {
 	// Find the positions of tagKeySeparator in the byte slice
 	var indices []int
@@ -717,17 +827,6 @@ func extractValueFromKey(key []byte) string {
 
 	// TODO: Do an unsafe cast to avoid an extra allocation here
 	return string(value)
-}
-
-func extractEventSeqFromKey(key []byte) string {
-	parts := strings.Split(string(key), tagKeySeparator)
-
-	lastEl := parts[len(parts)-1]
-
-	if strings.Contains(lastEl, eventSeqSeparator) {
-		return strings.SplitN(lastEl, eventSeqSeparator, 2)[1]
-	}
-	return "0"
 }
 
 func keyForEvent(key string, value string, result *abci.TxResult, eventSeq int64) []byte {
