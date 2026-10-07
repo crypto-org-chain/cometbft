@@ -69,7 +69,7 @@ func BenchmarkTxSearch(b *testing.B) {
 		pagSettings txindex.Pagination
 	}{
 		{"all", txindex.Pagination{}},
-		{"page", txindex.Pagination{OrderDesc: true, IsPaginated: true, Page: 1, PerPage: 100}},
+		{"page", txindex.Pagination{OrderDesc: true, Page: 1, PerPage: 100}},
 	}
 
 	for _, bm := range benchmarks {

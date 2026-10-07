@@ -90,10 +90,9 @@ func (env *Environment) TxSearch(
 	}
 
 	results, totalCount, err := env.searchTxs(ctx.Context(), q, txindex.Pagination{
-		OrderDesc:   orderDesc,
-		IsPaginated: true,
-		Page:        page,
-		PerPage:     perPage,
+		OrderDesc: orderDesc,
+		Page:      page,
+		PerPage:   perPage,
 	})
 	if err != nil {
 		return nil, err

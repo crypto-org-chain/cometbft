@@ -47,18 +47,21 @@ type PageSearcher interface {
 	SearchPage(ctx context.Context, q *query.Query, pagSettings Pagination) ([]*abci.TxResult, int, error)
 }
 
-// Pagination selects one page of search results. Without IsPaginated all
-// matches are returned.
+// Pagination selects one page of search results. A PerPage of 0 returns all
+// matches.
 type Pagination struct {
-	OrderDesc   bool
-	IsPaginated bool
-	Page        int
-	PerPage     int
+	OrderDesc bool
+	Page      int
+	PerPage   int
 }
 
 // Paginate returns the requested page of s, or nil when page is out of range;
-// callers validate page against len(s).
+// callers validate page against len(s). A perPage of 0 returns all of s,
+// whatever the page.
 func Paginate[T any](s []T, page, perPage int) []T {
+	if perPage == 0 {
+		return s
+	}
 	// page comes from the request; checking it before multiplying keeps
 	// (page-1)*perPage from overflowing.
 	if page < 1 || perPage < 1 || page-1 > len(s)/perPage {
