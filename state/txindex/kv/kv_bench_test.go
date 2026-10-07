@@ -11,6 +11,7 @@ import (
 
 	abci "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/libs/pubsub/query"
+	"github.com/cometbft/cometbft/state/txindex"
 	"github.com/cometbft/cometbft/types"
 )
 
@@ -61,14 +62,23 @@ func BenchmarkTxSearch(b *testing.B) {
 	}
 
 	txQuery := query.MustCompile(`transfer.address = 'address_43' AND transfer.amount = 50`)
-
-	b.ResetTimer()
-
 	ctx := context.Background()
 
-	for i := 0; i < b.N; i++ {
-		if _, err := indexer.Search(ctx, txQuery); err != nil {
-			b.Errorf("failed to query for txs: %s", err)
-		}
+	benchmarks := []struct {
+		name        string
+		pagSettings txindex.Pagination
+	}{
+		{"all", txindex.Pagination{}},
+		{"page", txindex.Pagination{OrderDesc: true, Page: 1, PerPage: 100}},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if _, _, err := indexer.SearchPage(ctx, txQuery, bm.pagSettings); err != nil {
+					b.Errorf("failed to query for txs: %s", err)
+				}
+			}
+		})
 	}
 }
