@@ -8,8 +8,7 @@
 
 ### IMPROVEMENTS
 
-- `[indexer]` paginate tx search results before loading txs; a tx indexed
-  again at another height may be ordered by another of its positions
+- `[indexer]` paginate tx search results before loading txs
   ([\#69](https://github.com/crypto-org-chain/cometbft/pull/69))
 
 ### FEATURES
