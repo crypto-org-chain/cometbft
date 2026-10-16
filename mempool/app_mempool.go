@@ -272,19 +272,14 @@ func (m *AppMempool) CheckTx(tx types.Tx, callback func(res *abci.ResponseCheckT
 		}()
 
 		res, err := m.app.CheckTx(ctx, req)
+		if err == nil && res == nil {
+			err = errors.New("nil CheckTx response")
+		}
 		if err != nil {
 			// CheckTx errors are non-fatal; other ABCI methods panic on error.
 			m.logger.Error("AppMempool.CheckTx: error checking tx", "error", err, "tx", txHash(tx))
 			if callback != nil {
 				callback(&abci.ResponseCheckTx{Code: abci.CodeTypeInternal, Log: fmt.Sprintf("CheckTx app client error: %v", err)})
-			}
-			return
-		}
-
-		if res == nil {
-			m.logger.Error("AppMempool.CheckTx: nil response", "tx", txHash(tx))
-			if callback != nil {
-				callback(&abci.ResponseCheckTx{Code: abci.CodeTypeInternal, Log: "nil CheckTx response"})
 			}
 			return
 		}
