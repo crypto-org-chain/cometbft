@@ -211,50 +211,38 @@ func TestAppMempool(t *testing.T) {
 			}, cfg.CheckTxRetryDelay, 5*time.Millisecond)
 		})
 
-		t.Run("app client error calls callback and keeps tx in seen cache", func(t *testing.T) {
-			cfg := config.TestMempoolConfig()
-			cfg.CheckTxRetryDelay = shortRetryDelay
+		t.Run("app failure calls callback with internal code and keeps tx in seen cache", func(t *testing.T) {
+			for _, tt := range []struct {
+				name string
+				res  *abci.ResponseCheckTx
+				err  error
+			}{
+				{name: "client error", err: fmt.Errorf("connection error")},
+				{name: "nil response"},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					cfg := config.TestMempoolConfig()
+					cfg.CheckTxRetryDelay = shortRetryDelay
 
-			app := abcimock.NewClient(t)
-			app.On("CheckTx", mock.Anything, mock.Anything).
-				Return((*abci.ResponseCheckTx)(nil), fmt.Errorf("connection error"))
+					app := abcimock.NewClient(t)
+					app.On("CheckTx", mock.Anything, mock.Anything).Return(tt.res, tt.err)
 
-			m := NewAppMempool(cfg, app)
-			tx := types.Tx("retry-tx")
+					m := NewAppMempool(cfg, app)
+					failedTx := tx("app-failure-tx")
 
-			called := make(chan struct{})
-			require.NoError(t, m.CheckTx(tx, func(_ *abci.ResponseCheckTx) { close(called) }, TxInfo{}))
+					resCh := make(chan *abci.ResponseCheckTx, 1)
+					require.NoError(t, m.CheckTx(failedTx, func(res *abci.ResponseCheckTx) { resCh <- res }, TxInfo{}))
 
-			select {
-			case <-called:
-			case <-time.After(time.Second):
-				t.Fatal("callback not called on app client error")
+					select {
+					case res := <-resCh:
+						require.Equal(t, abci.CodeTypeInternal, res.Code)
+						require.NotEmpty(t, res.Log)
+					case <-time.After(time.Second):
+						t.Fatal("callback not called")
+					}
+					requireStaysSeen(t, m, failedTx)
+				})
 			}
-			requireStaysSeen(t, m, tx)
-		})
-
-		t.Run("nil response calls callback and keeps tx in seen cache", func(t *testing.T) {
-			cfg := config.TestMempoolConfig()
-			cfg.CheckTxRetryDelay = shortRetryDelay
-
-			app := abcimock.NewClient(t)
-			app.On("CheckTx", mock.Anything, mock.Anything).
-				Return((*abci.ResponseCheckTx)(nil), nil)
-
-			m := NewAppMempool(cfg, app)
-			tx := types.Tx("nil-tx")
-
-			called := make(chan struct{})
-			require.NotPanics(t, func() {
-				require.NoError(t, m.CheckTx(tx, func(_ *abci.ResponseCheckTx) { close(called) }, TxInfo{}))
-			})
-
-			select {
-			case <-called:
-			case <-time.After(time.Second):
-				t.Fatal("callback not called on nil CheckTx response")
-			}
-			requireStaysSeen(t, m, tx)
 		})
 	})
 
