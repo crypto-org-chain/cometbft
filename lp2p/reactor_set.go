@@ -194,10 +194,7 @@ func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Enve
 
 	reactor := rs.reactors[idx]
 
-	labels := []string{
-		"reactor", reactorName,
-		"message_type", messageType,
-	}
+	labels := messageLabels(reactorName, messageType)
 
 	// lp2p metrics
 	rs.switchRef.metrics.MessagesReceived.With(labels...).Add(1)
@@ -212,11 +209,11 @@ func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Enve
 
 	err := reactor.consumerQueue.PushPriority(pq, priority)
 	if err != nil {
-		rs.switchRef.metrics.MessagesReactorInFlight.With(labels...).Add(-1)
 		if errors.Is(err, autopool.ErrQueueFull) {
-			rs.switchRef.metrics.MessagesReactorDropped.With(labels...).Add(1)
-			rs.switchRef.Logger.Error("Reactor queue full, dropping message", "reactor", reactorName, "message_type", messageType)
+			rs.recordDrop(labels)
+			rs.switchRef.Logger.Debug("Reactor queue full, dropping message", "reactor", reactorName, "message_type", messageType)
 		} else {
+			rs.switchRef.metrics.MessagesReactorInFlight.With(labels...).Add(-1)
 			rs.switchRef.Logger.Error("Failed to push envelope to priority queue", "reactor", reactorName, "err", err)
 		}
 		return
@@ -232,10 +229,7 @@ func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Enve
 func (rs *reactorSet) receiveQueued(reactorID int, e pendingEnvelope) {
 	reactor := rs.reactors[reactorID]
 
-	labels := []string{
-		"reactor", reactor.name,
-		"message_type", e.messageType,
-	}
+	labels := messageLabels(reactor.name, e.messageType)
 
 	// duration between p2p receive and piping inside the consumer queue
 	pendingFor := time.Since(e.addedAt)
@@ -265,6 +259,15 @@ func (rs *reactorSet) receiveQueued(reactorID int, e pendingEnvelope) {
 
 	rs.switchRef.metrics.MessagesReactorInFlight.With(labels...).Add(-1)
 	rs.switchRef.metrics.MessageReactorReceiveDuration.With(labels...).Observe(timeTaken.Seconds())
+}
+
+func (rs *reactorSet) recordDrop(labels []string) {
+	rs.switchRef.metrics.MessagesReactorInFlight.With(labels...).Add(-1)
+	rs.switchRef.metrics.MessagesReactorDropped.With(labels...).Add(1)
+}
+
+func messageLabels(reactorName, messageType string) []string {
+	return []string{"reactor", reactorName, "message_type", messageType}
 }
 
 func (rs *reactorSet) recoverReceive(reactorName string) {
@@ -308,9 +311,7 @@ func (rs *reactorSet) newReactorPriorityQueue(
 		if !ok {
 			return
 		}
-		labels := []string{"reactor", reactorName, "message_type", e.messageType}
-		rs.switchRef.metrics.MessagesReactorInFlight.With(labels...).Add(-1)
-		rs.switchRef.metrics.MessagesReactorDropped.With(labels...).Add(1)
+		rs.recordDrop(messageLabels(reactorName, e.messageType))
 	}))
 
 	return autopool.New(
