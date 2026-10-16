@@ -303,24 +303,30 @@ func TestAppMempool(t *testing.T) {
 
 		require.Subset(t, allMempoolTxs, sink)
 
-		t.Run("nil response does not panic", func(t *testing.T) {
+		t.Run("nil response keeps streaming", func(t *testing.T) {
 			cfg := config.TestMempoolConfig()
 			cfg.ReapInterval = 5 * time.Millisecond
 
 			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			batch := types.Txs{tx("after-nil")}
 
 			app := abcimock.NewClient(t)
 			app.On("ReapTxs", mock.Anything, mock.Anything).
-				Return(func(_ context.Context, _ *abci.RequestReapTxs) (*abci.ResponseReapTxs, error) {
-					cancel()
-					return (*abci.ResponseReapTxs)(nil), nil
-				})
+				Return((*abci.ResponseReapTxs)(nil), nil).Once()
+			app.On("ReapTxs", mock.Anything, mock.Anything).
+				Return(&abci.ResponseReapTxs{Txs: batch.ToSliceOfBytes()}, nil).Maybe()
 
-			require.NotPanics(t, func() {
-				ch := NewAppMempool(cfg, app).TxStream(ctx)
-				for range ch {
-				}
-			})
+			ch := NewAppMempool(cfg, app).TxStream(ctx)
+
+			select {
+			case txs, ok := <-ch:
+				require.True(t, ok, "stream closed after nil ReapTxs response")
+				require.Equal(t, batch, txs)
+			case <-time.After(time.Second):
+				t.Fatal("no txs streamed after nil ReapTxs response")
+			}
 		})
 	})
 }
@@ -403,16 +409,9 @@ func TestAppMempool_RejectedTxsMetric(t *testing.T) {
 	app.On("InsertTx", mock.Anything, mock.Anything).
 		Return(&abci.ResponseInsertTx{Code: 123}, nil).Once()
 
-	nop := NopMetrics()
-	m := NewAppMempool(config.TestMempoolConfig(), app, WithAMMetrics(&Metrics{
-		RejectedTxs:        rejected,
-		FailedTxs:          nop.FailedTxs,
-		TxSizeBytes:        nop.TxSizeBytes,
-		EvictedTxs:         nop.EvictedTxs,
-		RecheckTimes:       nop.RecheckTimes,
-		AlreadyReceivedTxs: nop.AlreadyReceivedTxs,
-		ReapedTxs:          nop.ReapedTxs,
-	}))
+	metrics := NopMetrics()
+	metrics.RejectedTxs = rejected
+	m := NewAppMempool(config.TestMempoolConfig(), app, WithAMMetrics(metrics))
 
 	// retryable code must NOT increment RejectedTxs
 	require.Error(t, m.InsertTx(types.Tx("retry-tx")))
