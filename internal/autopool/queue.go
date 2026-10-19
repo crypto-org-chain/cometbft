@@ -93,7 +93,8 @@ func NewPriorityQueue(priorities int) *PriorityQueue {
 }
 
 // NewPriorityQueueWithMax bounds total depth at maxSize (0 means unbounded).
-// Once full, Push evicts a lower-priority item rather than reject, so low-priority bursts can't starve high-priority admission.
+// Once full, Push evicts the oldest lower-priority item if there is one, else rejects, so low-priority bursts can't
+// starve high-priority admission.
 func NewPriorityQueueWithMax(priorities, maxSize int, opts ...PriorityQueueOption) *PriorityQueue {
 	if priorities <= 0 {
 		priorities = 1
