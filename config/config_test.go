@@ -2,9 +2,11 @@ package config_test
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -409,4 +411,56 @@ func TestInstrumentationConfigValidateBasic(t *testing.T) {
 	// tamper with maximum open connections
 	cfg.MaxOpenConnections = -1
 	assert.Error(t, cfg.ValidateBasic())
+}
+
+func TestLibP2PScalerQueueBoundsFromConfigFile(t *testing.T) {
+	const override = `
+[[p2p.libp2p.scaler.overrides]]
+reactor = "BLOCKSYNC"
+min_workers = 2
+max_workers = 16
+`
+	defaults := config.DefaultLibP2PScaler()
+
+	for _, tc := range []struct {
+		name     string
+		toml     string
+		wantSize int
+	}{
+		{
+			name:     "explicitGlobal",
+			toml:     "[p2p.libp2p.scaler]\nmax_queue_size = 50000\n" + override,
+			wantSize: 50000,
+		},
+		{
+			name:     "omittedGlobalKeepsDefault",
+			toml:     override,
+			wantSize: defaults.MaxQueueSize,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := viper.New()
+			v.SetConfigType("toml")
+			require.NoError(t, v.ReadConfig(strings.NewReader(tc.toml)))
+
+			cfg := config.DefaultConfig()
+			require.NoError(t, v.Unmarshal(cfg))
+
+			scaler := cfg.P2P.LibP2PConfig.Scaler
+			require.Equal(t, tc.wantSize, scaler.MaxQueueSize)
+
+			require.Len(t, scaler.Overrides, 1)
+			require.Equal(t, "BLOCKSYNC", scaler.Overrides[0].Reactor)
+			assert.Nil(t, scaler.Overrides[0].MaxQueueSize, "omitted bound must stay nil so it inherits the global value")
+		})
+	}
+}
+
+func TestDefaultLibP2PScalerQueueBounds(t *testing.T) {
+	scaler := config.DefaultLibP2PScaler()
+	require.Equal(t, 200_000, scaler.MaxQueueSize)
+
+	for _, override := range scaler.Overrides {
+		assert.Nil(t, override.MaxQueueSize, "default override %q must not pin max_queue_size", override.Reactor)
+	}
 }
