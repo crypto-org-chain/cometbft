@@ -140,7 +140,7 @@ func (m *AppMempool) guardTx(tx types.Tx) error {
 	return nil
 }
 
-// forgetTx forgets a tx after a delay (blocking)
+// forgetTx forgets a tx after a delay
 func (m *AppMempool) forgetTx(tx types.Tx, retryable bool) {
 	delay := m.checkTxRetryDelay
 	if retryable {
@@ -294,9 +294,6 @@ func (m *AppMempool) CheckTx(tx types.Tx, callback func(res *abci.ResponseCheckT
 			m.forgetTx(tx, codeRetry(res.Code))
 		}
 
-		// app mempool doesn't execute the tx, so we ALWAYS return an empty response here.
-		// This will most likely break many clients. Clients should rely on app-specific
-		// broadcasting endpoints (think of eth_sendRawTransaction, etc...).
 		if callback != nil {
 			callback(res)
 		}
