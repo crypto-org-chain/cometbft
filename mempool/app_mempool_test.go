@@ -3,6 +3,9 @@ package mempool
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,23 +13,37 @@ import (
 	abcimock "github.com/cometbft/cometbft/abci/client/mocks"
 	abci "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/config"
+	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/types"
 	kitmetrics "github.com/go-kit/kit/metrics"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
 
+func newTestAppMempool(t *testing.T, cfg *config.MempoolConfig, app AppMempoolClient, opts ...AppMempoolOpt) *AppMempool {
+	t.Helper()
+	m := NewAppMempool(cfg, app, opts...)
+	t.Cleanup(m.Close)
+	return m
+}
+
+func checkTxResult(t *testing.T, m *AppMempool, tx types.Tx) *abci.ResponseCheckTx {
+	t.Helper()
+	resCh := make(chan *abci.ResponseCheckTx, 1)
+	require.NoError(t, m.CheckTx(tx, func(res *abci.ResponseCheckTx) { resCh <- res }, TxInfo{}))
+	select {
+	case res := <-resCh:
+		return res
+	case <-time.After(5 * time.Second):
+		t.Fatal("CheckTx callback not called")
+		return nil
+	}
+}
+
 func TestAppMempool(t *testing.T) {
 	tx := func(v string) types.Tx { return types.Tx(v) }
 
-	const (
-		codeFail        = uint32(123)
-		shortRetryDelay = 10 * time.Millisecond
-	)
-
-	requireStaysSeen := func(t *testing.T, m *AppMempool, tx types.Tx) {
-		require.Never(t, func() bool { return !m.guard.Has(tx.Key()) }, 10*shortRetryDelay, shortRetryDelay)
-	}
+	const codeFail = uint32(123)
 
 	t.Run("InsertTx", func(t *testing.T) {
 		// ARRANGE
@@ -60,7 +77,7 @@ func TestAppMempool(t *testing.T) {
 			})
 
 		// Given mempool
-		m := NewAppMempool(config.DefaultMempoolConfig(), app)
+		m := newTestAppMempool(t, config.DefaultMempoolConfig(), app)
 
 		// Given txs
 		txs := []types.Tx{tx("tx1"), tx("tx2"), tx(""), tx("fail-retryable")}
@@ -88,33 +105,6 @@ func TestAppMempool(t *testing.T) {
 			return !m.guard.Has(txs[3].Key())
 		}
 		require.Eventually(t, retryableForgotten, m.checkTxRetryDelay, 50*time.Millisecond)
-
-		t.Run("keeps tx in seen cache on transport error", func(t *testing.T) {
-			cfg := config.TestMempoolConfig()
-			cfg.CheckTxRetryDelay = shortRetryDelay
-
-			app := abcimock.NewClient(t)
-			app.On("InsertTx", mock.Anything, mock.Anything).
-				Return((*abci.ResponseInsertTx)(nil), fmt.Errorf("connection error"))
-
-			m := NewAppMempool(cfg, app)
-			tx := types.Tx("retry-tx")
-
-			require.Error(t, m.InsertTx(tx))
-			requireStaysSeen(t, m, tx)
-			require.ErrorIs(t, m.InsertTx(tx), ErrSeenTx)
-		})
-
-		t.Run("nil response panics", func(t *testing.T) {
-			app := abcimock.NewClient(t)
-			app.On("InsertTx", mock.Anything, mock.Anything).
-				Return((*abci.ResponseInsertTx)(nil), nil)
-
-			m := NewAppMempool(config.TestMempoolConfig(), app)
-			tx := types.Tx("nil-tx")
-
-			require.Panics(t, func() { _ = m.InsertTx(tx) })
-		})
 
 		t.Run("CheckTx", func(t *testing.T) {
 			for _, tt := range []struct {
@@ -202,47 +192,57 @@ func TestAppMempool(t *testing.T) {
 			app.On("CheckTx", mock.Anything, mock.Anything).
 				Return(&abci.ResponseCheckTx{Code: abci.CodeTypeRetry}, nil)
 
-			m := NewAppMempool(cfg, app)
+			var logs lockedBuffer
+			m := newTestAppMempool(t, cfg, app, WithAMLogger(log.NewTMLogger(&logs)))
+			require.True(t, m.panicStacks.claim())
 			tx := types.Tx("panic-tx")
 
 			require.NoError(t, m.CheckTx(tx, func(_ *abci.ResponseCheckTx) { panic("callback panic") }, TxInfo{}))
 			require.Eventually(t, func() bool {
 				return !m.guard.Has(tx.Key())
 			}, cfg.CheckTxRetryDelay, 5*time.Millisecond)
+
+			require.Eventually(t, func() bool {
+				return strings.Contains(logs.String(), "panic in the AppMempool CheckTx goroutine")
+			}, time.Second, 5*time.Millisecond)
+			requireOneErrorWithoutStack(t, logs.String(), "panic in the AppMempool CheckTx goroutine")
 		})
 
-		t.Run("app failure calls callback with internal code and keeps tx in seen cache", func(t *testing.T) {
-			for _, tt := range []struct {
-				name string
-				res  *abci.ResponseCheckTx
-				err  error
-			}{
-				{name: "client error", err: fmt.Errorf("connection error")},
-				{name: "nil response"},
-			} {
-				t.Run(tt.name, func(t *testing.T) {
-					cfg := config.TestMempoolConfig()
-					cfg.CheckTxRetryDelay = shortRetryDelay
+		t.Run("app panics log one stack per interval at Error and the rest at Debug", func(t *testing.T) {
+			app := abcimock.NewClient(t)
+			app.On("CheckTx", mock.Anything, mock.Anything).
+				Return(checkTxPanics)
 
-					app := abcimock.NewClient(t)
-					app.On("CheckTx", mock.Anything, mock.Anything).Return(tt.res, tt.err)
+			var logs lockedBuffer
+			m := newTestAppMempool(t, config.TestMempoolConfig(), app, WithAMLogger(log.NewTMLogger(&logs)))
 
-					m := NewAppMempool(cfg, app)
-					failedTx := tx("app-failure-tx")
-
-					resCh := make(chan *abci.ResponseCheckTx, 1)
-					require.NoError(t, m.CheckTx(failedTx, func(res *abci.ResponseCheckTx) { resCh <- res }, TxInfo{}))
-
-					select {
-					case res := <-resCh:
-						require.Equal(t, abci.CodeTypeInternal, res.Code)
-						require.NotEmpty(t, res.Log)
-					case <-time.After(time.Second):
-						t.Fatal("callback not called")
-					}
-					requireStaysSeen(t, m, failedTx)
-				})
+			for _, panicTx := range []types.Tx{tx("panic-1"), tx("panic-2")} {
+				res := checkTxResult(t, m, panicTx)
+				require.Equal(t, abci.CodeTypeInternal, res.Code)
 			}
+
+			out := logs.String()
+			require.Equal(t, 1, strings.Count(out, "stack="), out)
+			lines := requireFirstAtRestDebug(t, out, "panic in AppMempool.CheckTx", "E[")
+			require.Contains(t, lines[0], "stack=", out)
+			require.False(t, m.txPanicStacks.claim(), "CheckTx panics use the per-tx stack budget the reactor shares")
+		})
+
+		t.Run("app errors log at Error once per interval and the rest at Debug", func(t *testing.T) {
+			app := abcimock.NewClient(t)
+			app.On("CheckTx", mock.Anything, mock.Anything).Return((*abci.ResponseCheckTx)(nil), fmt.Errorf("connection error"))
+
+			var logs lockedBuffer
+			m := newTestAppMempool(t, config.TestMempoolConfig(), app, WithAMLogger(log.NewTMLogger(&logs)))
+
+			for _, failedTx := range []types.Tx{tx("error-1"), tx("error-2")} {
+				require.Equal(t, abci.CodeTypeInternal, checkTxResult(t, m, failedTx).Code)
+			}
+
+			out := logs.String()
+			requireFirstAtRestDebug(t, out, "error checking tx", "E[")
+			require.True(t, m.txPanicStacks.claim(), "CheckTx app errors must not use the per-tx panic stack budget")
+			require.True(t, m.panicStacks.claim(), "CheckTx app errors must not use the one-off stack budget")
 		})
 	})
 
@@ -278,7 +278,7 @@ func TestAppMempool(t *testing.T) {
 			})
 
 		// Given mempool
-		m := NewAppMempool(config.DefaultMempoolConfig(), app)
+		m := newTestAppMempool(t, config.DefaultMempoolConfig(), app)
 
 		// ACT
 		// stream txs from app
@@ -291,30 +291,248 @@ func TestAppMempool(t *testing.T) {
 
 		require.Subset(t, allMempoolTxs, sink)
 
-		t.Run("nil response keeps streaming", func(t *testing.T) {
+		t.Run("logs failing reaps at Error once per interval and reports recovery", func(t *testing.T) {
+			type reapFn = func(context.Context, *abci.RequestReapTxs) (*abci.ResponseReapTxs, error)
+			appPanic := func(context.Context, *abci.RequestReapTxs) (*abci.ResponseReapTxs, error) {
+				panic("app panic")
+			}
+			appErr := func(context.Context, *abci.RequestReapTxs) (*abci.ResponseReapTxs, error) {
+				return nil, fmt.Errorf("connection error")
+			}
+			nilResp := func(context.Context, *abci.RequestReapTxs) (*abci.ResponseReapTxs, error) {
+				return nil, nil
+			}
+			ctxErr := func(context.Context, *abci.RequestReapTxs) (*abci.ResponseReapTxs, error) {
+				return nil, context.DeadlineExceeded
+			}
+			empty := func(context.Context, *abci.RequestReapTxs) (*abci.ResponseReapTxs, error) {
+				return &abci.ResponseReapTxs{}, nil
+			}
+			recovery := slices.Repeat([]reapFn{empty}, reapRecoverySuccesses)
+
+			for _, tt := range []struct {
+				name            string
+				reaps           []reapFn
+				panicFirstError bool
+				wantErrors      int
+				wantStacks      int
+				wantRecovered   []string
+			}{
+				{
+					name: "healthy stream reports no recovery",
+				},
+				{
+					name:          "successes must be in a row to end the streak",
+					reaps:         slices.Concat([]reapFn{appErr}, recovery[:len(recovery)-1], []reapFn{appErr, nilResp, appErr}),
+					wantErrors:    1,
+					wantRecovered: []string{"failures=3"},
+				},
+				{
+					name:          "panic after errors still logs its stack",
+					reaps:         []reapFn{appErr, appErr, appPanic},
+					wantErrors:    2,
+					wantStacks:    1,
+					wantRecovered: []string{"failures=3"},
+				},
+				{
+					name:          "a panic streak after an error streak reports recovery",
+					reaps:         slices.Concat([]reapFn{appErr}, recovery, []reapFn{appPanic}),
+					wantErrors:    2,
+					wantStacks:    1,
+					wantRecovered: []string{"failures=1", "failures=1"},
+				},
+				{
+					name:          "stacks stay throttled across streaks",
+					reaps:         slices.Concat([]reapFn{appPanic}, recovery, []reapFn{appPanic}),
+					wantErrors:    1,
+					wantStacks:    1,
+					wantRecovered: []string{"failures=1"},
+				},
+				{
+					name:          "app context error does not stop the stream",
+					reaps:         []reapFn{ctxErr},
+					wantErrors:    1,
+					wantRecovered: []string{"failures=1"},
+				},
+				{
+					name:            "a logger that panics on a reap failure does not stop the stream",
+					reaps:           []reapFn{appErr},
+					panicFirstError: true,
+					wantRecovered:   []string{"failures=1"},
+				},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					cfg := config.TestMempoolConfig()
+					cfg.ReapInterval = 5 * time.Millisecond
+
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+
+					batch := types.Txs{tx("after-failures")}
+
+					var calls atomic.Int32
+					app := abcimock.NewClient(t)
+					app.On("ReapTxs", mock.Anything, mock.Anything).
+						Return(func(ctx context.Context, req *abci.RequestReapTxs) (*abci.ResponseReapTxs, error) {
+							switch i := int(calls.Add(1)) - 1; {
+							case i < len(tt.reaps):
+								return tt.reaps[i](ctx, req)
+							case i < len(tt.reaps)+len(recovery):
+								return empty(ctx, req)
+							default:
+								return &abci.ResponseReapTxs{Txs: batch.ToSliceOfBytes()}, nil
+							}
+						})
+
+					var logs lockedBuffer
+					logger := log.NewTMLogger(&logs)
+					if tt.panicFirstError {
+						logger = &firstErrorPanicsLogger{Logger: logger}
+					}
+					m := newTestAppMempool(t, cfg, app, WithAMLogger(logger))
+					ch := m.TxStream(ctx)
+
+					select {
+					case txs, ok := <-ch:
+						require.True(t, ok, "stream closed after a failed reap")
+						require.Equal(t, batch, txs)
+					case <-time.After(time.Second):
+						t.Fatal("no txs streamed after the failing reaps")
+					}
+
+					cancel()
+					for range ch {
+					}
+
+					out := logs.String()
+					var errorLines int
+					for _, line := range logLinesWith(out, "error reaping txs") {
+						if strings.HasPrefix(line, "E[") {
+							errorLines++
+						}
+					}
+					var recovered []string
+					for _, line := range logLinesWith(out, "reaping recovered") {
+						if !strings.HasPrefix(line, "I[") {
+							continue
+						}
+						for _, field := range strings.Fields(line) {
+							if strings.HasPrefix(field, "failures=") {
+								recovered = append(recovered, field)
+							}
+						}
+					}
+
+					require.Equal(t, tt.wantErrors, errorLines, out)
+					require.Equal(t, tt.wantStacks, strings.Count(out, "stack="), out)
+					require.Equal(t, tt.wantRecovered, recovered, out)
+					if len(tt.reaps) == 0 {
+						require.NotContains(t, out, "reaping recovered", out)
+					}
+					require.True(t, m.panicStacks.claim(), "reap failures must not use the one-off stack budget")
+					require.True(t, m.txPanicStacks.claim(), "reap failures must not use the per-tx panic stack budget")
+					require.True(t, m.checkTxErrorLogs.claim(), "reap failures must not use the CheckTx error log budget")
+				})
+			}
+		})
+
+		t.Run("each stream has its own reap log budgets", func(t *testing.T) {
+			type streamKey struct{}
+			cfg := config.TestMempoolConfig()
+			cfg.ReapInterval = 5 * time.Millisecond
+
+			var calls sync.Map
+			app := abcimock.NewClient(t)
+			app.On("ReapTxs", mock.Anything, mock.Anything).
+				Return(func(ctx context.Context, _ *abci.RequestReapTxs) (*abci.ResponseReapTxs, error) {
+					n, _ := calls.LoadOrStore(ctx.Value(streamKey{}), new(atomic.Int32))
+					switch n.(*atomic.Int32).Add(1) {
+					case 1:
+						return nil, fmt.Errorf("connection error")
+					case 2:
+						panic("app panic")
+					}
+					return &abci.ResponseReapTxs{Txs: [][]byte{[]byte("reaped")}}, nil
+				})
+
+			var logs lockedBuffer
+			m := newTestAppMempool(t, cfg, app, WithAMLogger(log.NewTMLogger(&logs)))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			streams := []<-chan types.Txs{
+				m.TxStream(context.WithValue(ctx, streamKey{}, 1)),
+				m.TxStream(context.WithValue(ctx, streamKey{}, 2)),
+			}
+			for _, ch := range streams {
+				select {
+				case _, ok := <-ch:
+					require.True(t, ok, "stream closed after a failed reap")
+				case <-time.After(time.Second):
+					t.Fatal("no txs streamed after the failed reaps")
+				}
+			}
+			cancel()
+			for _, ch := range streams {
+				for range ch {
+				}
+			}
+
+			out := logs.String()
+			require.Equal(t, 2, strings.Count(out, "stack="), out)
+			require.Len(t, logLinesWith(out, "E["), 4, out)
+		})
+
+		t.Run("a panic outside the app call closes the stream and logs at Error", func(t *testing.T) {
 			cfg := config.TestMempoolConfig()
 			cfg.ReapInterval = 5 * time.Millisecond
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			batch := types.Txs{tx("after-nil")}
+			app := abcimock.NewClient(t)
+			app.On("ReapTxs", mock.Anything, mock.Anything).Return(&abci.ResponseReapTxs{Txs: [][]byte{[]byte("reaped")}}, nil)
+
+			metrics := NopMetrics()
+			metrics.ReapedTxs = &panickingCounter{}
+			var logs lockedBuffer
+			m := newTestAppMempool(t, cfg, app, WithAMMetrics(metrics), WithAMLogger(log.NewTMLogger(&logs)))
+			require.True(t, m.panicStacks.claim())
+
+			select {
+			case _, ok := <-m.TxStream(ctx):
+				require.False(t, ok, "stream should close")
+			case <-time.After(time.Second):
+				t.Fatal("stream not closed after a panic in reapTxs")
+			}
+
+			requireOneErrorWithoutStack(t, logs.String(), "panic in AppMempool.reapTxs")
+		})
+
+		t.Run("app error after the stream context is canceled ends the stream quietly", func(t *testing.T) {
+			cfg := config.TestMempoolConfig()
+			cfg.ReapInterval = 5 * time.Millisecond
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 
 			app := abcimock.NewClient(t)
 			app.On("ReapTxs", mock.Anything, mock.Anything).
-				Return((*abci.ResponseReapTxs)(nil), nil).Once()
-			app.On("ReapTxs", mock.Anything, mock.Anything).
-				Return(&abci.ResponseReapTxs{Txs: batch.ToSliceOfBytes()}, nil).Maybe()
+				Return(func(context.Context, *abci.RequestReapTxs) (*abci.ResponseReapTxs, error) {
+					cancel()
+					return nil, fmt.Errorf("connection closed")
+				}).Once()
 
-			ch := NewAppMempool(cfg, app).TxStream(ctx)
+			var logs lockedBuffer
+			ch := newTestAppMempool(t, cfg, app, WithAMLogger(log.NewTMLogger(&logs))).TxStream(ctx)
 
 			select {
-			case txs, ok := <-ch:
-				require.True(t, ok, "stream closed after nil ReapTxs response")
-				require.Equal(t, batch, txs)
+			case _, ok := <-ch:
+				require.False(t, ok, "stream should close")
 			case <-time.After(time.Second):
-				t.Fatal("no txs streamed after nil ReapTxs response")
+				t.Fatal("stream not closed after its context was canceled")
 			}
+			require.NotContains(t, logs.String(), "error reaping txs")
 		})
 	})
 }
@@ -334,7 +552,7 @@ func TestAppMempool_UsesConfigValues(t *testing.T) {
 			return true
 		})).Return(&abci.ResponseReapTxs{Txs: [][]byte{[]byte("tx1")}}, nil).Once()
 
-		m := NewAppMempool(cfg, app)
+		m := newTestAppMempool(t, cfg, app)
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -361,7 +579,7 @@ func TestAppMempool_UsesConfigValues(t *testing.T) {
 		app.On("CheckTx", mock.Anything, mock.Anything).
 			Return(&abci.ResponseCheckTx{Code: abci.CodeTypeOK}, nil).Maybe() // not called by InsertTx
 
-		m := NewAppMempool(cfg, app)
+		m := newTestAppMempool(t, cfg, app)
 
 		// Fill cache with 3 txs
 		require.NoError(t, m.InsertTx(types.Tx("tx1")))
@@ -388,24 +606,150 @@ func (c *spyCounter) With(_ ...string) kitmetrics.Counter { return c }
 func (c *spyCounter) Add(delta float64)                   { c.n.Add(int64(delta)) }
 func (c *spyCounter) value() int64                        { return c.n.Load() }
 
-func TestAppMempool_RejectedTxsMetric(t *testing.T) {
-	rejected := &spyCounter{}
+type panickingHistogram struct{}
 
-	app := abcimock.NewClient(t)
-	app.On("InsertTx", mock.Anything, mock.Anything).
-		Return(&abci.ResponseInsertTx{Code: abci.CodeTypeRetry}, nil).Once()
-	app.On("InsertTx", mock.Anything, mock.Anything).
-		Return(&abci.ResponseInsertTx{Code: 123}, nil).Once()
+func (h panickingHistogram) With(...string) kitmetrics.Histogram { return h }
+func (panickingHistogram) Observe(float64)                       { panic("metrics panic") }
 
-	metrics := NopMetrics()
-	metrics.RejectedTxs = rejected
-	m := NewAppMempool(config.TestMempoolConfig(), app, WithAMMetrics(metrics))
+type panickingCounter struct{ spyCounter }
 
-	// retryable code must NOT increment RejectedTxs
-	require.Error(t, m.InsertTx(types.Tx("retry-tx")))
-	require.Equal(t, int64(0), rejected.value())
+func (*panickingCounter) Add(float64) { panic("metrics panic") }
 
-	// non-retryable failure must increment RejectedTxs
-	require.Error(t, m.InsertTx(types.Tx("fail-tx")))
-	require.Equal(t, int64(1), rejected.value())
+func TestAppMempool_FailureMetrics(t *testing.T) {
+	type seenCheck int
+	const (
+		unchecked seenCheck = iota
+		staysSeen
+		forgottenAfterDelay
+	)
+
+	for _, tt := range []struct {
+		name         string
+		method       string
+		ret          []any
+		wantPanic    bool
+		wantCode     uint32
+		wantLog      string
+		wantRejected int64
+		wantFailed   int64
+		seen         seenCheck
+	}{
+		{
+			name:     "InsertTx retryable code",
+			method:   "InsertTx",
+			ret:      []any{&abci.ResponseInsertTx{Code: abci.CodeTypeRetry}, nil},
+			wantCode: abci.CodeTypeRetry,
+		},
+		{
+			name:         "InsertTx non-retryable code",
+			method:       "InsertTx",
+			ret:          []any{&abci.ResponseInsertTx{Code: 123}, nil},
+			wantCode:     123,
+			wantRejected: 1,
+			seen:         staysSeen,
+		},
+		{
+			name:       "InsertTx transport error",
+			method:     "InsertTx",
+			ret:        []any{nil, fmt.Errorf("connection error")},
+			wantFailed: 1,
+			seen:       forgottenAfterDelay,
+		},
+		{
+			name:       "InsertTx nil response",
+			method:     "InsertTx",
+			ret:        []any{nil, nil},
+			wantPanic:  true,
+			wantFailed: 1,
+			seen:       staysSeen,
+		},
+		{
+			name:       "InsertTx app panic",
+			method:     "InsertTx",
+			ret:        []any{insertPanics},
+			wantPanic:  true,
+			wantFailed: 1,
+			seen:       staysSeen,
+		},
+		{
+			name:     "CheckTx non-retryable code",
+			method:   "CheckTx",
+			ret:      []any{&abci.ResponseCheckTx{Code: 123}, nil},
+			wantCode: 123,
+			seen:     forgottenAfterDelay,
+		},
+		{
+			name:       "CheckTx transport error",
+			method:     "CheckTx",
+			ret:        []any{nil, fmt.Errorf("connection error")},
+			wantCode:   abci.CodeTypeInternal,
+			wantLog:    "CheckTx app client error: connection error",
+			wantFailed: 1,
+			seen:       forgottenAfterDelay,
+		},
+		{
+			name:       "CheckTx nil response",
+			method:     "CheckTx",
+			ret:        []any{nil, nil},
+			wantCode:   abci.CodeTypeInternal,
+			wantLog:    "CheckTx app client error: nil CheckTx response",
+			wantFailed: 1,
+			seen:       forgottenAfterDelay,
+		},
+		{
+			name:       "CheckTx app panic hides the panic value",
+			method:     "CheckTx",
+			ret:        []any{checkTxPanics},
+			wantCode:   abci.CodeTypeInternal,
+			wantLog:    "CheckTx app panic",
+			wantFailed: 1,
+			seen:       forgottenAfterDelay,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := config.TestMempoolConfig()
+			cfg.CheckTxRetryDelay = 600 * time.Millisecond
+			delay := cfg.CheckTxRetryDelay
+
+			rejected, failed := &spyCounter{}, &spyCounter{}
+			metrics := NopMetrics()
+			metrics.RejectedTxs = rejected
+			metrics.FailedTxs = failed
+
+			app := abcimock.NewClient(t)
+			app.On(tt.method, mock.Anything, mock.Anything).Return(tt.ret...)
+			m := newTestAppMempool(t, cfg, app,
+				WithAMMetrics(metrics), WithAMLogger(&firstErrorPanicsLogger{Logger: log.NewNopLogger()}))
+			tx := types.Tx("metric-tx")
+
+			call := func() { require.ErrorContains(t, m.InsertTx(tx), fmt.Sprintf("(code=%d)", tt.wantCode)) }
+			if tt.method == "CheckTx" {
+				call = func() {
+					res := checkTxResult(t, m, tx)
+					require.Equal(t, tt.wantCode, res.Code)
+					require.Equal(t, tt.wantLog, res.Log)
+				}
+			}
+
+			failedAt := time.Now()
+			if tt.wantPanic {
+				require.Panics(t, call)
+			} else {
+				require.NotPanics(t, call)
+			}
+
+			require.Equal(t, tt.wantRejected, rejected.value())
+			require.Equal(t, tt.wantFailed, failed.value())
+
+			forgotten := func() bool { return !m.guard.Has(tx.Key()) }
+			switch tt.seen {
+			case staysSeen:
+				require.Never(t, forgotten, delay+delay/4, delay/10)
+				require.ErrorIs(t, m.InsertTx(tx), ErrSeenTx)
+			case forgottenAfterDelay:
+				require.Never(t, func() bool { return forgotten() && time.Since(failedAt) < delay/2 }, delay/4, delay/40)
+				require.Eventually(t, forgotten, 4*delay, delay/40)
+			}
+		})
+	}
 }

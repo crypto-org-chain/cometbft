@@ -506,7 +506,10 @@ reap_max_bytes = {{ .Mempool.ReapMaxBytes }}
 reap_max_gas = {{ .Mempool.ReapMaxGas }}
 # App mempool only: interval between ReapTxs calls when streaming txs from app.
 reap_interval = "{{ .Mempool.ReapInterval }}"
-# App mempool only: delay after which a tx is forgotten for ABCI.CheckTx
+# App mempool only: how long a tx that failed CheckTx or hit an app error stays in the seen
+# cache before it can be resubmitted. Retryable codes (>= 32000) use a tenth of it.
+# A peer tx stays cached until evicted when the app rejects it with a non-retryable code,
+# panics on it or returns nil.
 check_tx_retry_delay = "{{ .Mempool.CheckTxRetryDelay }}"
 
 #######################################################
