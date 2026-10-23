@@ -2,6 +2,9 @@ package mempool
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,12 +16,25 @@ import (
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/libs/rand"
 	"github.com/cometbft/cometbft/p2p"
+	p2pmock "github.com/cometbft/cometbft/p2p/mock"
 	protomem "github.com/cometbft/cometbft/proto/tendermint/mempool"
 	"github.com/cometbft/cometbft/types"
 	"github.com/fortytw2/leaktest"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
+
+func insertTxReq(tx string) any {
+	return mock.MatchedBy(func(req *abci.RequestInsertTx) bool { return string(req.Tx) == tx })
+}
+
+func receiveTxs(r *AppReactor, txs ...string) {
+	msg := &protomem.Txs{}
+	for _, tx := range txs {
+		msg.Txs = append(msg.Txs, []byte(tx))
+	}
+	r.Receive(p2p.Envelope{Src: p2pmock.NewPeer(net.IP{127, 0, 0, 1}), ChannelID: MempoolChannel, Message: msg})
+}
 
 func TestAppReactor(t *testing.T) {
 	t.Run("effectiveMaxBatchBytes", func(t *testing.T) {
@@ -88,6 +104,150 @@ func TestAppReactor(t *testing.T) {
 				}
 			})
 		}
+	})
+
+	t.Run("Receive keeps inserting after a panicking tx", func(t *testing.T) {
+		app := abcimock.NewClient(t)
+		app.On("InsertTx", mock.Anything, insertTxReq("poison-1")).Return(insertPanics)
+		app.On("InsertTx", mock.Anything, insertTxReq("poison-2")).
+			Return(func(context.Context, *abci.RequestInsertTx) (*abci.ResponseInsertTx, error) {
+				panic(panickingStringer{})
+			})
+		app.On("InsertTx", mock.Anything, insertTxReq("good")).
+			Return(&abci.ResponseInsertTx{Code: abci.CodeTypeOK}, nil).Once()
+
+		cfg := config.TestConfig().Mempool
+		r := NewAppReactor(cfg, newTestAppMempool(t, cfg, app), false)
+
+		var logs lockedBuffer
+		r.SetLogger(log.NewTMLogger(&logs))
+
+		require.NotPanics(t, func() { receiveTxs(r, "poison-1", "poison-2", "good") })
+
+		out := logs.String()
+		require.Contains(t, out, "Panic inserting tx", out)
+		require.Equal(t, 1, strings.Count(out, "stack="), out)
+	})
+
+	t.Run("Receive survives a logger that panics", func(t *testing.T) {
+		app := abcimock.NewClient(t)
+		app.On("InsertTx", mock.Anything, insertTxReq("poison")).
+			Return(insertPanics)
+		app.On("InsertTx", mock.Anything, insertTxReq("good")).
+			Return(&abci.ResponseInsertTx{Code: abci.CodeTypeOK}, nil).Once()
+
+		cfg := config.TestConfig().Mempool
+		r := NewAppReactor(cfg, newTestAppMempool(t, cfg, app), false)
+		r.SetLogger(&firstErrorPanicsLogger{Logger: log.NewNopLogger()})
+
+		require.NotPanics(t, func() { receiveTxs(r, "poison", "good") })
+	})
+
+	t.Run("Receive caps a long app error in its log", func(t *testing.T) {
+		long := strings.Repeat("x", 10*maxLoggedValueLen)
+		app := abcimock.NewClient(t)
+		app.On("InsertTx", mock.Anything, mock.Anything).Return((*abci.ResponseInsertTx)(nil), fmt.Errorf("%s", long))
+
+		cfg := config.TestConfig().Mempool
+		r := NewAppReactor(cfg, newTestAppMempool(t, cfg, app), false)
+
+		var logs lockedBuffer
+		r.SetLogger(log.NewTMLogger(&logs))
+		receiveTxs(r, "long-error-tx")
+
+		out := logs.String()
+		require.Contains(t, out, "Failed to insert tx")
+		for _, line := range strings.Split(out, "\n") {
+			require.Less(t, len(line), 2*maxLoggedValueLen, line)
+		}
+	})
+
+	t.Run("Receive logs insert failures at Info once per interval and the rest at Debug", func(t *testing.T) {
+		app := abcimock.NewClient(t)
+		app.On("InsertTx", mock.Anything, mock.Anything).Return(&abci.ResponseInsertTx{Code: 123}, nil)
+
+		cfg := config.TestConfig().Mempool
+		m := newTestAppMempool(t, cfg, app)
+		r := NewAppReactor(cfg, m, false)
+
+		var logs lockedBuffer
+		r.SetLogger(log.NewTMLogger(&logs))
+		receiveTxs(r, "rejected-1", "rejected-2")
+
+		out := logs.String()
+		requireFirstAtRestDebug(t, out, "Failed to insert tx", "I[")
+		require.True(t, m.checkTxErrorLogs.claim(), "insert failures must not use the CheckTx error log budget")
+	})
+
+	t.Run("Receive logs an oversized tx at Debug", func(t *testing.T) {
+		cfg := config.TestConfig().Mempool
+		cfg.MaxTxBytes = 4
+		r := NewAppReactor(cfg, newTestAppMempool(t, cfg, abcimock.NewClient(t)), false)
+
+		var logs lockedBuffer
+		r.SetLogger(log.NewTMLogger(&logs))
+		receiveTxs(r, "larger-than-four")
+
+		out := logs.String()
+		require.NotContains(t, out, "Failed to insert tx", out)
+
+		if log.LogDebug {
+			lines := logLinesWith(out, "Tx too large")
+			require.Len(t, lines, 1, out)
+			require.True(t, strings.HasPrefix(lines[0], "D["), out)
+		}
+	})
+
+	t.Run("reactor shares its mempool's per-tx panic-stack budget", func(t *testing.T) {
+		app := abcimock.NewClient(t)
+		app.On("InsertTx", mock.Anything, mock.Anything).
+			Return(insertPanics)
+
+		cfg := config.TestConfig().Mempool
+		m := newTestAppMempool(t, cfg, app)
+		r := NewAppReactor(cfg, m, false)
+		require.True(t, m.txPanicStacks.claim(), "a CheckTx panic takes this minute's stack")
+
+		var logs lockedBuffer
+		r.SetLogger(log.NewTMLogger(&logs))
+		receiveTxs(r, "poison")
+
+		out := logs.String()
+		require.NotContains(t, out, "stack=", out)
+		require.True(t, m.panicStacks.claim(), "per-tx panics must not use the one-off stack budget")
+		if log.LogDebug {
+			lines := logLinesWith(out, "Panic inserting tx")
+			require.Len(t, lines, 1, out)
+			require.True(t, strings.HasPrefix(lines[0], "D["), "a panic without a stack is logged at Debug: %s", out)
+		}
+	})
+
+	t.Run("broadcast routine logs a panic with its stack", func(t *testing.T) {
+		cfg := config.TestConfig().Mempool
+		cfg.Broadcast = true
+		cfg.ReapInterval = 5 * time.Millisecond
+
+		app := abcimock.NewClient(t)
+		app.On("ReapTxs", mock.Anything, mock.Anything).Return(&abci.ResponseReapTxs{Txs: [][]byte{[]byte("to-broadcast")}}, nil).Maybe()
+
+		metrics := NopMetrics()
+		metrics.BatchSize = panickingHistogram{}
+		m := newTestAppMempool(t, cfg, app, WithAMMetrics(metrics))
+		r := NewAppReactor(cfg, m, false)
+
+		var logs lockedBuffer
+		r.SetLogger(log.NewTMLogger(&logs))
+
+		require.NoError(t, r.Start())
+		t.Cleanup(func() { _ = r.Stop() })
+
+		require.Eventually(t, func() bool {
+			return strings.Contains(logs.String(), "Panic in broadcast routine")
+		}, 2*time.Second, 10*time.Millisecond)
+		require.NoError(t, r.Stop())
+
+		requireOneErrorWithStack(t, logs.String(), "Panic in broadcast routine")
+		require.True(t, m.txPanicStacks.claim(), "the broadcast routine must not use the per-tx panic stack budget")
 	})
 
 	t.Run("OnStop closes mempool", func(t *testing.T) {

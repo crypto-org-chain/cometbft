@@ -6,6 +6,8 @@
 
 ### BUG FIXES
 
+- `[mempool]` recover AppMempool from app errors and panics
+  ([\#72](https://github.com/crypto-org-chain/cometbft/pull/72))
 - `[lp2p]` cap per-reactor priority queue to prevent memory-exhaustion DoS
   ([\#5955](https://github.com/cometbft/cometbft/pull/5955))
 - `[mempool]` AppMempool ABCI response handling, callback/cleanup, and lifecycle

@@ -11,7 +11,7 @@ const (
 	CodeTypeOK uint32 = 0
 
 	// CodeTypeInternal is returned when CometBFT can't get a verdict from the
-	// app (transport error or nil response). Non-retryable.
+	// app (transport error, nil response or app panic). Non-retryable.
 	CodeTypeInternal uint32 = 1
 
 	// CodeTypeRetry is a code that indicates a transaction should be retried later.
