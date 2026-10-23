@@ -24,15 +24,16 @@ type Metrics struct {
 	// Histogram of transaction sizes in bytes.
 	TxSizeBytes metrics.Histogram `metrics_buckettype:"exp" metrics_bucketsizes:"1,3,7"`
 
-	// FailedTxs defines the number of failed transactions. These are
-	// transactions that failed to make it into the mempool because they were
-	// deemed invalid.
+	// FailedTxs defines the number of failed transactions. In CListMempool these
+	// are transactions deemed invalid; in AppMempool, transactions the app failed
+	// to process (client error, nil response or panic).
 	// metrics:Number of failed transactions.
 	FailedTxs metrics.Counter
 
-	// RejectedTxs defines the number of rejected transactions. These are
-	// transactions that failed to make it into the mempool due to resource
-	// limits, e.g. mempool is full.
+	// RejectedTxs defines the number of rejected transactions. In CListMempool
+	// these hit resource limits, e.g. mempool is full, or were already in the
+	// mempool; in AppMempool, these are peer txs (InsertTx) the app rejected
+	// with a non-retryable code.
 	// metrics:Number of rejected transactions.
 	RejectedTxs metrics.Counter
 
