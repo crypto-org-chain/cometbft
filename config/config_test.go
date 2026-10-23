@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/cometbft/cometbft/config"
+	cmterrors "github.com/cometbft/cometbft/types/errors"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -308,25 +310,65 @@ func TestMempoolConfigValidateBasic(t *testing.T) {
 }
 
 func TestMempoolConfigValidateBasic_AppMempool(t *testing.T) {
-	// App mempool validation only runs when type is "app"
-	cfg := config.TestMempoolConfig()
-	cfg.Type = config.MempoolTypeApp
-	cfg.SeenCacheSize = 100
-	cfg.ReapInterval = 500 * time.Millisecond
-	assert.NoError(t, cfg.ValidateBasic())
+	const notPositive = "must be positive when mempool type is \"app\""
 
-	// SeenCacheSize < 0 fails when type is app
-	cfg.SeenCacheSize = -1
-	assert.Error(t, cfg.ValidateBasic())
-	cfg.SeenCacheSize = 100
+	for _, tc := range []struct {
+		name         string
+		malleate     func(cfg *config.MempoolConfig)
+		wantContains string
+		wantNegative bool
+	}{
+		{name: "valid", malleate: func(*config.MempoolConfig) {}},
+		{
+			name:         "zero seen_cache_size",
+			malleate:     func(cfg *config.MempoolConfig) { cfg.SeenCacheSize = 0 },
+			wantContains: "seen_cache_size " + notPositive,
+		},
+		{
+			name:         "negative seen_cache_size",
+			malleate:     func(cfg *config.MempoolConfig) { cfg.SeenCacheSize = -1 },
+			wantContains: "seen_cache_size",
+			wantNegative: true,
+		},
+		{
+			name:         "zero reap_interval",
+			malleate:     func(cfg *config.MempoolConfig) { cfg.ReapInterval = 0 },
+			wantContains: "reap_interval " + notPositive,
+		},
+		{
+			name:         "negative reap_interval",
+			malleate:     func(cfg *config.MempoolConfig) { cfg.ReapInterval = -1 },
+			wantContains: "reap_interval " + notPositive,
+		},
+		{
+			name:         "zero check_tx_retry_delay",
+			malleate:     func(cfg *config.MempoolConfig) { cfg.CheckTxRetryDelay = 0 },
+			wantContains: "check_tx_retry_delay " + notPositive,
+		},
+		{
+			name:         "negative check_tx_retry_delay",
+			malleate:     func(cfg *config.MempoolConfig) { cfg.CheckTxRetryDelay = -1 },
+			wantContains: "check_tx_retry_delay " + notPositive,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.TestMempoolConfig()
+			cfg.Type = config.MempoolTypeApp
+			cfg.SeenCacheSize = 100
+			cfg.ReapInterval = 500 * time.Millisecond
+			tc.malleate(cfg)
 
-	// ReapInterval <= 0 fails when type is app
-	cfg.ReapInterval = 0
-	assert.Error(t, cfg.ValidateBasic())
-	cfg.ReapInterval = -1
-	assert.Error(t, cfg.ValidateBasic())
-	cfg.ReapInterval = 500 * time.Millisecond
-	assert.NoError(t, cfg.ValidateBasic())
+			err := cfg.ValidateBasic()
+			if tc.wantContains == "" {
+				require.NoError(t, err)
+				return
+			}
+
+			require.ErrorContains(t, err, tc.wantContains)
+			var negative cmterrors.ErrNegativeField
+			require.Equal(t, tc.wantNegative, errors.As(err, &negative), err)
+		})
+	}
 }
 
 func TestMempoolConfigValidateBasic_AppMempoolValidationSkippedForOtherTypes(t *testing.T) {
@@ -339,6 +381,7 @@ func TestMempoolConfigValidateBasic_AppMempoolValidationSkippedForOtherTypes(t *
 	cfg.Type = config.MempoolTypeNop
 	cfg.SeenCacheSize = -1
 	cfg.ReapInterval = 0
+	cfg.CheckTxRetryDelay = 0
 	assert.NoError(t, cfg.ValidateBasic())
 }
 

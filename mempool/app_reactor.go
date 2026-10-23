@@ -7,6 +7,7 @@ import (
 
 	"github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/internal/protowire"
+	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	protomem "github.com/cometbft/cometbft/proto/tendermint/mempool"
 	"github.com/cometbft/cometbft/types"
@@ -26,6 +27,8 @@ type AppReactor struct {
 
 	switchedOn           atomic.Bool
 	waitForSwitchingOnCh chan struct{}
+
+	insertErrorLogs *logThrottle
 }
 
 func NewAppReactor(
@@ -42,6 +45,7 @@ func NewAppReactor(
 		cancelCtx:            cancelCtx,
 		switchedOn:           atomic.Bool{},
 		waitForSwitchingOnCh: nil,
+		insertErrorLogs:      newLogThrottle(),
 	}
 
 	r.BaseReactor = *p2p.NewBaseReactor("Mempool", r)
@@ -70,7 +74,7 @@ func (r *AppReactor) OnStart() error {
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
-				r.Logger.Error("Panic in broadcast routine", "panic", p)
+				logRecoveredPanic(r.Logger, r.mempool.panicStacks, "Panic in broadcast routine", p)
 			}
 		}()
 
@@ -174,20 +178,27 @@ func (r *AppReactor) Receive(e p2p.Envelope) {
 }
 
 func (r *AppReactor) insertTx(peerID p2p.ID, tx types.Tx) {
+	defer func() {
+		if p := recover(); p != nil {
+			logRecoveredTxPanic(r.Logger, r.mempool.txPanicStacks, "Panic inserting tx", p, "tx", txHashValue(tx), "peer", peerID)
+		}
+	}()
+
 	err := r.mempool.InsertTx(tx)
 	if err == nil {
 		// all good
 		return
 	}
 
-	txHash := txHash(tx)
+	hash := txHashValue(tx)
+	var tooLarge *ErrTxTooLarge
 	switch {
 	case errors.Is(err, ErrSeenTx):
-		r.Logger.Debug("Tx already seen", "tx", txHash, "peer", peerID)
-	case errors.As(err, &ErrTxTooLarge{}):
-		r.Logger.Debug("Tx too large", "err", err, "tx", txHash, "peer", peerID)
+		r.Logger.Debug("Tx already seen", "tx", hash, "peer", peerID)
+	case errors.As(err, &tooLarge):
+		r.Logger.Debug("Tx too large", "err", err, "tx", hash, "peer", peerID)
 	default:
-		r.Logger.Info("Failed to insert tx", "err", err, "tx", txHash, "peer", peerID)
+		logRepeatable(r.Logger, r.insertErrorLogs, log.Logger.Info, "Failed to insert tx", "err", boundedValue{err}, "tx", hash, "peer", peerID)
 	}
 }
 
@@ -288,8 +299,4 @@ func chunkTxs(txs types.Txs, maxBatchSizeBytes int) []types.Txs {
 	}
 
 	return chunks
-}
-
-func txHash(tx types.Tx) string {
-	return fmt.Sprintf("%X", tx.Hash())
 }
