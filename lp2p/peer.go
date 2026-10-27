@@ -10,6 +10,7 @@ import (
 	"github.com/cometbft/cometbft/libs/service"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
+	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 )
@@ -35,6 +36,7 @@ type Peer struct {
 	isPrivate       bool
 	isPersistent    bool
 	isUnconditional bool
+	isBootstrap     bool
 
 	metrics *p2p.Metrics
 }
@@ -63,6 +65,8 @@ func NewPeer(
 
 		metrics: metrics,
 	}
+
+	_, p.isBootstrap = host.BootstrapPeer(addrInfo.ID)
 
 	logger := host.Logger().With("peer_id", addrInfo.ID.String())
 
@@ -171,6 +175,10 @@ func (p *Peer) send(e p2p.Envelope) (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), TimeoutStream)
 	defer cancel()
 
+	if !p.isBootstrap {
+		ctx = network.WithNoDial(ctx, "only bootstrap peers are redialed")
+	}
+
 	start := time.Now()
 
 	defer func() {
@@ -201,10 +209,14 @@ func (p *Peer) send(e p2p.Envelope) (err error) {
 }
 
 func (p *Peer) handleSendErr(err error) {
-	switch {
-	case err == nil:
+	if err == nil {
 		return
-	case errors.Is(err, swarm.ErrAllDialsFailed), errors.Is(err, swarm.ErrNoGoodAddresses):
+	}
+
+	dialFailed := errors.Is(err, swarm.ErrAllDialsFailed) || errors.Is(err, swarm.ErrNoGoodAddresses)
+	unreachable := !p.isBootstrap && p.host.Network().Connectedness(p.addrInfo.ID) != network.Connected
+
+	if dialFailed || unreachable {
 		p.host.EmitPeerFailure(p.addrInfo.ID, err)
 	}
 }
