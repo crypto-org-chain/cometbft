@@ -12,10 +12,12 @@ import (
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/libs/service"
 	"github.com/cometbft/cometbft/p2p"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
 )
@@ -35,7 +37,14 @@ type Switch struct {
 
 	metrics *p2p.Metrics
 
-	peerStoppingWait time.Duration
+	peerStoppingWait  time.Duration
+	reconcileInterval time.Duration
+	flaps             *flapBackoff
+
+	disconnects       *disconnectQueue
+	disconnectSub     event.Subscription
+	disconnectQuit    chan struct{}
+	disconnectWorkers sync.WaitGroup
 
 	// active is used to track if the switch has started
 	// BaseService has similar field, but it triggered BEFORE OnStart().
@@ -74,7 +83,10 @@ func NewSwitch(
 
 		metrics: metrics,
 
-		peerStoppingWait: defaultPeerStoppingWait,
+		peerStoppingWait:  defaultPeerStoppingWait,
+		reconcileInterval: defaultReconcileInterval,
+		flaps:             newFlapBackoff(time.Second, MaxReconnectBackoff, time.Minute),
+		disconnects:       newDisconnectQueue(),
 
 		active: atomic.Bool{},
 	}
@@ -116,6 +128,10 @@ func (s *Switch) OnStart() error {
 		peer := s.peerSet.Get(key)
 		s.StopPeerForError(peer, err)
 	})
+
+	if err := s.watchDisconnects(); err != nil {
+		return err
+	}
 
 	// at this point the switch is considered active.
 	// in case we receive a message from a bootstrap peer,
@@ -159,6 +175,7 @@ func (s *Switch) OnStart() error {
 func (s *Switch) OnStop() {
 	s.Logger.Info("Stopping LibP2PSwitch")
 
+	s.stopWatchingDisconnects()
 	s.reactors.Stop()
 	s.peerSet.RemoveAll(PeerRemovalOptions{Reason: "switch stopped"})
 
@@ -264,12 +281,22 @@ func (s *Switch) StopPeerForError(peer p2p.Peer, reason any) {
 		return
 	}
 
+	s.stopPeer(p, reason, nil)
+}
+
+func (s *Switch) stopPeer(p *Peer, reason any, condition func() bool) {
 	pid := p.ID()
 
-	err := s.peerSet.Remove(pid, PeerRemovalOptions{Reason: reason, OnAfterStop: s.onPeerRemoved})
+	err := s.peerSet.Remove(pid, PeerRemovalOptions{Reason: reason, Condition: condition, OnAfterStop: s.onPeerRemoved})
+	if condition != nil && (errors.Is(err, errRemovalSkipped) || errors.Is(err, errPeerNotFound)) {
+		return
+	}
+
 	switch {
 	case errors.Is(err, errPeerStarting):
-		s.closePeer(p)
+		if !isConnectionClosed(reason) {
+			s.closePeer(p)
+		}
 	case err != nil:
 		s.Logger.Error("Failed to remove peer", "peer_id", pid, "err", err)
 	}
@@ -277,14 +304,24 @@ func (s *Switch) StopPeerForError(peer p2p.Peer, reason any) {
 
 func (s *Switch) onPeerRemoved(p *Peer, reason any) {
 	s.reactors.RemovePeer(p, reason)
-	s.closePeer(p)
+
+	err, _ := reason.(error)
+	connectionClosed := errors.Is(err, errConnectionClosed)
+	if !connectionClosed {
+		s.closePeer(p)
+	}
 
 	pid := p.ID()
 	shouldReconnect := false
+	_, bootstrap := s.host.BootstrapPeer(p.addrInfo.ID)
+	transportFailed := connectionClosed || errors.Is(err, swarm.ErrAllDialsFailed) || errors.Is(err, swarm.ErrNoGoodAddresses)
 
 	if p.IsPersistent() {
 		shouldReconnect = true
 		s.Logger.Debug("Will reconnect to peer", "peer_id", pid, "err", reason)
+	} else if bootstrap && transportFailed {
+		shouldReconnect = true
+		s.Logger.Debug("Will reconnect to bootstrap peer after a transport failure", "peer_id", pid, "err", reason)
 	} else if errTransient, ok := p2p.TransientErrorFromAny(reason); ok {
 		shouldReconnect = true
 		s.Logger.Debug("Will reconnect to peer after transient error", "peer_id", pid, "err", errTransient.Err)
@@ -294,14 +331,29 @@ func (s *Switch) onPeerRemoved(p *Peer, reason any) {
 		return
 	}
 
-	go s.reconnectPeer(p.AddrInfo(), MaxReconnectBackoff, PeerAddOptions{
+	opts := PeerAddOptions{
 		Persistent:    p.IsPersistent(),
 		Unconditional: p.IsUnconditional(),
 		Private:       p.IsPrivate(),
 		OnBeforeStart: s.reactors.InitPeer,
 		OnAfterStart:  s.reactors.AddPeer,
 		OnStartFailed: s.reactors.RemovePeer,
-	})
+	}
+
+	var delay time.Duration
+	if connectionClosed {
+		delay = s.flaps.next(p.addrInfo.ID)
+	}
+
+	go func() {
+		select {
+		case <-time.After(delay):
+		case <-s.Quit():
+			return
+		}
+
+		s.reconnectPeer(p.AddrInfo(), MaxReconnectBackoff, opts)
+	}()
 }
 
 func (s *Switch) closePeer(p *Peer) {
@@ -607,16 +659,20 @@ func (s *Switch) addPeer(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, er
 	p, err := s.peerSet.Add(addrInfo, opts)
 
 	var stopping peerStoppingError
-	if !errors.As(err, &stopping) {
-		return p, err
+	if errors.As(err, &stopping) {
+		select {
+		case <-stopping.done:
+		case <-time.After(s.peerStoppingWait):
+		}
+
+		p, err = s.peerSet.Add(addrInfo, opts)
 	}
 
-	select {
-	case <-stopping.done:
-	case <-time.After(s.peerStoppingWait):
+	if err == nil && s.isDisconnected(addrInfo.ID) {
+		s.disconnects.add(addrInfo.ID)
 	}
 
-	return s.peerSet.Add(addrInfo, opts)
+	return p, err
 }
 
 // reconnectPeer reconnects persistent peers back to the host.

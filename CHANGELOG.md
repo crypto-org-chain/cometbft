@@ -8,6 +8,8 @@
 
 ### BUG FIXES
 
+- `[lp2p]` remove peers when their connection closes
+  ([\#79](https://github.com/crypto-org-chain/cometbft/pull/79))
 - `[lp2p]` finish peer removal before freeing the peer slot
   ([\#78](https://github.com/crypto-org-chain/cometbft/pull/78))
 - `[lp2p]` report real peer direction and count each peer once

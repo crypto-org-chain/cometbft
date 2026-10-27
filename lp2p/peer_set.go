@@ -31,6 +31,8 @@ var (
 	ErrSelfPeer   = errors.New("peer is self")
 
 	errPeerStarting           = errors.New("peer is starting; removal deferred")
+	errRemovalSkipped         = errors.New("removal condition not met")
+	errPeerNotFound           = errors.New("peer not found")
 	errPeerRemovedDuringStart = errors.New("peer was removed while starting")
 )
 
@@ -159,13 +161,17 @@ func (ps *PeerSet) Add(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, erro
 // If OnAfterStop is provided, it is called after the peer is stopped and before its slot is freed.
 // Note that Reason is any due to backwards compatibility.
 type PeerRemovalOptions struct {
-	Reason      any
+	Reason any
+	// Condition, if set, is checked under the set lock (so it must not call PeerSet methods); the peer is kept
+	// when it returns false. It is not re-checked when a removal is deferred until Add finishes.
+	Condition   func() bool
 	OnAfterStop func(p *Peer, reason any)
 }
 
 // Remove stops the peer and runs opts.OnAfterStop before the peer's slot is freed, so the peer cannot be
 // re-added until removal completes. If the peer is still being added, the removal is deferred and performed
 // by Add once its callbacks finish (or dropped if the peer fails to start), and an error is returned.
+// If opts.Condition returns false, the peer is kept and an error is returned.
 func (ps *PeerSet) Remove(key p2p.ID, opts PeerRemovalOptions) error {
 	id := ps.keyToPeerID(key)
 	if id == "" {
@@ -176,18 +182,23 @@ func (ps *PeerSet) Remove(key p2p.ID, opts PeerRemovalOptions) error {
 		return ErrSelfPeer
 	}
 
-	ps.logger.Info("Removing peer", "peer_id", id.String(), "reason", opts.Reason)
-
 	ps.mu.Lock()
 	e, ok := ps.peers[id]
 	if !ok || e.removal != nil {
 		ps.mu.Unlock()
-		return errors.New("peer not found")
+		return errPeerNotFound
+	}
+
+	if opts.Condition != nil && !opts.Condition() {
+		ps.mu.Unlock()
+		return errRemovalSkipped
 	}
 
 	e.removal = &opts
 	starting := e.starting
 	ps.mu.Unlock()
+
+	ps.logger.Info("Removing peer", "peer_id", id.String(), "reason", opts.Reason)
 
 	if starting {
 		return errPeerStarting
