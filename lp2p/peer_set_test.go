@@ -2,13 +2,18 @@ package lp2p
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/libs/service"
 	"github.com/cometbft/cometbft/p2p"
+	"github.com/go-kit/kit/metrics"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 )
 
 func TestPeerSet(t *testing.T) {
@@ -226,4 +231,328 @@ func TestPeerSet(t *testing.T) {
 			assert.ElementsMatch(t, expectedIDs, copiedIDs)
 		})
 	})
+}
+
+type peerSetLifecycleSuite struct {
+	suite.Suite
+
+	ps    *PeerSet
+	peers *testGauge
+	other *Host
+}
+
+type testGauge struct {
+	mu    sync.Mutex
+	value float64
+}
+
+func (g *testGauge) With(...string) metrics.Gauge { return g }
+
+func (g *testGauge) Set(v float64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.value = v
+}
+
+func (g *testGauge) Add(delta float64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.value += delta
+}
+
+func (g *testGauge) Value() float64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.value
+}
+
+func TestPeerSetLifecycleSuite(t *testing.T) {
+	suite.Run(t, new(peerSetLifecycleSuite))
+}
+
+func (s *peerSetLifecycleSuite) SetupTest() {
+	hosts := makeTestHosts(s.T(), 2)
+
+	m := p2p.NopMetrics()
+	s.peers = &testGauge{}
+	m.Peers = s.peers
+
+	s.ps = NewPeerSet(hosts[0], m, log.NewNopLogger())
+	s.other = hosts[1]
+}
+
+func (s *peerSetLifecycleSuite) key() p2p.ID {
+	return peerIDToKey(s.other.ID())
+}
+
+func (s *peerSetLifecycleSuite) TestRemoveFreesSlotAfterCallbacks() {
+	_, err := s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+	s.Require().NoError(err)
+	s.Equal(1.0, s.peers.Value())
+
+	entered, release, removed := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		removed <- s.ps.Remove(s.key(), PeerRemovalOptions{OnAfterStop: func(*Peer, any) {
+			close(entered)
+			<-release
+		}})
+	}()
+	<-entered
+
+	s.Nil(s.ps.Get(s.key()))
+	s.Zero(s.ps.Size())
+	s.Empty(s.ps.Copy())
+	s.Nil(s.ps.Random())
+	s.ps.ForEach(func(p2p.Peer) { s.Fail("removing peer is visible to ForEach") })
+
+	_, err = s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+	var stopping peerStoppingError
+	s.ErrorAs(err, &stopping)
+
+	close(release)
+	s.Require().NoError(<-removed)
+	s.Zero(s.peers.Value())
+
+	_, err = s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+	s.NoError(err)
+}
+
+func (s *peerSetLifecycleSuite) TestDeferredRemoval() {
+	testCases := []struct {
+		name          string
+		remove        func(p *Peer, record func(string)) error
+		expectedOrder []string
+	}{
+		{
+			name: "remove",
+			remove: func(p *Peer, record func(string)) error {
+				return s.ps.Remove(p.ID(), PeerRemovalOptions{OnAfterStop: func(*Peer, any) { record("removed") }})
+			},
+			expectedOrder: []string{"added", "removed"},
+		},
+		{
+			name: "remove all",
+			remove: func(*Peer, func(string)) error {
+				s.ps.RemoveAll(PeerRemovalOptions{})
+				return errPeerStarting
+			},
+			expectedOrder: []string{"added"},
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+
+			var order []string
+			record := func(step string) { order = append(order, step) }
+
+			_, err := s.ps.Add(s.other.AddrInfo(), PeerAddOptions{
+				OnBeforeStart: func(p *Peer) {
+					s.ErrorIs(tc.remove(p, record), errPeerStarting)
+					s.ErrorContains(s.ps.Remove(p.ID(), PeerRemovalOptions{}), "peer not found")
+				},
+				OnAfterStart: func(*Peer) { record("added") },
+			})
+
+			s.ErrorIs(err, errPeerRemovedDuringStart)
+			s.Equal(tc.expectedOrder, order)
+			s.Nil(s.ps.Get(s.key()))
+			s.Zero(s.peers.Value())
+
+			_, err = s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+			s.NoError(err)
+		})
+	}
+}
+
+func (s *peerSetLifecycleSuite) TestFailingStopStillRunsCallbacks() {
+	p, err := s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+	s.Require().NoError(err)
+	s.Require().NoError(p.Stop())
+
+	var removed bool
+	s.Require().NoError(s.ps.Remove(s.key(), PeerRemovalOptions{OnAfterStop: func(*Peer, any) { removed = true }}))
+
+	s.True(removed)
+	s.Nil(s.ps.Get(s.key()))
+	s.Zero(s.peers.Value())
+}
+
+func (s *peerSetLifecycleSuite) TestStartFailure() {
+	testCases := []struct {
+		name          string
+		removeOnStart bool
+	}{
+		{name: "frees the slot"},
+		{name: "drops a deferred removal", removeOnStart: true},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+
+			var (
+				removed bool
+				failed  any
+			)
+
+			_, err := s.ps.Add(s.other.AddrInfo(), PeerAddOptions{
+				OnBeforeStart: func(p *Peer) {
+					s.Require().NoError(p.Start())
+					if tc.removeOnStart {
+						s.ErrorIs(s.ps.Remove(p.ID(), PeerRemovalOptions{OnAfterStop: func(*Peer, any) { removed = true }}), errPeerStarting)
+					}
+				},
+				OnStartFailed: func(_ *Peer, reason any) {
+					failed = reason
+					s.Nil(s.ps.Get(s.key()))
+					_, err := s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+					s.Error(err)
+				},
+			})
+
+			s.Error(err)
+			s.ErrorIs(failed.(error), service.ErrAlreadyStarted)
+			s.False(removed)
+			s.Nil(s.ps.Get(s.key()))
+			s.Zero(s.peers.Value())
+
+			_, err = s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+			s.NoError(err)
+		})
+	}
+}
+
+func (s *peerSetLifecycleSuite) TestPanicInCallbackFreesSlot() {
+	testCases := []struct {
+		name         string
+		opts         PeerAddOptions
+		failedPanics bool
+	}{
+		{name: "before start", opts: PeerAddOptions{OnBeforeStart: func(*Peer) { panic("boom") }}},
+		{name: "after start", opts: PeerAddOptions{OnAfterStart: func(*Peer) { panic("boom") }}},
+		{name: "start failure callback panics too", opts: PeerAddOptions{OnAfterStart: func(*Peer) { panic("boom") }}, failedPanics: true},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+
+			var (
+				added  *Peer
+				failed any
+			)
+			opts := tc.opts
+			before := opts.OnBeforeStart
+			opts.OnBeforeStart = func(p *Peer) {
+				added = p
+				if before != nil {
+					before(p)
+				}
+			}
+			opts.OnStartFailed = func(_ *Peer, reason any) {
+				failed = reason
+				if tc.failedPanics {
+					panic("again")
+				}
+			}
+
+			s.Panics(func() { _, _ = s.ps.Add(s.other.AddrInfo(), opts) })
+
+			s.False(added.IsRunning())
+			s.Equal("boom", failed)
+			s.Nil(s.ps.Get(s.key()))
+
+			_, err := s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+			s.NoError(err)
+		})
+	}
+}
+
+func (s *peerSetLifecycleSuite) TestPanicInRemovalCallbackFreesSlot() {
+	panicking := PeerRemovalOptions{OnAfterStop: func(*Peer, any) { panic("boom") }}
+
+	testCases := []struct {
+		name   string
+		remove func()
+	}{
+		{
+			name: "live peer",
+			remove: func() {
+				_, err := s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+				s.Require().NoError(err)
+				_ = s.ps.Remove(s.key(), panicking)
+			},
+		},
+		{
+			name: "deferred removal",
+			remove: func() {
+				_, _ = s.ps.Add(s.other.AddrInfo(), PeerAddOptions{
+					OnBeforeStart: func(p *Peer) { _ = s.ps.Remove(p.ID(), panicking) },
+				})
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+
+			s.Panics(tc.remove)
+
+			s.Nil(s.ps.Get(s.key()))
+			s.Zero(s.peers.Value())
+
+			_, err := s.ps.Add(s.other.AddrInfo(), PeerAddOptions{})
+			s.NoError(err)
+		})
+	}
+}
+
+func (s *peerSetLifecycleSuite) TestConcurrentChurn() {
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		started  int
+		finished int
+		deadline = time.Now().Add(500 * time.Millisecond)
+	)
+
+	opts := PeerAddOptions{
+		OnAfterStart: func(*Peer) {
+			mu.Lock()
+			started++
+			mu.Unlock()
+		},
+	}
+	removal := PeerRemovalOptions{OnAfterStop: func(*Peer, any) {
+		mu.Lock()
+		finished++
+		mu.Unlock()
+	}}
+
+	for range 4 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				_, _ = s.ps.Add(s.other.AddrInfo(), opts)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(deadline) {
+				_ = s.ps.Remove(s.key(), removal)
+			}
+		}()
+	}
+	wg.Wait()
+
+	_ = s.ps.Remove(s.key(), removal)
+
+	s.Nil(s.ps.Get(s.key()))
+	s.Zero(s.peers.Value())
+	s.Equal(started, finished)
+	s.Positive(started)
 }

@@ -35,6 +35,8 @@ type Switch struct {
 
 	metrics *p2p.Metrics
 
+	peerStoppingWait time.Duration
+
 	// active is used to track if the switch has started
 	// BaseService has similar field, but it triggered BEFORE OnStart().
 	// This leads to concurrent peers provisioning between bootstrapping peers and accepting incoming messages
@@ -49,6 +51,8 @@ type SwitchReactor struct {
 }
 
 const MaxReconnectBackoff = 5 * time.Minute
+
+const defaultPeerStoppingWait = 2 * time.Second
 
 var _ p2p.Switcher = (*Switch)(nil)
 
@@ -69,6 +73,8 @@ func NewSwitch(
 		peerSet: NewPeerSet(host, metrics, logger),
 
 		metrics: metrics,
+
+		peerStoppingWait: defaultPeerStoppingWait,
 
 		active: atomic.Bool{},
 	}
@@ -260,24 +266,20 @@ func (s *Switch) StopPeerForError(peer p2p.Peer, reason any) {
 
 	pid := p.ID()
 
-	removalOpts := PeerRemovalOptions{
-		Reason:      reason,
-		OnAfterStop: s.reactors.RemovePeer,
-	}
-
-	if err := s.peerSet.Remove(pid, removalOpts); err != nil {
+	err := s.peerSet.Remove(pid, PeerRemovalOptions{Reason: reason, OnAfterStop: s.onPeerRemoved})
+	switch {
+	case errors.Is(err, errPeerStarting):
+		s.closePeer(p)
+	case err != nil:
 		s.Logger.Error("Failed to remove peer", "peer_id", pid, "err", err)
-		return
 	}
+}
 
-	// todo, actually, for persistent peers we can skip this step,
-	// but explicitly closing might cleanup some conns/resources
-	if err := s.host.Network().ClosePeer(p.addrInfo.ID); err != nil {
-		// tolerate this error.
-		s.Logger.Error("Failed to close peer", "peer_id", pid, "err", err)
-	}
+func (s *Switch) onPeerRemoved(p *Peer, reason any) {
+	s.reactors.RemovePeer(p, reason)
+	s.closePeer(p)
 
-	// reconnect logic
+	pid := p.ID()
 	shouldReconnect := false
 
 	if p.IsPersistent() {
@@ -300,6 +302,12 @@ func (s *Switch) StopPeerForError(peer p2p.Peer, reason any) {
 		OnAfterStart:  s.reactors.AddPeer,
 		OnStartFailed: s.reactors.RemovePeer,
 	})
+}
+
+func (s *Switch) closePeer(p *Peer) {
+	if err := p.CloseConn(); err != nil {
+		s.Logger.Error("Failed to close peer", "peer_id", p.ID(), "err", err)
+	}
 }
 
 func (s *Switch) IsDialingOrExistingAddress(addr *p2p.NetAddress) bool {
@@ -408,7 +416,11 @@ func (s *Switch) handleStream(stream network.Stream) {
 
 	// 3. Retrieve the peer from the peerSet (or provision if it's not).
 	peer, err := s.resolvePeer(peerID, stream.Conn().RemoteMultiaddr())
-	if err != nil {
+	switch {
+	case errors.Is(err, errPeerRemovedDuringStart):
+		s.Logger.Debug("Peer removed while resolving stream", "protocol", protocolID, "peer_id", peerID.String())
+		return
+	case err != nil:
 		s.Logger.Error("Failed to resolve peer", "protocol", protocolID, "peer_id", peerID.String(), "err", err)
 		return
 	}
@@ -508,7 +520,7 @@ func (s *Switch) resolvePeer(id peer.ID, connRemoteAddr ma.Multiaddr) (p2p.Peer,
 		OnStartFailed: s.reactors.RemovePeer,
 	}
 
-	peer, err := s.peerSet.Add(addrInfo, opts)
+	peer, err := s.addPeer(addrInfo, opts)
 	switch {
 	case errors.Is(err, ErrPeerExists):
 		// tolerate two concurrent peer additions
@@ -558,16 +570,20 @@ func (s *Switch) bootstrapPeer(ctx context.Context, addrInfo peer.AddrInfo, opts
 		return errors.Wrap(err, "unable to connect to peer")
 	}
 
-	if _, err := s.addDialedPeer(addrInfo, opts); err != nil {
-		return errors.Wrap(err, "unable to add peer")
-	}
-
 	for _, addr := range addrInfo.Addrs {
 		// if this a DNS address, save it to the peerstore, so in case of IP address change,
 		// we can use the DNS address to reconnect during message sending.
 		if IsDNSAddr(addr) {
 			s.host.Peerstore().AddAddr(addrInfo.ID, addr, peerstore.PermanentAddrTTL)
 		}
+	}
+
+	_, err := s.addDialedPeer(addrInfo, opts)
+	switch {
+	case errors.Is(err, errPeerRemovedDuringStart):
+		return nil
+	case err != nil:
+		return errors.Wrap(err, "unable to add peer")
 	}
 
 	// after connecting, there might be more than
@@ -583,6 +599,22 @@ func (s *Switch) bootstrapPeer(ctx context.Context, addrInfo peer.AddrInfo, opts
 
 func (s *Switch) addDialedPeer(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, error) {
 	opts.Outbound = true
+
+	return s.addPeer(addrInfo, opts)
+}
+
+func (s *Switch) addPeer(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, error) {
+	p, err := s.peerSet.Add(addrInfo, opts)
+
+	var stopping peerStoppingError
+	if !errors.As(err, &stopping) {
+		return p, err
+	}
+
+	select {
+	case <-stopping.done:
+	case <-time.After(s.peerStoppingWait):
+	}
 
 	return s.peerSet.Add(addrInfo, opts)
 }
@@ -641,6 +673,10 @@ func (s *Switch) reconnectPeer(addrInfo peer.AddrInfo, backoffMax time.Duration,
 
 		// 2. add peer to the peer set
 		_, err := s.addDialedPeer(addrInfo, opts)
+		if errors.Is(err, errPeerRemovedDuringStart) {
+			return
+		}
+
 		if err != nil && !errors.Is(err, ErrPeerExists) {
 			s.Logger.Error(
 				"Failed to add peer after reconnection",
