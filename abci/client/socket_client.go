@@ -138,7 +138,7 @@ func (cli *socketClient) sendRequestsRoutine(conn io.Writer) {
 
 			err := types.WriteMessage(reqres.Request, w)
 			if err != nil {
-				cli.stopForError(fmt.Errorf("write to buffer: %w", err))
+				cli.StopForError(fmt.Errorf("write to buffer: %w", err))
 				return
 			}
 
@@ -146,7 +146,7 @@ func (cli *socketClient) sendRequestsRoutine(conn io.Writer) {
 			if _, ok := reqres.Request.Value.(*types.Request_Flush); ok {
 				err = w.Flush()
 				if err != nil {
-					cli.stopForError(fmt.Errorf("flush buffer: %w", err))
+					cli.StopForError(fmt.Errorf("flush buffer: %w", err))
 					return
 				}
 			}
@@ -172,19 +172,19 @@ func (cli *socketClient) recvResponseRoutine(conn io.Reader) {
 		res := &types.Response{}
 		err := types.ReadMessage(r, res)
 		if err != nil {
-			cli.stopForError(fmt.Errorf("read message: %w", err))
+			cli.StopForError(fmt.Errorf("read message: %w", err))
 			return
 		}
 
 		switch r := res.Value.(type) {
 		case *types.Response_Exception: // app responded with error
 			// XXX After setting cli.err, release waiters (e.g. reqres.Done())
-			cli.stopForError(errors.New(r.Exception.Error))
+			cli.StopForError(errors.New(r.Exception.Error))
 			return
 		default:
 			err := cli.didRecvResponse(res)
 			if err != nil {
-				cli.stopForError(err)
+				cli.StopForError(err)
 				return
 			}
 		}
@@ -205,26 +205,29 @@ func (cli *socketClient) trackRequest(reqres *ReqRes) {
 
 func (cli *socketClient) didRecvResponse(res *types.Response) error {
 	cli.mtx.Lock()
-	defer cli.mtx.Unlock()
 
 	// Get the first ReqRes.
 	next := cli.reqSent.Front()
 	if next == nil {
+		cli.mtx.Unlock()
 		return ErrUnexpectedResponse{Response: *res, Reason: "no call was made"}
 	}
 
 	reqres := next.Value.(*ReqRes)
 	if !resMatchesReq(reqres.Request, res) {
+		cli.mtx.Unlock()
 		return ErrUnexpectedResponse{Response: *res, Reason: fmt.Sprintf("unexpected response to the request %T", reqres.Request.Value)}
 	}
 
 	reqres.Response = res
 	reqres.Done()            // release waiters
 	cli.reqSent.Remove(next) // pop first item from linked list
+	resCb := cli.resCb
+	cli.mtx.Unlock()
 
 	// Notify client listener if set (global callback).
-	if cli.resCb != nil {
-		cli.resCb(reqres.Request, res)
+	if resCb != nil {
+		resCb(reqres.Request, res)
 	}
 
 	// Notify reqRes listener if set (request specific callback).
@@ -278,6 +281,28 @@ func (cli *socketClient) CheckTx(ctx context.Context, req *types.RequestCheckTx)
 		return nil, err
 	}
 	return reqRes.Response.GetCheckTx(), cli.Error()
+}
+
+func (cli *socketClient) InsertTx(ctx context.Context, req *types.RequestInsertTx) (*types.ResponseInsertTx, error) {
+	reqRes, err := cli.queueRequest(ctx, types.ToRequestInsertTx(req))
+	if err != nil {
+		return nil, err
+	}
+	if err := cli.Flush(ctx); err != nil {
+		return nil, err
+	}
+	return reqRes.Response.GetInsertTx(), cli.Error()
+}
+
+func (cli *socketClient) ReapTxs(ctx context.Context, req *types.RequestReapTxs) (*types.ResponseReapTxs, error) {
+	reqRes, err := cli.queueRequest(ctx, types.ToRequestReapTxs(req))
+	if err != nil {
+		return nil, err
+	}
+	if err := cli.Flush(ctx); err != nil {
+		return nil, err
+	}
+	return reqRes.Response.GetReapTxs(), cli.Error()
 }
 
 func (cli *socketClient) Query(ctx context.Context, req *types.RequestQuery) (*types.ResponseQuery, error) {
@@ -469,6 +494,10 @@ func resMatchesReq(req *types.Request, res *types.Response) (ok bool) {
 		_, ok = res.Value.(*types.Response_Info)
 	case *types.Request_CheckTx:
 		_, ok = res.Value.(*types.Response_CheckTx)
+	case *types.Request_InsertTx:
+		_, ok = res.Value.(*types.Response_InsertTx)
+	case *types.Request_ReapTxs:
+		_, ok = res.Value.(*types.Response_ReapTxs)
 	case *types.Request_Commit:
 		_, ok = res.Value.(*types.Response_Commit)
 	case *types.Request_Query:
@@ -497,7 +526,7 @@ func resMatchesReq(req *types.Request, res *types.Response) (ok bool) {
 	return ok
 }
 
-func (cli *socketClient) stopForError(err error) {
+func (cli *socketClient) StopForError(err error) {
 	if !cli.IsRunning() {
 		return
 	}

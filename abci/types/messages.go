@@ -52,6 +52,18 @@ func ToRequestCheckTx(req *RequestCheckTx) *Request {
 	}
 }
 
+func ToRequestInsertTx(req *RequestInsertTx) *Request {
+	return &Request{
+		Value: &Request_InsertTx{req},
+	}
+}
+
+func ToRequestReapTxs(req *RequestReapTxs) *Request {
+	return &Request{
+		Value: &Request_ReapTxs{req},
+	}
+}
+
 func ToRequestCommit() *Request {
 	return &Request{
 		Value: &Request_Commit{&RequestCommit{}},
@@ -153,6 +165,18 @@ func ToResponseInfo(res *ResponseInfo) *Response {
 func ToResponseCheckTx(res *ResponseCheckTx) *Response {
 	return &Response{
 		Value: &Response_CheckTx{res},
+	}
+}
+
+func ToResponseInsertTx(res *ResponseInsertTx) *Response {
+	return &Response{
+		Value: &Response_InsertTx{res},
+	}
+}
+
+func ToResponseReapTxs(res *ResponseReapTxs) *Response {
+	return &Response{
+		Value: &Response_ReapTxs{res},
 	}
 }
 

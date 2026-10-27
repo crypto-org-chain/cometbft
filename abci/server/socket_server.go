@@ -54,20 +54,34 @@ func NewSocketServer(protoAddr string, app types.Application) service.Service {
 	return s
 }
 
+// NewSocketServerWithListener creates a server using an already-bound listener,
+// useful for tests (ephemeral ports) and socket-activated processes.
+func NewSocketServerWithListener(ln net.Listener, app types.Application) service.Service {
+	s := &SocketServer{
+		proto:    ln.Addr().Network(),
+		addr:     ln.Addr().String(),
+		listener: ln,
+		app:      app,
+		conns:    make(map[int]net.Conn),
+	}
+	s.BaseService = *service.NewBaseService(nil, "ABCIServer", s)
+	return s
+}
+
 func (s *SocketServer) SetLogger(l cmtlog.Logger) {
 	s.BaseService.SetLogger(l)
 	s.isLoggerSet = true
 }
 
 func (s *SocketServer) OnStart() error {
-	ln, err := net.Listen(s.proto, s.addr)
-	if err != nil {
-		return err
+	if s.listener == nil {
+		ln, err := net.Listen(s.proto, s.addr)
+		if err != nil {
+			return err
+		}
+		s.listener = ln
 	}
-
-	s.listener = ln
 	go s.acceptConnectionsRoutine()
-
 	return nil
 }
 
@@ -163,6 +177,8 @@ func (s *SocketServer) waitForClose(closeConn chan error, connID int) {
 func (s *SocketServer) handleRequests(closeConn chan error, conn io.Reader, responses chan<- *types.Response) {
 	bufReader := bufio.NewReader(conn)
 
+	locked := false // true only while appMtx is held inside the loop
+
 	defer func() {
 		// make sure to recover from any app-related panics to allow proper socket cleanup.
 		// In the case of a panic, we do not notify the client by passing an exception so
@@ -177,6 +193,8 @@ func (s *SocketServer) handleRequests(closeConn chan error, conn io.Reader, resp
 				fmt.Fprintln(os.Stderr, err)
 			}
 			closeConn <- err
+		}
+		if locked {
 			s.appMtx.Unlock()
 		}
 	}()
@@ -194,6 +212,7 @@ func (s *SocketServer) handleRequests(closeConn chan error, conn io.Reader, resp
 			return
 		}
 		s.appMtx.Lock()
+		locked = true
 		resp, err := s.handleRequest(context.TODO(), req)
 		if err != nil {
 			// any error either from the application or because of an unknown request
@@ -204,6 +223,7 @@ func (s *SocketServer) handleRequests(closeConn chan error, conn io.Reader, resp
 			responses <- resp
 		}
 		s.appMtx.Unlock()
+		locked = false
 	}
 }
 
@@ -226,6 +246,18 @@ func (s *SocketServer) handleRequest(ctx context.Context, req *types.Request) (*
 			return nil, err
 		}
 		return types.ToResponseCheckTx(res), nil
+	case *types.Request_InsertTx:
+		res, err := s.app.InsertTx(ctx, r.InsertTx)
+		if err != nil {
+			return nil, err
+		}
+		return types.ToResponseInsertTx(res), nil
+	case *types.Request_ReapTxs:
+		res, err := s.app.ReapTxs(ctx, r.ReapTxs)
+		if err != nil {
+			return nil, err
+		}
+		return types.ToResponseReapTxs(res), nil
 	case *types.Request_Commit:
 		res, err := s.app.Commit(ctx, r.Commit)
 		if err != nil {

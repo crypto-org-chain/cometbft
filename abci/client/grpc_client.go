@@ -61,27 +61,21 @@ func (cli *grpcClient) OnStart() error {
 	// This processes asynchronous request/response messages and dispatches
 	// them to callbacks.
 	go func() {
-		// Use a separate function to use defer for mutex unlocks (this handles panics)
-		callCb := func(reqres *ReqRes) {
-			cli.mtx.Lock()
-			defer cli.mtx.Unlock()
-
-			reqres.Done()
-
-			// Notify client listener if set
-			if cli.resCb != nil {
-				cli.resCb(reqres.Request, reqres.Response)
-			}
-
-			// Notify reqRes listener if set
-			reqres.InvokeCallback()
-		}
 		for reqres := range cli.chReqRes {
-			if reqres != nil {
-				callCb(reqres)
-			} else {
+			if reqres == nil {
 				cli.Logger.Error("Received nil reqres")
+				continue
 			}
+
+			cli.mtx.Lock()
+			reqres.Done()
+			resCb := cli.resCb
+			cli.mtx.Unlock()
+
+			if resCb != nil {
+				resCb(reqres.Request, reqres.Response)
+			}
+			reqres.InvokeCallback()
 		}
 	}()
 
@@ -196,6 +190,14 @@ func (cli *grpcClient) Info(ctx context.Context, req *types.RequestInfo) (*types
 
 func (cli *grpcClient) CheckTx(ctx context.Context, req *types.RequestCheckTx) (*types.ResponseCheckTx, error) {
 	return cli.client.CheckTx(ctx, req, grpc.WaitForReady(true))
+}
+
+func (cli *grpcClient) InsertTx(ctx context.Context, req *types.RequestInsertTx) (*types.ResponseInsertTx, error) {
+	return cli.client.InsertTx(ctx, req, grpc.WaitForReady(true))
+}
+
+func (cli *grpcClient) ReapTxs(ctx context.Context, req *types.RequestReapTxs) (*types.ResponseReapTxs, error) {
+	return cli.client.ReapTxs(ctx, req, grpc.WaitForReady(true))
 }
 
 func (cli *grpcClient) Query(ctx context.Context, req *types.RequestQuery) (*types.ResponseQuery, error) {

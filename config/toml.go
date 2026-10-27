@@ -140,6 +140,11 @@ abci = "{{ .BaseConfig.ABCI }}"
 # so the app can decide if we should keep the connection or not
 filter_peers = {{ .BaseConfig.FilterPeers }}
 
+# Buffer capacity for the internal EventBus. A value of 0 means unbuffered
+# (publishers block until subscribers receive). Higher values reduce back-pressure
+# at the cost of memory.
+event_bus_buffer_capacity = {{ .BaseConfig.EventBusBufferCapacity }}
+
 
 #######################################################################
 ###                 Advanced Configuration Options                  ###
@@ -410,6 +415,7 @@ max_peer_streams = {{ .P2P.LibP2PConfig.Limits.MaxPeerStreams }}
 #  - "nop"   : nop-mempool (short for no operation; the ABCI app is responsible
 #  for storing, disseminating and proposing txs). "create_empty_blocks=false" is
 #  not supported.
+# - "app"    : app-side mempool (the ABCI app is responsible for mempool, comet only broadcasts txs).
 type = "{{ .Mempool.Type }}"
 
 # Recheck (default: true) defines whether CometBFT should recheck the
@@ -483,6 +489,17 @@ max_batch_bytes = {{ .Mempool.MaxBatchBytes }}
 experimental_max_gossip_connections_to_persistent_peers = {{ .Mempool.ExperimentalMaxGossipConnectionsToPersistentPeers }}
 experimental_max_gossip_connections_to_non_persistent_peers = {{ .Mempool.ExperimentalMaxGossipConnectionsToNonPersistentPeers }}
 
+# App mempool only: size of LRU cache for seen transactions (deduplication).
+seen_cache_size = {{ .Mempool.SeenCacheSize }}
+# App mempool only: max bytes passed to ReapTxs (0 = no limit).
+reap_max_bytes = {{ .Mempool.ReapMaxBytes }}
+# App mempool only: max gas passed to ReapTxs (0 = no limit).
+reap_max_gas = {{ .Mempool.ReapMaxGas }}
+# App mempool only: interval between ReapTxs calls when streaming txs from app.
+reap_interval = "{{ .Mempool.ReapInterval }}"
+# App mempool only: delay after which a tx is forgotten for ABCI.CheckTx
+check_tx_retry_delay = "{{ .Mempool.CheckTxRetryDelay }}"
+
 #######################################################
 ###         State Sync Configuration Options        ###
 #######################################################
@@ -538,6 +555,10 @@ version = "{{ .BlockSync.Version }}"
 # Experimental Adaptive sync (bool):
 #
 # Run both BLOCKSYNC and CONSENSUS for improved liveness, connectivity, and performance.
+# NOTE: On validator nodes, running consensus concurrently with blocksync while catching up
+# risks equivocation — consensus can sign votes for heights where the ingestor has not yet
+# committed the already-decided block. The HRS file and KMS are not sufficient backstops
+# for this scenario. Only enable on validators if you understand and accept this risk.
 adaptive_sync = {{ .BlockSync.AdaptiveSync }}
 
 #######################################################

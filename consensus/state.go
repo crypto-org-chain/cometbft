@@ -835,6 +835,8 @@ func (cs *State) receiveRoutine(maxSteps int) {
 		case mi = <-cs.peerMsgQueue:
 			cs.Logger.Debug("Received message from cs.peerMsgQueue", "peer", mi.PeerID)
 
+			// Peer messages are buffered; signed self-messages are handled via
+			// internalMsgQueue with WriteSync.
 			if err := cs.wal.Write(mi); err != nil {
 				cs.Logger.Error("failed writing to WAL", "err", err)
 			}
@@ -846,22 +848,7 @@ func (cs *State) receiveRoutine(maxSteps int) {
 		case mi = <-cs.internalMsgQueue:
 			cs.Logger.Debug("Received message from cs.internalMsgQueue", "peer_id", mi.PeerID)
 
-			writeWal := true
-
-			// avoid writing WAL for ingested verified blocks coming from blocksync
-			if _, ok := mi.Msg.(*ingestVerifiedBlockRequest); ok {
-				writeWal = false
-			}
-
-			if writeWal {
-				// NOTE: fsync
-				if err := cs.wal.WriteSync(mi); err != nil {
-					panic(fmt.Errorf(
-						"failed to write %v msg to consensus WAL; check your file system and restart the node: %w",
-						mi, err,
-					))
-				}
-			}
+			cs.writeInternalMsgToWAL(mi)
 
 			if _, ok := mi.Msg.(*VoteMessage); ok {
 				// we actually want to simulate failing during
@@ -887,6 +874,33 @@ func (cs *State) receiveRoutine(maxSteps int) {
 			onExit(cs)
 			return
 		}
+	}
+}
+
+// writeInternalMsgToWAL persists local messages with per-type durability.
+func (cs *State) writeInternalMsgToWAL(mi msgInfo) {
+	switch mi.Msg.(type) {
+	case *VoteMessage, *ProposalMessage:
+		// Signed messages must hit disk before processing.
+		if err := cs.wal.WriteSync(mi); err != nil {
+			panic(fmt.Errorf(
+				"failed to write %v msg to consensus WAL; check your file system and restart the node: %w",
+				mi, err,
+			))
+		}
+	case *ingestVerifiedBlockRequest:
+		// Not replayed via WAL.
+	case *BlockPartMessage:
+		// Unsigned block parts use buffered WAL writes.
+		if err := cs.wal.Write(mi); err != nil {
+			panic(fmt.Errorf(
+				"failed to write %v msg to consensus WAL; check your file system and restart the node: %w",
+				mi, err,
+			))
+		}
+	default:
+		// New internal message types must be handled explicitly.
+		panic(fmt.Errorf("unexpected internal message type: %T", mi.Msg))
 	}
 }
 
@@ -920,19 +934,11 @@ func (cs *State) handleMsg(mi msgInfo) {
 		// This prevented the reactor from being able to retrieve the most updated
 		// version of the RoundState. The reactor needs the updated RoundState to
 		// gossip the now completed block.
-		//
-		// This code can be further improved by either always operating on a copy
-		// of RoundState and only locking when switching out State's copy of
-		// RoundState with the updated copy or by emitting RoundState events in
-		// more places for routines depending on it to listen for.
 		cs.mtx.Unlock()
 
 		cs.mtx.Lock()
 		if added && cs.ProposalBlockParts.IsComplete() {
 			cs.handleCompleteProposal(msg.Height)
-		}
-		if added {
-			cs.statsMsgQueue <- mi
 		}
 
 		if err != nil && msg.Round != cs.Round {
@@ -949,9 +955,6 @@ func (cs *State) handleMsg(mi msgInfo) {
 		// attempt to add the vote and dupeout the validator if it's a duplicate signature
 		// if the vote gives us a 2/3-any or 2/3-one, we transition
 		added, err = cs.tryAddVote(msg.Vote, peerID)
-		if added {
-			cs.statsMsgQueue <- mi
-		}
 
 		// if err == ErrAddingVote {
 		// TODO: punish peer
@@ -973,6 +976,12 @@ func (cs *State) handleMsg(mi msgInfo) {
 	default:
 		cs.Logger.Error("unknown msg type", "type", fmt.Sprintf("%T", msg))
 		return
+	}
+
+	if added {
+		cs.mtx.Unlock()
+		cs.statsMsgQueue <- mi
+		cs.mtx.Lock()
 	}
 
 	if err != nil {
@@ -2046,6 +2055,19 @@ func (cs *State) addProposalBlockPart(msg *BlockPartMessage, peerID p2p.ID) (add
 			return added, err
 		}
 
+		if block.Height != cs.Height {
+			return added, fmt.Errorf(
+				"proposal block height mismatch: block.Height=%d, cs.Height=%d",
+				block.Height, cs.Height,
+			)
+		}
+		if cs.Proposal != nil && block.Height != cs.Proposal.Height {
+			return added, fmt.Errorf(
+				"proposal block height mismatch: block.Height=%d, proposal.Height=%d",
+				block.Height, cs.Proposal.Height,
+			)
+		}
+
 		cs.ProposalBlock = block
 
 		// NOTE: it's possible to receive complete proposal blocks for future rounds without having the proposal
@@ -2431,6 +2453,29 @@ func (cs *State) signVote(
 				return nil, err
 			}
 			vote.Extension = ext
+
+			// Self-verify the extension before broadcasting. Every other validator
+			// runs VerifyVoteExtension on this precommit's extension and rejects
+			// the precommit if it doesn't pass. Without this check, an application
+			// whose ExtendVote produces data its own VerifyVoteExtension rejects
+			// would cause a chain-wide deadlock: the proposer happily advances
+			// while peers loop verifying the same invalid extension (#5204). Treat
+			// self-rejection as a non-recoverable application bug — the two
+			// handlers are inconsistent — and panic with a clear message instead
+			// of producing a silent network-level stall.
+			//
+			// Skip self-verify when the extension is empty: an absent-but-required
+			// extension is caught downstream by SignAndCheckVote and produces a
+			// recoverable error, which is the existing behavior we want to preserve.
+			if len(vote.Extension) > 0 {
+				if err := cs.blockExec.VerifyVoteExtension(context.Background(), vote); err != nil {
+					panic(fmt.Errorf(
+						"validator %X failed self-verification of its own vote extension at height %d: %w; "+
+							"application ExtendVote and VerifyVoteExtension handlers are inconsistent",
+						addr, vote.Height, err,
+					))
+				}
+			}
 		}
 	}
 
@@ -2523,11 +2568,11 @@ func (cs *State) checkDoubleSigningRisk(height int64) error {
 	if cs.privValidator != nil && cs.privValidatorPubKey != nil && cs.config.DoubleSignCheckHeight > 0 && height > 0 {
 		valAddr := cs.privValidatorPubKey.Address()
 		doubleSignCheckHeight := cs.config.DoubleSignCheckHeight
-		if doubleSignCheckHeight > height {
-			doubleSignCheckHeight = height
+		if doubleSignCheckHeight >= height {
+			doubleSignCheckHeight = height - 1
 		}
 
-		for i := int64(1); i < doubleSignCheckHeight; i++ {
+		for i := int64(1); i <= doubleSignCheckHeight; i++ {
 			lastCommit := cs.blockStore.LoadSeenCommit(height - i)
 			if lastCommit != nil {
 				for sigIdx, s := range lastCommit.Signatures {

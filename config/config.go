@@ -45,6 +45,7 @@ const (
 
 	MempoolTypeFlood = "flood"
 	MempoolTypeNop   = "nop"
+	MempoolTypeApp   = "app"
 
 	LibP2PLimitsModeDisabled = "disabled"
 	LibP2PLimitsModeDefault  = "default"
@@ -244,24 +245,29 @@ type BaseConfig struct {
 	// If true, query the ABCI app on connecting to a new peer
 	// so the app can decide if we should keep the connection or not
 	FilterPeers bool `mapstructure:"filter_peers"` // false
+
+	// The capacity of the internal buffer used by the EventBus. A value of 0
+	// means unbuffered (publishers block until subscribers receive).
+	EventBusBufferCapacity int `mapstructure:"event_bus_buffer_capacity"`
 }
 
 // DefaultBaseConfig returns a default base configuration for a CometBFT node
 func DefaultBaseConfig() BaseConfig {
 	return BaseConfig{
-		Version:            version.TMCoreSemVer,
-		Genesis:            defaultGenesisJSONPath,
-		PrivValidatorKey:   defaultPrivValKeyPath,
-		PrivValidatorState: defaultPrivValStatePath,
-		NodeKey:            defaultNodeKeyPath,
-		Moniker:            defaultMoniker,
-		ProxyApp:           "tcp://127.0.0.1:26658",
-		ABCI:               "socket",
-		LogLevel:           DefaultLogLevel,
-		LogFormat:          LogFormatPlain,
-		FilterPeers:        false,
-		DBBackend:          "goleveldb",
-		DBPath:             DefaultDataDir,
+		Version:                version.TMCoreSemVer,
+		Genesis:                defaultGenesisJSONPath,
+		PrivValidatorKey:       defaultPrivValKeyPath,
+		PrivValidatorState:     defaultPrivValStatePath,
+		NodeKey:                defaultNodeKeyPath,
+		Moniker:                defaultMoniker,
+		ProxyApp:               "tcp://127.0.0.1:26658",
+		ABCI:                   "socket",
+		LogLevel:               DefaultLogLevel,
+		LogFormat:              LogFormatPlain,
+		FilterPeers:            false,
+		DBBackend:              "goleveldb",
+		DBPath:                 DefaultDataDir,
+		EventBusBufferCapacity: 0,
 	}
 }
 
@@ -311,6 +317,9 @@ func (cfg BaseConfig) ValidateBasic() error {
 	case LogFormatPlain, LogFormatJSON:
 	default:
 		return errors.New("unknown log_format (must be 'plain' or 'json')")
+	}
+	if cfg.EventBusBufferCapacity < 0 {
+		return fmt.Errorf("event_bus_buffer_capacity must be >= 0, got %d", cfg.EventBusBufferCapacity)
 	}
 	return nil
 }
@@ -929,6 +938,7 @@ type MempoolConfig struct {
 	//  - "nop"   : nop-mempool (short for no operation; the ABCI app is
 	//  responsible for storing, disseminating and proposing txs).
 	//  "create_empty_blocks=false" is not supported.
+	//  - "app"   : app-side mempool (the ABCI app is responsible for mempool, comet only broadcasts txs).
 	Type string `mapstructure:"type"`
 	// RootDir is the root directory for all data. This should be configured via
 	// the $CMTHOME env variable or --home cmd flag rather than overriding this
@@ -994,6 +1004,17 @@ type MempoolConfig struct {
 	// performance results using the default P2P configuration.
 	ExperimentalMaxGossipConnectionsToPersistentPeers    int `mapstructure:"experimental_max_gossip_connections_to_persistent_peers"`
 	ExperimentalMaxGossipConnectionsToNonPersistentPeers int `mapstructure:"experimental_max_gossip_connections_to_non_persistent_peers"`
+
+	// App mempool only: size of LRU cache for seen transactions (deduplication).
+	SeenCacheSize int `mapstructure:"seen_cache_size"`
+	// App mempool only: max bytes passed to ReapTxs (0 = no limit).
+	ReapMaxBytes uint64 `mapstructure:"reap_max_bytes"`
+	// App mempool only: max gas passed to ReapTxs (0 = no limit).
+	ReapMaxGas uint64 `mapstructure:"reap_max_gas"`
+	// App mempool only: interval between ReapTxs calls when streaming txs from app.
+	ReapInterval time.Duration `mapstructure:"reap_interval"`
+	// App mempool only: delay after which a tx is forgotten for ABCI.CheckTx
+	CheckTxRetryDelay time.Duration `mapstructure:"check_tx_retry_delay"`
 }
 
 // DefaultMempoolConfig returns a default configuration for the CometBFT mempool
@@ -1009,9 +1030,15 @@ func DefaultMempoolConfig() *MempoolConfig {
 		Size:        5000,
 		MaxTxsBytes: 1024 * 1024 * 1024, // 1GB
 		CacheSize:   10000,
-		MaxTxBytes:  1024 * 1024, // 1MB
+		MaxTxBytes:  4 * 1024 * 1024, // 4MB
 		ExperimentalMaxGossipConnectionsToNonPersistentPeers: 0,
 		ExperimentalMaxGossipConnectionsToPersistentPeers:    0,
+		// App mempool defaults
+		SeenCacheSize:     100_000,
+		ReapMaxBytes:      0,
+		ReapMaxGas:        0,
+		ReapInterval:      500 * time.Millisecond,
+		CheckTxRetryDelay: 5 * time.Second,
 	}
 }
 
@@ -1019,6 +1046,7 @@ func DefaultMempoolConfig() *MempoolConfig {
 func TestMempoolConfig() *MempoolConfig {
 	cfg := DefaultMempoolConfig()
 	cfg.CacheSize = 1000
+	cfg.SeenCacheSize = 1000
 	return cfg
 }
 
@@ -1036,7 +1064,7 @@ func (cfg *MempoolConfig) WalEnabled() bool {
 // returns an error if any check fails.
 func (cfg *MempoolConfig) ValidateBasic() error {
 	switch cfg.Type {
-	case MempoolTypeFlood, MempoolTypeNop:
+	case MempoolTypeFlood, MempoolTypeApp, MempoolTypeNop:
 	case "": // allow empty string to be backwards compatible
 	default:
 		return fmt.Errorf("unknown mempool type: %q", cfg.Type)
@@ -1058,6 +1086,15 @@ func (cfg *MempoolConfig) ValidateBasic() error {
 	}
 	if cfg.ExperimentalMaxGossipConnectionsToNonPersistentPeers < 0 {
 		return errors.New("experimental_max_gossip_connections_to_non_persistent_peers can't be negative")
+	}
+	// App mempool validation
+	if cfg.Type == MempoolTypeApp {
+		if cfg.SeenCacheSize < 0 {
+			return cmterrors.ErrNegativeField{Field: "seen_cache_size"}
+		}
+		if cfg.ReapInterval <= 0 {
+			return errors.New("reap_interval must be positive when mempool type is \"app\"")
+		}
 	}
 	return nil
 }

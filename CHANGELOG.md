@@ -4,15 +4,208 @@
 
 ### DEPENDENCIES
 
+- `[go]` Bump minimum Go version to 1.26.10 ([\#6114](https://github.com/cometbft/cometbft/pull/6114))
+
 ### BUG FIXES
 
+- `[rpc]` reject out-of-range `/genesis_chunked` indices that wrap to a negative int instead of panicking
+  ([\#6070](https://github.com/cometbft/cometbft/pull/6070))
+- `[lp2p]` size the system-wide connection limit in custom limits mode from `max_peers` instead of `max_peer_streams`
+  ([\#6074](https://github.com/cometbft/cometbft/pull/6074))
+- `[lp2p]` fix flaky MsgBytesFilter test by avoiding broadcast race
+  ([\#6053](https://github.com/cometbft/cometbft/pull/6053))
+- `[rpc]` release WebSocket response contexts after each subscription event,
+  preventing cancellation functions from accumulating for long-lived clients
+  ([\#6083](https://github.com/cometbft/cometbft/pull/6083))
+- `[spec]` fix the inductive invariant `spec/light-client/accountability`
+- `[state]` reject `/tx_search` and `/block_search` queries outright when
+  they compare `tx.height`/`block.height` against a non-numeric argument,
+  instead of silently dropping the condition and widening the results to
+  rows the query explicitly excludes
+  ([\#PENDING](https://github.com/cometbft/cometbft/pull/PENDING))
+
 ### IMPROVEMENTS
+
+- `[state]` use fast validator loading for `BlockExecutor` commit-info paths,
+  avoiding unnecessary proposer-priority reconstruction on cache misses
+  ([\#6039](https://github.com/cometbft/cometbft/pull/6039))
 
 ### FEATURES
 
 ### STATE-BREAKING
 
 ### API-BREAKING
+
+## v0.40.0
+
+*July 27, 2026*
+
+### DEPENDENCIES
+
+### BUG FIXES
+
+- `[blocksync]` tolerate late BlockResponse from honest peers after switching to consensus
+  ([\#5959](https://github.com/cometbft/cometbft/pull/5959))
+- `[mempool]` include proto framing overhead in AppReactor batch size to prevent peer teardown
+  ([\#5956](https://github.com/cometbft/cometbft/pull/5956))
+- `[blocksync]` document `adaptive_sync` equivocation risk for validator nodes
+  ([\#5953](https://github.com/cometbft/cometbft/pull/5953))
+- `[abci]` fix socket transport missing `InsertTx` and `ReapTxs` cases in
+  `handleRequest` and `resMatchesReq`, causing `ErrUnexpectedResponse` and
+  node self-kill when `mempool.type = "app"` with the default socket transport
+  ([\#5958](https://github.com/cometbft/cometbft/pull/5958))
+- `[flowrate]` fix flaky `TestWriter` by comparing `Idle` with a duration
+  tolerance instead of exact equality
+  ([\#5929](https://github.com/cometbft/cometbft/pull/5929))
+- `[rpc]` escape the request `Host` in the endpoints listing page so it cannot
+  break out of the generated HTML
+  ([\#5921](https://github.com/cometbft/cometbft/pull/5921))
+- `[consensus]` Fix `double_sign_check_height = 1` performing no double-sign
+  checks due to off-by-one error in loop condition (`i < N` should be
+  `i <= N`). The value `1` now correctly checks the previous block as intended.
+  ([\#5668](https://github.com/cometbft/cometbft/pull/5668))
+- `[rpc/jsonrpc]` reject non-finite, fractional, and out-of-int64-range
+  numeric IDs in request decoding instead of silently saturating to
+  `math.MinInt`, which previously made distinct large IDs collide.
+  ([\#5861](https://github.com/cometbft/cometbft/pull/5861))
+- `[consensus]` a proposer now self-verifies its own vote extension before
+  broadcasting its precommit, so an application whose `ExtendVote` and
+  `VerifyVoteExtension` handlers are inconsistent halts the node with a clear
+  `CONSENSUS FAILURE` instead of stalling the whole network
+  ([\#5204](https://github.com/cometbft/cometbft/issues/5204))
+- `[blocksync]` fix deadlock in `AddBlock` caused by holding `pool.mtx` during
+  `sendError`
+  ([\#5931](https://github.com/cometbft/cometbft/pull/5931))
+- `[blocksync]` hold `pool.mtx` and recompute `maxPeerHeight` in `Enable()`
+  ([\#5888](https://github.com/cometbft/cometbft/pull/5888))
+- `[inspect]` fix flaky `TestInspectRun` and consolidate start/stop handshake
+  ([\#5891](https://github.com/cometbft/cometbft/pull/5891))
+- `[p2p]` fix flaky switch tests by replacing fixed sleeps with deterministic peer-wait polling
+  ([\#5918](https://github.com/cometbft/cometbft/pull/5918))
+- `[p2p]` fix race and goroutine leak in `TestTransportMultiplexAcceptNonBlocking` test
+  ([\#5878](https://github.com/cometbft/cometbft/pull/5878))
+- `[evidence]` fix flaky `TestReactorsGossipNoCommittedEvidence` test
+  ([\#5870](https://github.com/cometbft/cometbft/pull/5870))
+- `[blocksync]` fix flaky `TestBlockPoolBasic` deadlock under `-race`
+  ([\#5867](https://github.com/cometbft/cometbft/pull/5867))
+- `[blocksync]` fix removeTimedoutPeers deadlock found via Byzantine prevote gossip race
+  ([\#5839](https://github.com/cometbft/cometbft/pull/5839))
+- `[mempool]` fix setRecheckFull/setDone race causing spurious ErrRecheckFull.
+  ([\#5837](https://github.com/cometbft/cometbft/pull/5837))
+- `[abci]` fix deadlock when response callback re-enters the client.
+  ([\#5850](https://github.com/cometbft/cometbft/pull/5850))
+- `[node]` use kernel-assigned ephemeral ports and fix `OnStart` cleanup
+  ([\#5868](https://github.com/cometbft/cometbft/pull/5868))
+- `[node]` close partial listeners on startRPC failure
+  ([\#5869](https://github.com/cometbft/cometbft/pull/5869))
+- `[lp2p]` remove `MaxStreamSize` clamp in `StreamReadSized`
+  ([\#5954](https://github.com/cometbft/cometbft/pull/5954))
+- `[lp2p]` fallback to conn remote addr when resolving inbound peer
+  ([\#5879](https://github.com/cometbft/cometbft/pull/5879))
+- `[consensus]` release cs.mtx before sending to statsMsgQueue
+  ([\#5813](https://github.com/cometbft/cometbft/pull/5813))
+- `[mempool]` truncate proto field number to int32 in filter's ReadTag
+  ([\#5948](https://github.com/cometbft/cometbft/pull/5948))
+- `[privval]` preempt sleep retries in privval signer client
+  ([\#5934](https://github.com/cometbft/cometbft/pull/5934))
+
+### IMPROVEMENTS
+
+- `[blocksync]` replace `numPending int32` with `atomic.Int32` and document `BlockPool` field ownership
+  ([\#5889](https://github.com/cometbft/cometbft/pull/5889))
+- `[execution]` cache validator set within a block cycle.
+  ([\#5834](https://github.com/cometbft/cometbft/pull/5834))
+- `[state]` skip the proposer-priority advance when loading validators for the
+  block-replay commit-info path (`LoadValidatorsFast`); up to ~900x faster at
+  the largest checkpoint offsets.
+  ([\#5204](https://github.com/cometbft/cometbft/issues/5204))
+- `[consensus]` reuse encode/decode buffers in WALEncoder and WALDecoder.
+  ([\#5865](https://github.com/cometbft/cometbft/pull/5865))
+- `[blocksync]` validate blocksync response sender and signature count
+  ([\#5860](https://github.com/cometbft/cometbft/pull/5860))
+- `[autofile]` skip fsync in `FlushAndSync` when no new data was written
+  ([\#5866](https://github.com/cometbft/cometbft/pull/5866))
+- `[mempool]` Implement `MsgBytesFilter` in Reactor to prevent heap amplification attack
+  ([\#5946](https://github.com/cometbft/cometbft/pull/5946))
+- `[privval]` Dynamically calculate privval maxRemoteSignerMsgSize.
+  ([\#5985](https://github.com/cometbft/cometbft/pull/5985))
+- `[types]` Update default max block bytes param to account for increased signature size of mldsa65.
+  ([\#5987](https://github.com/cometbft/cometbft/pull/5987))
+- `[config]` Update the default max_tx_bytes to account for increased signature size of mlsdsa65.
+  ([\#5989](https://github.com/cometbft/cometbft/pull/5989))
+- `[crypto]` Add UnmarshalJSON to secp256k1eth key type.
+  ([\#5990](https://github.com/cometbft/cometbft/pull/5990))
+
+### FEATURES
+
+- `[config]` Add EventBusBufferCapacity setting.
+  ([\#5849](https://github.com/cometbft/cometbft/pull/5849))
+- `[abci/server]` Accept pre-bound listener in socket and gRPC servers.
+  ([\#5904](https://github.com/cometbft/cometbft/pull/5904))
+- `[crypto]` Add ml-dsa-65 keytype.
+  ([\#5875](https://github.com/cometbft/cometbft/pull/5875))
+- `[crypto]` Add `secp256k1eth` keytype: go-ethereum-compatible secp256k1 signing
+  (legacy Keccak-256, 65-byte `[R||S||V]` signatures, 20-byte Ethereum addresses).
+  ([\#5907](https://github.com/cometbft/cometbft/pull/5907))
+
+### STATE-BREAKING
+
+- `[crypto]` `secp256k1eth` verification now requires exact 65-byte recoverable
+  `[R||S||V]` signatures with canonical `V` in `{0,1}`.
+- `[state]` `MedianTime` skips `Nil` and `Absent` precommits, aligning with `VerifyCommit`'s commit tally.
+  ([\#5901](https://github.com/cometbft/cometbft/pull/5901))
+
+### API-BREAKING
+
+- `[crypto]` Add ml-dsa-65 keytype.
+  ([\#5875](https://github.com/cometbft/cometbft/pull/5875))
+
+## v0.39.3
+
+*May 5, 2026*
+
+### DEPENDENCIES
+
+- Bump pq version to 1.12.0
+  ([\#5713](https://github.com/cometbft/cometbft/pull/5713))
+
+### FEATURES
+
+- `[mempool]` Allow CheckTx retries for BroadcastTxSync
+  ([\#5802](https://github.com/cometbft/cometbft/pull/5802))
+
+## v0.39.2
+
+*May 4, 2026*
+
+### DEPENDENCIES
+
+- `[build]` Bump `github.com/Masterminds/semver/v3` from `3.4.0` to `3.5.0`
+  ([\#5823](https://github.com/cometbft/cometbft/pull/5823))
+
+### BUG FIXES
+
+- `[mempool]` App mempool waits before broadcasting.
+  ([\#5800](https://github.com/cometbft/cometbft/pull/5800))
+- `[blocksync]` Prevent maxPeerHeight poisoning
+  ([\#5803](https://github.com/cometbft/cometbft/pull/5803))
+- `[p2p]` Add lp2p reactor panic recovery
+  ([\#5816](https://github.com/cometbft/cometbft/pull/5816))
+- `[light]` Stop witness comparison after divergence checks
+  ([\#5820](https://github.com/cometbft/cometbft/pull/5820))
+- `[abci]` fix(abci): prevent panic on unlock in socket server panic recovery
+  ([\#5593](https://github.com/cometbft/cometbft/pull/5593))
+
+### IMPROVEMENTS
+
+- `[abci,mempool]` Add Krakatoa app-mempool flow, including ABCI app-connection methods and app mempool/reactor wiring.
+  ([`f4a9ba936`](https://github.com/cometbft/cometbft/commit/f4a9ba936), [\#5791](https://github.com/cometbft/cometbft/pull/5791))
+- `[e2e]` Introduce app-mempool e2e network fixtures for simple, perturbed, and libp2p scenarios.
+  ([`f4a9ba936`](https://github.com/cometbft/cometbft/commit/f4a9ba936))
+- `[execution,state]` Add height validation in state execution and consensus paths
+  ([\#5804](https://github.com/cometbft/cometbft/pull/5804))
+- `[consensus]` perf(consensus): skip fsync for unsigned internal messages (block parts)
+  ([\#5695](https://github.com/cometbft/cometbft/pull/5695))
 
 ## v0.39.1
 
@@ -56,6 +249,7 @@
 
 ### IMPROVEMENTS
 
+- `[consensus]` perf(consensus): skip fsync for unsigned internal messages (block parts) ([\#5695](https://github.com/cometbft/cometbft/pull/5695))
 - `[ci]`: add lp2p testnet ([\#5643](https://github.com/cometbft/cometbft/pull/5643))
 - `[mempool]` feat!(p2p): introduce follower-mode. Improve lib-p2p integraap access
 - `[types]` Add validation for `AuthorityParams.Authority` field in consensus params, enforcing a maximum length of 256 characters ([#5511](https://github.com/cometbft/cometbft/pull/5511))
@@ -75,6 +269,8 @@
   ([\#5692](https://github.com/cometbft/cometbft/pull/5692))
 - `[p2p]` feat(p2p): add adaptive sync for comet-p2p
   ([\#5705](https://github.com/cometbft/cometbft/pull/5705))
+- `[blocksync]` fix redo event loss, stale event cancellation, and optimize retry timer
+  ([\#5592](https://github.com/cometbft/cometbft/pull/5592))
 
 ### FEATURES
 
@@ -160,6 +356,8 @@
   ([\#4783](https://github.com/cometbft/cometbft/issues/4783))
 - `[cli]` Prevent inadvertent rollover of IPs in `cometbft testnet` config generator
   ([\#5541](https://github.com/cometbft/cometbft/pull/5541))
+- `[abci]` fix(abci): prevent panic on unlock in socket server panic recovery
+  ([\#5593](https://github.com/cometbft/cometbft/pull/5593))
 
 ### API-BREAKING
 
@@ -1097,4 +1295,3 @@ Friendly reminder, we have a [bug bounty program](https://hackerone.com/cosmos).
 ## Previous changes
 
 For changes released before the creation of CometBFT, please refer to the Tendermint Core [CHANGELOG.md](https://github.com/tendermint/tendermint/blob/a9feb1c023e172b542c972605311af83b777855b/CHANGELOG.md).
-

@@ -31,6 +31,9 @@ const (
 
 	// adaptiveSync ticker. Still quick, just bursts fewer cpu cycles
 	intervalAdaptiveSync = 5 * intervalTrySync
+
+	// defaultNoBlockTimeout is the
+	defaultNoBlockTimeout = 30 * time.Second
 )
 
 type consensusReactor interface {
@@ -53,6 +56,9 @@ func (e peerError) Error() string {
 	return fmt.Sprintf("error with peer %v: %s", e.peerID, e.err.Error())
 }
 
+// Reactor implements MsgBytesFilter
+var _ p2p.MsgBytesFilter = (*Reactor)(nil)
+
 // Reactor handles long-term catchup syncing.
 type Reactor struct {
 	p2p.BaseReactor
@@ -70,7 +76,7 @@ type Reactor struct {
 	adaptiveSyncEnabled bool
 
 	blockExec     *sm.BlockExecutor
-	store         sm.BlockStore
+	store         *store.BlockStore
 	pool          *BlockPool
 	localAddr     crypto.Address
 	poolRoutineWg sync.WaitGroup
@@ -128,7 +134,7 @@ func NewReactor(
 	if startHeight == 1 {
 		startHeight = state.InitialHeight
 	}
-	pool := NewBlockPool(startHeight, requestsCh, errorsCh)
+	pool := NewBlockPool(startHeight, requestsCh, errorsCh, defaultNoBlockTimeout)
 
 	enabledFlag := &atomic.Bool{}
 	enabledFlag.Store(enabled)
@@ -224,7 +230,10 @@ func (r *Reactor) Enable(state sm.State) error {
 	r.Logger.Info("Enabling blocksync reactor")
 
 	r.initialState = state
+	r.pool.mtx.Lock()
 	r.pool.height = state.LastBlockHeight + 1
+	r.pool.updateMaxPeerHeight()
+	r.pool.mtx.Unlock()
 
 	return r.runPool(true)
 }
@@ -279,8 +288,9 @@ func (r *Reactor) RemovePeer(peer p2p.Peer, _ any) {
 // respondToPeer loads a block and sends it to the requesting peer,
 // if we have it. Otherwise, we'll respond saying we don't have it.
 func (r *Reactor) respondToPeer(msg *bcproto.BlockRequest, src p2p.Peer) {
-	block := r.store.LoadBlock(msg.Height)
-	if block == nil {
+	// Load the block directly in proto form to skip the BlockFromProto+ToProto round-trip.
+	bl := r.store.LoadBlockProto(msg.Height)
+	if bl == nil {
 		r.Logger.Info("Peer asking for a block we don't have", "src", src, "height", msg.Height)
 		src.TrySend(p2p.Envelope{
 			ChannelID: BlocksyncChannel,
@@ -300,15 +310,9 @@ func (r *Reactor) respondToPeer(msg *bcproto.BlockRequest, src p2p.Peer) {
 	if state.ConsensusParams.ABCI.VoteExtensionsEnabled(msg.Height) {
 		extCommit = r.store.LoadBlockExtendedCommit(msg.Height)
 		if extCommit == nil {
-			r.Logger.Error("Found block in store with no extended commit", "block", block)
+			r.Logger.Error("Found block in store with no extended commit", "height", msg.Height)
 			return
 		}
-	}
-
-	bl, err := block.ToProto()
-	if err != nil {
-		r.Logger.Error("Unable to convert the block to protobuf", "err", err)
-		return
 	}
 
 	src.TrySend(p2p.Envelope{
@@ -341,6 +345,75 @@ func (r *Reactor) handlePeerResponse(msg *bcproto.BlockResponse, src p2p.Peer) {
 	if err := r.pool.AddBlock(src.ID(), bi, extCommit, msg.Block.Size()); err != nil {
 		r.Logger.Error("Failed to add block", "peer", src, "err", err)
 	}
+}
+
+// FilterMsgBytes implements p2p.MsgBytesFilter and rejects messages from
+// unexpected peers before unmarshalling the request.
+func (r *Reactor) FilterMsgBytes(chID byte, src p2p.Peer, msgBytes []byte) error {
+	// do not check invalid messages, will fail unmarshalling
+	if chID != BlocksyncChannel || len(msgBytes) == 0 {
+		return nil
+	}
+
+	// unmarshal into custom stub struct that will do no allocations so we can
+	// quickly and cheaply check the validity of BlockResponse message
+	var stub bcproto.SigCountMessage
+	if err := stub.Unmarshal(msgBytes); err != nil {
+		return fmt.Errorf("malformed blocksync message from peer %s: %w", src.ID(), err)
+	}
+	if stub.BlockResponse == nil {
+		// Not a BlockResponse oneof case, no extra validation to do in this
+		// case
+		return nil
+	}
+
+	// Never ran blocksync on this node — any BlockResponse is unsolicited.
+	if !r.enabled.Load() {
+		return errors.New("unsolicited BlockResponse: blocksync not active")
+	}
+	// Pool has stopped (switched to consensus). Requests we sent before the
+	// transition are still in flight; the peers are honest and must not be
+	// disconnected for answering our own requests. Still enforce the sig-count
+	// guard below, since any connected peer can reach this path now.
+	if !r.pool.IsRunning() {
+		return validateMaxVotes(stub.BlockResponse)
+	}
+
+	// ensure we have an outstanding request to this peer
+	if !r.pool.HasPendingRequestFrom(src.ID()) {
+		return fmt.Errorf("unsolicited BlockResponse from peer %s", src.ID())
+	}
+
+	// validate the commit count in the response
+	if err := validateMaxVotes(stub.BlockResponse); err != nil {
+		return fmt.Errorf("validating max votes in BlockResponse from peer %s: %w", src.ID(), err)
+	}
+
+	return nil
+}
+
+// validateMaxVotes validates that the number of commit signatures and extended
+// commit signatures are both less than the MaxVotesCount, returns an error if
+// not.
+func validateMaxVotes(br *bcproto.SigCountBlockResponse) error {
+	commitSigs, extSigs := 0, 0
+	if br != nil {
+		if br.Block != nil && br.Block.LastCommit != nil {
+			commitSigs = len(br.Block.LastCommit.Signatures)
+		}
+		if br.ExtCommit != nil {
+			extSigs = len(br.ExtCommit.ExtendedSignatures)
+		}
+	}
+
+	if commitSigs > types.MaxVotesCount {
+		return fmt.Errorf("too many commit signatures: %d (max %d)", commitSigs, types.MaxVotesCount)
+	}
+	if extSigs > types.MaxVotesCount {
+		return fmt.Errorf("too many extended commit signatures: %d (max %d)", extSigs, types.MaxVotesCount)
+	}
+
+	return nil
 }
 
 // Receive implements Reactor by handling 4 types of messages (look below).
@@ -571,16 +644,9 @@ FOR_LOOP:
 
 			// Fully verify extended commit if present
 			if extensionsEnabled {
-				// if vote extensions were required at this height, ensure they exist.
-				if err = extCommit.EnsureExtensions(true); err != nil {
-					r.handleValidationFailure(first, second, err)
-					continue FOR_LOOP
-				}
-
 				// if vote extensions were required at this height, verify all
-				// signatures in the extended commit since it is persisted to
-				// the store.
-				if err = state.Validators.VerifyCommit(chainID, firstID, first.Height, extCommit.ToCommit()); err != nil {
+				// signatures in the extended commit since it is persisted to the store.
+				if err = state.Validators.VerifyCommitExtended(chainID, firstID, first.Height, extCommit); err != nil {
 					r.handleValidationFailure(first, second, err)
 					continue FOR_LOOP
 				}

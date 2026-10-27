@@ -44,12 +44,21 @@ type BlockExecutor struct {
 	// 1-element cache of validated blocks
 	lastValidatedBlock atomic.Pointer[types.Block]
 
+	// Commit-info validator sets may have unadvanced proposer priorities and
+	// must not be used for proposer selection or mutated.
+	lastLoadedCommitInfoValidators atomic.Pointer[cachedCommitInfoValidators]
+
 	logger log.Logger
 
 	metrics *Metrics
 
 	// blockTimeTolerance is the maximum allowed difference between proposed block time and wall clock.
 	blockTimeTolerance time.Duration
+}
+
+type cachedCommitInfoValidators struct {
+	height int64
+	valSet *types.ValidatorSet
 }
 
 type BlockExecutorOption func(executor *BlockExecutor)
@@ -146,7 +155,7 @@ func (blockExec *BlockExecutor) CreateProposalBlock(
 		&abci.RequestPrepareProposal{
 			MaxTxBytes:         maxDataBytes,
 			Txs:                block.Txs.ToSliceOfBytes(),
-			LocalLastCommit:    buildExtendedCommitInfoFromStore(lastExtCommit, blockExec.store, state.InitialHeight, state.ConsensusParams.ABCI),
+			LocalLastCommit:    blockExec.buildExtendedCommitInfo(lastExtCommit, state.InitialHeight, state.ConsensusParams.ABCI),
 			Misbehavior:        block.Evidence.Evidence.ToABCI(),
 			Height:             block.Height,
 			Time:               block.Time,
@@ -183,7 +192,7 @@ func (blockExec *BlockExecutor) ProcessProposal(
 		Height:             block.Height,
 		Time:               block.Time,
 		Txs:                block.Txs.ToSliceOfBytes(),
-		ProposedLastCommit: buildLastCommitInfoFromStore(block, blockExec.store, state.InitialHeight),
+		ProposedLastCommit: blockExec.buildLastCommitInfo(block, state.InitialHeight),
 		Misbehavior:        block.Evidence.Evidence.ToABCI(),
 		ProposerAddress:    block.ProposerAddress,
 		NextValidatorsHash: block.NextValidatorsHash,
@@ -217,8 +226,13 @@ func (blockExec *BlockExecutor) ValidateBlockSkipLastCommit(state State, block *
 func (blockExec *BlockExecutor) validateBlockAndCheckEvidence(state State, block *types.Block, opts ...func(*blockValidationOptions)) error {
 	lastValidated := blockExec.GetLastValidatedBlock()
 
+	expectedHeight := state.LastBlockHeight + 1
+	if state.LastBlockHeight == 0 {
+		expectedHeight = state.InitialHeight
+	}
+
 	// safe to call with nil
-	if !lastValidated.HashesTo(block.Hash()) {
+	if !lastValidated.HashesTo(block.Hash()) || block.Height != expectedHeight {
 		// always use blocktime tolerance set on the struct
 		if err := validateBlock(state, block, append(opts, blockExec.withBlockTimeTolerance)...); err != nil {
 			return err
@@ -255,8 +269,13 @@ func (blockExec *BlockExecutor) ApplyBlock(
 ) (State, error) {
 	lastValidated := blockExec.GetLastValidatedBlock()
 
+	expectedHeight := state.LastBlockHeight + 1
+	if state.LastBlockHeight == 0 {
+		expectedHeight = state.InitialHeight
+	}
+
 	// safe to call with nil
-	if !lastValidated.HashesTo(block.Hash()) {
+	if !lastValidated.HashesTo(block.Hash()) || block.Height != expectedHeight {
 		if err := validateBlock(state, block, blockExec.withBlockTimeTolerance); err != nil {
 			return state, ErrInvalidBlock(err)
 		}
@@ -274,7 +293,7 @@ func (blockExec *BlockExecutor) applyBlock(state State, blockID types.BlockID, b
 		ProposerAddress:    block.ProposerAddress,
 		Height:             block.Height,
 		Time:               block.Time,
-		DecidedLastCommit:  buildLastCommitInfoFromStore(block, blockExec.store, state.InitialHeight),
+		DecidedLastCommit:  blockExec.buildLastCommitInfo(block, state.InitialHeight),
 		Misbehavior:        block.Evidence.Evidence.ToABCI(),
 		Txs:                block.Txs.ToSliceOfBytes(),
 	})
@@ -387,7 +406,7 @@ func (blockExec *BlockExecutor) ExtendVote(
 		Height:             vote.Height,
 		Time:               block.Time,
 		Txs:                block.Txs.ToSliceOfBytes(),
-		ProposedLastCommit: buildLastCommitInfoFromStore(block, blockExec.store, state.InitialHeight),
+		ProposedLastCommit: blockExec.buildLastCommitInfo(block, state.InitialHeight),
 		Misbehavior:        block.Evidence.Evidence.ToABCI(),
 		NextValidatorsHash: block.NextValidatorsHash,
 		ProposerAddress:    block.ProposerAddress,
@@ -519,6 +538,29 @@ func (blockExec *BlockExecutor) setLastValidatedBlock(old, new *types.Block) {
 //---------------------------------------------------------
 // Helper functions for executing blocks and updating state
 
+// fastValidatorLoader is the duck-typed interface for stores that can return a
+// ValidatorSet without advancing proposer priorities. dbStore implements it
+// (see state/store.go); external Store implementations don't have to. The
+// helper below uses the fast path when available and falls back to
+// LoadValidators otherwise, so the addition stays additive for third-party
+// Store implementors.
+type fastValidatorLoader interface {
+	LoadValidatorsFast(int64) (*types.ValidatorSet, error)
+}
+
+// loadValidatorsForCommitInfo loads the ValidatorSet at height for building ABCI
+// CommitInfo records, which only read validator addresses and voting powers.
+// When store implements LoadValidatorsFast it is used to skip the
+// IncrementProposerPriority loop that dominates replay time on chains with
+// infrequent validator-set changes (issue #1693); otherwise it falls back to
+// LoadValidators.
+func loadValidatorsForCommitInfo(store Store, height int64) (*types.ValidatorSet, error) {
+	if fast, ok := store.(fastValidatorLoader); ok {
+		return fast.LoadValidatorsFast(height)
+	}
+	return store.LoadValidators(height)
+}
+
 func buildLastCommitInfoFromStore(block *types.Block, store Store, initialHeight int64) abci.CommitInfo {
 	if block.Height == initialHeight { // check for initial height before loading validators
 		// there is no last commit for the initial height.
@@ -526,12 +568,47 @@ func buildLastCommitInfoFromStore(block *types.Block, store Store, initialHeight
 		return abci.CommitInfo{}
 	}
 
-	lastValSet, err := store.LoadValidators(block.Height - 1)
+	lastValSet, err := loadValidatorsForCommitInfo(store, block.Height-1)
 	if err != nil {
 		panic(fmt.Errorf("failed to load validator set at height %d: %w", block.Height-1, err))
 	}
 
 	return BuildLastCommitInfo(block, lastValSet, initialHeight)
+}
+
+// note: set.Validators[i].ProposerPriority and set.Proposer are stale to avoid extra computations
+func (blockExec *BlockExecutor) loadValidatorsForCommitInfoCached(height int64) (*types.ValidatorSet, error) {
+	if entry := blockExec.lastLoadedCommitInfoValidators.Load(); entry != nil && entry.height == height {
+		return entry.valSet, nil
+	}
+	valSet, err := loadValidatorsForCommitInfo(blockExec.store, height)
+	if err != nil {
+		return nil, err
+	}
+	blockExec.lastLoadedCommitInfoValidators.Store(&cachedCommitInfoValidators{height: height, valSet: valSet})
+	return valSet, nil
+}
+
+func (blockExec *BlockExecutor) buildLastCommitInfo(block *types.Block, initialHeight int64) abci.CommitInfo {
+	if block.Height == initialHeight {
+		return abci.CommitInfo{}
+	}
+	lastValSet, err := blockExec.loadValidatorsForCommitInfoCached(block.Height - 1)
+	if err != nil {
+		panic(fmt.Errorf("failed to load validator set at height %d: %w", block.Height-1, err))
+	}
+	return BuildLastCommitInfo(block, lastValSet, initialHeight)
+}
+
+func (blockExec *BlockExecutor) buildExtendedCommitInfo(ec *types.ExtendedCommit, initialHeight int64, ap types.ABCIParams) abci.ExtendedCommitInfo {
+	if ec.Height < initialHeight {
+		return abci.ExtendedCommitInfo{}
+	}
+	valSet, err := blockExec.loadValidatorsForCommitInfoCached(ec.Height)
+	if err != nil {
+		panic(fmt.Errorf("failed to load validator set at height %d, initial height %d: %w", ec.Height, initialHeight, err))
+	}
+	return BuildExtendedCommitInfo(ec, valSet, initialHeight, ap)
 }
 
 // BuildLastCommitInfo builds a CommitInfo from the given block and validator set.
@@ -573,32 +650,9 @@ func BuildLastCommitInfo(block *types.Block, lastValSet *types.ValidatorSet, ini
 	}
 }
 
-// buildExtendedCommitInfoFromStore populates an ABCI extended commit from the
-// corresponding CometBFT extended commit ec, using the stored validator set
-// from ec.  It requires ec to include the original precommit votes along with
-// the vote extensions from the last commit.
-//
-// For heights below the initial height, for which we do not have the required
-// data, it returns an empty record.
-//
-// Assumes that the commit signatures are sorted according to validator index.
-func buildExtendedCommitInfoFromStore(ec *types.ExtendedCommit, store Store, initialHeight int64, ap types.ABCIParams) abci.ExtendedCommitInfo {
-	if ec.Height < initialHeight {
-		// There are no extended commits for heights below the initial height.
-		return abci.ExtendedCommitInfo{}
-	}
-
-	valSet, err := store.LoadValidators(ec.Height)
-	if err != nil {
-		panic(fmt.Errorf("failed to load validator set at height %d, initial height %d: %w", ec.Height, initialHeight, err))
-	}
-
-	return BuildExtendedCommitInfo(ec, valSet, initialHeight, ap)
-}
-
 // BuildExtendedCommitInfo builds an ExtendedCommitInfo from the given block and validator set.
 // If you want to load the validator set from the store instead of providing it,
-// use buildExtendedCommitInfoFromStore.
+// use blockExec.buildExtendedCommitInfo.
 func BuildExtendedCommitInfo(ec *types.ExtendedCommit, valSet *types.ValidatorSet, initialHeight int64, ap types.ABCIParams) abci.ExtendedCommitInfo {
 	if ec.Height < initialHeight {
 		// There are no extended commits for heights below the initial height.
@@ -818,6 +872,8 @@ func fireEvents(
 
 // ExecCommitBlock executes and commits a block on the proxyApp without validating or mutating the state.
 // It returns the application root hash (result of abci.Commit).
+// Note: this function does not use BlockExecutor's validator cache; it is only called from the
+// replay path where no BlockExecutor is available.
 func ExecCommitBlock(
 	appConnConsensus proxy.AppConnConsensus,
 	block *types.Block,

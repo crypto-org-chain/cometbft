@@ -16,6 +16,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	ma "github.com/multiformats/go-multiaddr"
 	"github.com/pkg/errors"
 )
 
@@ -403,16 +404,32 @@ func (s *Switch) handleStream(stream network.Stream) {
 		return
 	}
 
-	msg, err := unmarshalProto(proto.descriptor, payload)
+	// 3. Retrieve the peer from the peerSet (or provision if it's not).
+	peer, err := s.resolvePeer(peerID, stream.Conn().RemoteMultiaddr())
 	if err != nil {
-		s.Logger.Error("Failed to unmarshal message", "protocol", protocolID, "err", err)
+		s.Logger.Error("Failed to resolve peer", "protocol", protocolID, "peer_id", peerID.String(), "err", err)
 		return
 	}
 
-	// 3. Retrieve the peer from the peerSet (or provision if it's not)
-	peer, err := s.resolvePeer(peerID)
+	// 4. Optional pre-unmarshal filter. Allow reactors to filter messages
+	// before unmarshalling them
+	if f, ok := reactor.Reactor.(p2p.MsgBytesFilter); ok {
+		if err := f.FilterMsgBytes(proto.descriptor.ID, peer, payload); err != nil {
+			s.Logger.Error(
+				"Rejected msg bytes by reactor filter",
+				"peer_id", peerID.String(),
+				"protocol", protocolID,
+				"err", err,
+			)
+			s.StopPeerForError(peer, err)
+			return
+		}
+	}
+
+	msg, err := unmarshalProto(proto.descriptor, payload)
 	if err != nil {
-		s.Logger.Error("Failed to resolve peer", "peer_id", peerID.String(), "err", err)
+		s.Logger.Error("Failed to unmarshal message", "protocol", protocolID, "err", err)
+		s.StopPeerForError(peer, err)
 		return
 	}
 
@@ -449,7 +466,7 @@ func (s *Switch) handleStream(stream network.Stream) {
 	s.reactors.Receive(reactor.name, messageType, envelope, priority)
 }
 
-func (s *Switch) resolvePeer(id peer.ID) (p2p.Peer, error) {
+func (s *Switch) resolvePeer(id peer.ID, connRemoteAddr ma.Multiaddr) (p2p.Peer, error) {
 	key := peerIDToKey(id)
 
 	// peer exists (99% of the time)
@@ -457,9 +474,16 @@ func (s *Switch) resolvePeer(id peer.ID) (p2p.Peer, error) {
 		return peer, nil
 	}
 
+	// addrInfo most likely exists...
 	addrInfo := s.host.Peerstore().PeerInfo(id)
+
+	// ... but peer identification runs asynchronously to stream handling,
+	// thus addrInfo may not yet be populated. fallback to connRemoteAddr.
 	if len(addrInfo.Addrs) == 0 {
-		return nil, errors.New("peer has no addresses in peerstore")
+		addrInfo = peer.AddrInfo{
+			ID:    id,
+			Addrs: []ma.Multiaddr{connRemoteAddr},
+		}
 	}
 
 	var isPrivate, isPersistent, isUnconditional bool
