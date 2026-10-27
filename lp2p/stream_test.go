@@ -3,14 +3,18 @@ package lp2p
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strconv"
 	"testing"
+	"testing/iotest"
+	"time"
 
 	"github.com/cometbft/cometbft/test/utils"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 )
 
 func TestStream(t *testing.T) {
@@ -361,4 +365,262 @@ func (s *streamStub) Write(p []byte) (int, error) {
 	return s.Stream.Write(p)
 }
 
+func (s *streamStub) SetReadDeadline(t time.Time) error {
+	if s.Stream == nil {
+		return nil
+	}
+
+	return s.Stream.SetReadDeadline(t)
+}
+
+func (s *streamStub) SetWriteDeadline(t time.Time) error {
+	if s.Stream == nil {
+		return nil
+	}
+
+	return s.Stream.SetWriteDeadline(t)
+}
+
 func (c *connStub) IsClosed() bool { return c.closed }
+
+type streamProgressSuite struct {
+	suite.Suite
+}
+
+func TestStreamProgressSuite(t *testing.T) {
+	suite.Run(t, new(streamProgressSuite))
+}
+
+func (s *streamProgressSuite) TestReadTimeout() {
+	const timeout = 500 * time.Millisecond
+
+	payload := patternBytes(24)
+	frame := append(uint64ToUvarint(uint64(len(payload))), payload...)
+
+	testCases := []struct {
+		name      string
+		write     func(stream network.Stream)
+		expectErr bool
+	}{
+		{
+			name:      "stalls before the length prefix",
+			write:     func(stream network.Stream) { _, _ = stream.Write([]byte{0x80}) },
+			expectErr: true,
+		},
+		{
+			name:      "stalls after the length prefix",
+			write:     func(stream network.Stream) { _, _ = stream.Write(frame[:4]) },
+			expectErr: true,
+		},
+		{
+			name: "slow writer that keeps making progress",
+			write: func(stream network.Stream) {
+				for _, b := range frame[:len(frame)-1] {
+					_, _ = stream.Write([]byte{b})
+					time.Sleep(timeout / 10)
+				}
+				_, _ = stream.Write(frame[len(frame)-1:])
+				_ = stream.CloseWrite()
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			ts := newStreamTestSuite(s.T())
+			protoID := ProtocolID(0xAB)
+
+			type result struct {
+				payload []byte
+				err     error
+			}
+
+			results := make(chan result, 1)
+			ts.hostA.SetStreamHandler(protoID, func(stream network.Stream) {
+				out, err := streamReadSizedClose(stream, 1024, timeout)
+				results <- result{payload: out, err: err}
+			})
+
+			stream, err := ts.hostB.NewStream(ts.ctx, ts.hostA.ID(), protoID)
+			s.Require().NoError(err)
+			s.T().Cleanup(func() { _ = stream.Reset() })
+
+			tc.write(stream)
+
+			select {
+			case res := <-results:
+				if tc.expectErr {
+					s.ErrorContains(res.err, "deadline")
+					return
+				}
+
+				s.Require().NoError(res.err)
+				s.Equal(payload, res.payload)
+			case <-time.After(10 * time.Second):
+				s.Fail("read did not finish")
+			}
+		})
+	}
+}
+
+func (s *streamProgressSuite) TestWriteTimeout() {
+	const timeout = 500 * time.Millisecond
+
+	payload := patternBytes(2 << 20)
+
+	testCases := []struct {
+		name      string
+		read      func(stream network.Stream) []byte
+		expectErr bool
+	}{
+		{
+			name: "reader stalls",
+			read: func(network.Stream) []byte {
+				time.Sleep(4 * timeout)
+				return nil
+			},
+			expectErr: true,
+		},
+		{
+			name: "slow reader that keeps making progress",
+			read: func(stream network.Stream) []byte {
+				var out []byte
+				buf := make([]byte, 64<<10)
+				for {
+					n, err := stream.Read(buf)
+					out = append(out, buf[:n]...)
+					if err != nil {
+						return out
+					}
+					time.Sleep(timeout / 10)
+				}
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			ts := newStreamTestSuite(s.T())
+			protoID := ProtocolID(0xAC)
+
+			received := make(chan []byte, 1)
+			ts.hostA.SetStreamHandler(protoID, func(stream network.Stream) {
+				received <- tc.read(stream)
+				_ = stream.Reset()
+			})
+
+			stream, err := ts.hostB.NewStream(ts.ctx, ts.hostA.ID(), protoID)
+			s.Require().NoError(err)
+
+			start := time.Now()
+			err = streamWriteClose(stream, payload, timeout)
+
+			if tc.expectErr {
+				s.ErrorContains(err, "deadline")
+				s.Less(time.Since(start), 3*timeout)
+				return
+			}
+
+			s.Require().NoError(err)
+			s.Greater(time.Since(start), 2*timeout)
+			s.Equal(append(uint64ToUvarint(uint64(len(payload))), payload...), <-received)
+		})
+	}
+}
+
+func (s *streamProgressSuite) TestDeadlinesClearedOnReturn() {
+	const timeout = 300 * time.Millisecond
+
+	var (
+		ts      = newStreamTestSuite(s.T())
+		protoID = ProtocolID(0xAD)
+		tail    = []byte("tail")
+	)
+
+	readErr := make(chan error, 1)
+	ts.hostA.SetStreamHandler(protoID, func(stream network.Stream) {
+		defer func() { _ = stream.Reset() }()
+
+		if _, err := streamReadSized(stream, 1024, timeout); err != nil {
+			readErr <- err
+			return
+		}
+
+		_, err := io.ReadFull(stream, make([]byte, len(tail)))
+		readErr <- err
+	})
+
+	stream, err := ts.hostB.NewStream(ts.ctx, ts.hostA.ID(), protoID)
+	s.Require().NoError(err)
+	s.T().Cleanup(func() { _ = stream.Reset() })
+
+	_, err = streamWrite(stream, []byte("head"), timeout)
+	s.Require().NoError(err)
+
+	time.Sleep(3 * timeout)
+
+	_, err = stream.Write(tail)
+	s.Require().NoError(err)
+	s.NoError(<-readErr)
+}
+
+func (s *streamProgressSuite) TestReadExactly() {
+	testCases := []struct {
+		name        string
+		size        uint64
+		available   int
+		readErr     error
+		expectedErr string
+	}{
+		{name: "empty", size: 0},
+		{name: "single segment", size: 100, available: 100},
+		{name: "truncated single segment", size: 100, available: 50, expectedErr: "eof partial read (50/100 bytes)"},
+		{name: "exactly one segment", size: readSegmentSize, available: readSegmentSize},
+		{name: "one byte past one segment", size: readSegmentSize + 1, available: readSegmentSize + 1},
+		{name: "several segments", size: 3*readSegmentSize + 7, available: 3*readSegmentSize + 7},
+		{name: "announced size larger than the data", size: 100 << 20, available: readSegmentSize + 100, expectedErr: "eof partial read (1048676/104857600 bytes)"},
+		{name: "reader fails mid-message", size: 200, available: 100, readErr: errors.New("boom"), expectedErr: "failed to read payload (read 100/200 bytes): boom"},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			data := patternBytes(tc.available)
+			source := io.Reader(bytes.NewReader(data))
+			if tc.readErr != nil {
+				source = io.MultiReader(source, iotest.ErrReader(tc.readErr))
+			}
+			r := &readSizeRecorder{r: iotest.HalfReader(source)}
+
+			out, err := readExactly(r, tc.size)
+
+			s.LessOrEqual(r.maxBuf, readSegmentSize)
+			if tc.expectedErr != "" {
+				s.ErrorContains(err, tc.expectedErr)
+				return
+			}
+
+			s.Require().NoError(err)
+			s.Equal(data, out)
+		})
+	}
+}
+
+type readSizeRecorder struct {
+	r      io.Reader
+	maxBuf int
+}
+
+func (r *readSizeRecorder) Read(p []byte) (int, error) {
+	r.maxBuf = max(r.maxBuf, len(p))
+
+	return r.r.Read(p)
+}
+
+func patternBytes(n int) []byte {
+	out := make([]byte, n)
+	for i := range out {
+		out[i] = byte(i*31 + i>>8)
+	}
+
+	return out
+}

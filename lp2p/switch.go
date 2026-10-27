@@ -398,7 +398,7 @@ func (s *Switch) handleStream(stream network.Stream) {
 	}
 
 	// 2. Read the stream so we can "release" it on another end (with a maximum size)
-	payload, err := StreamReadSizedClose(stream, proto.maxMessageSize())
+	payload, err := streamReadSizedClose(stream, proto.maxMessageSize(), s.host.streamTimeout)
 	if err != nil {
 		s.Logger.Error("Failed to read payload", "protocol", protocolID, "err", err)
 		return

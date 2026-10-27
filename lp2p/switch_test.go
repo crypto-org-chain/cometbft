@@ -648,6 +648,52 @@ func TestSwitch(t *testing.T) {
 		}, 2*time.Second, 20*time.Millisecond,
 			"B must receive the message even though B's peerstore was empty for A at stream time")
 	})
+
+	t.Run("StalledIncomingStreamIsReset", func(t *testing.T) {
+		const channelID = byte(0xF3)
+
+		hosts := makeTestHosts(t, 2)
+		hostA, hostB := hosts[0], hosts[1]
+
+		hostA.streamTimeout = 300 * time.Millisecond
+
+		channelDescriptor := &conn.ChannelDescriptor{
+			ID:                  channelID,
+			Priority:            1,
+			RecvMessageCapacity: 1024,
+			MessageType:         &types.RequestEcho{},
+		}
+
+		reactorA := newReactorMock([]*conn.ChannelDescriptor{channelDescriptor}, hostA.Logger())
+		switchA, err := NewSwitch(nil, hostA, []SwitchReactor{{Name: "echo", Reactor: reactorA}}, p2p.NopMetrics(), hostA.Logger())
+		require.NoError(t, err)
+		require.NoError(t, switchA.Start())
+		t.Cleanup(func() { _ = switchA.Stop() })
+
+		ctx := context.Background()
+		require.NoError(t, hostB.Connect(ctx, hostA.AddrInfo()))
+
+		stream, err := hostB.NewStream(ctx, hostA.ID(), ProtocolID(channelID))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = stream.Reset() })
+
+		_, err = stream.Write([]byte{0x80})
+		require.NoError(t, err)
+
+		readErr := make(chan error, 1)
+		go func() {
+			_, err := stream.Read(make([]byte, 1))
+			readErr <- err
+		}()
+
+		select {
+		case err := <-readErr:
+			require.Error(t, err)
+		case <-time.After(5 * time.Second):
+			t.Fatal("stalled stream was not reset")
+		}
+		require.Empty(t, reactorA.receivedEnvelopes())
+	})
 }
 
 // filteringReactor is a mock reactor that optionally filters messages via the

@@ -8,6 +8,8 @@
 
 ### BUG FIXES
 
+- `[lp2p]` time out stalled stream reads and writes
+  ([\#75](https://github.com/crypto-org-chain/cometbft/pull/75))
 - `[rpc]` reject out-of-range `/genesis_chunked` indices that wrap to a negative int instead of panicking
   ([\#6070](https://github.com/cometbft/cometbft/pull/6070))
 - `[lp2p]` size the system-wide connection limit in custom limits mode from `max_peers` instead of `max_peer_streams`
