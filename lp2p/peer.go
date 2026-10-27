@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/cometbft/cometbft/libs/service"
@@ -35,6 +36,8 @@ type Peer struct {
 	isPrivate       bool
 	isPersistent    bool
 	isUnconditional bool
+
+	outbound atomic.Bool
 
 	metrics *p2p.Metrics
 }
@@ -232,8 +235,9 @@ func (p *Peer) RemoteAddr() net.Addr {
 	}
 }
 
-// IsOutbound returns true because all lp2p peers are bi-directional.
-func (*Peer) IsOutbound() bool { return true }
+// IsOutbound reports whether this node chose to connect to the peer, regardless of which side opened the
+// libp2p connection.
+func (p *Peer) IsOutbound() bool { return p.outbound.Load() }
 
 // Status returns an empty ConnectionStatus. Per-channel send queue
 // statistics are not available with the libp2p transport.

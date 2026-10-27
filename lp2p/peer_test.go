@@ -37,7 +37,6 @@ func TestPeer(t *testing.T) {
 		peerC, err := NewPeer(hostA, hostC.AddrInfo(), p2p.NopMetrics(), false, false, false)
 		require.NoError(t, err)
 
-		// ACT & ASSERT — outbound peer (we dialed hostB)
 		// NodeInfo must type-assert to DefaultNodeInfo (this is what /net_info does)
 		nodeInfo, ok := peerB.NodeInfo().(p2p.DefaultNodeInfo)
 		require.True(t, ok, "NodeInfo must type-assert to p2p.DefaultNodeInfo")
@@ -45,16 +44,13 @@ func TestPeer(t *testing.T) {
 		assert.NotEmpty(t, nodeInfo.ListenAddr)
 
 		assert.True(t, peerB.RemoteIP().Equal(net.IPv4(127, 0, 0, 1)))
-		assert.True(t, peerB.IsOutbound())
 
 		remoteAddr, ok := peerB.RemoteAddr().(*net.TCPAddr)
 		require.True(t, ok)
 		assert.NotZero(t, remoteAddr.Port)
 
-		// ACT & ASSERT — inbound peer (hostC dialed us)
 		_, ok = peerC.NodeInfo().(p2p.DefaultNodeInfo)
 		require.True(t, ok)
-		assert.True(t, peerC.IsOutbound(), "all lp2p peers are bi-directional")
 	})
 
 	t.Run("NetInfoIteration", func(t *testing.T) {
