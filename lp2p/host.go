@@ -36,6 +36,8 @@ type Host struct {
 	logger log.Logger
 
 	peerFailureHandlers []func(id peer.ID, err error)
+
+	streamTimeout time.Duration
 }
 
 // BootstrapPeer initial peers to connect to
@@ -120,6 +122,7 @@ func NewHost(config *config.P2PConfig, nodeKey cmcrypto.PrivKey, logger log.Logg
 		config:         config.LibP2PConfig,
 		bootstrapPeers: bootstrapPeers,
 		logger:         logger,
+		streamTimeout:  TimeoutStream,
 	}
 
 	if connGaterEnabled {

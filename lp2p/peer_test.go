@@ -3,7 +3,9 @@ package lp2p
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/libs/log"
@@ -182,5 +184,49 @@ func TestPeer(t *testing.T) {
 			// ASSERT
 			require.False(t, send)
 		})
+	})
+
+	t.Run("SendToNonReadingPeerTimesOut", func(t *testing.T) {
+		var (
+			ctx   = context.Background()
+			hosts = makeTestHosts(t, 2)
+			hostA = hosts[0]
+			hostB = hosts[1]
+		)
+
+		require.NoError(t, hostA.Connect(ctx, hostB.AddrInfo()))
+		require.Eventually(t, func() bool {
+			protocols, err := hostA.Peerstore().GetProtocols(hostB.ID())
+			return err == nil && len(protocols) > 0
+		}, 5*time.Second, 20*time.Millisecond)
+
+		hostA.streamTimeout = time.Second
+
+		const channelID = byte(0xab)
+
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+
+		hostB.SetStreamHandler(ProtocolID(channelID), func(network.Stream) { <-release })
+
+		peerB, err := NewPeer(hostA, hostB.AddrInfo(), p2p.NopMetrics(), false, false, false)
+		require.NoError(t, err)
+
+		start := time.Now()
+		done := make(chan bool, 1)
+		go func() {
+			done <- peerB.Send(p2p.Envelope{
+				ChannelID: channelID,
+				Message:   types.ToRequestEcho(strings.Repeat("x", 8<<20)),
+			})
+		}()
+
+		select {
+		case sent := <-done:
+			require.False(t, sent)
+			require.Less(t, time.Since(start), 5*time.Second)
+		case <-time.After(10 * time.Second):
+			t.Fatal("send to a non-reading peer did not time out")
+		}
 	})
 }

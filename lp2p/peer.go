@@ -168,7 +168,7 @@ func (p *Peer) send(e p2p.Envelope) (err error) {
 
 	peerSendQueueSize.Add(1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), TimeoutStream)
+	ctx, cancel := context.WithTimeout(context.Background(), p.host.streamTimeout)
 	defer cancel()
 
 	start := time.Now()
@@ -197,7 +197,7 @@ func (p *Peer) send(e p2p.Envelope) (err error) {
 		return fmt.Errorf("failed to open stream %s: %w", protocolID, err)
 	}
 
-	return StreamWriteClose(s, payload)
+	return streamWriteClose(s, payload, p.host.streamTimeout)
 }
 
 func (p *Peer) handleSendErr(err error) {
