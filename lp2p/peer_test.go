@@ -2,15 +2,20 @@ package lp2p
 
 import (
 	"context"
+	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 )
 
 func TestPeer(t *testing.T) {
@@ -183,4 +188,153 @@ func TestPeer(t *testing.T) {
 			require.False(t, send)
 		})
 	})
+}
+
+type peerRedialSuite struct {
+	suite.Suite
+}
+
+func TestPeerRedialSuite(t *testing.T) {
+	suite.Run(t, new(peerRedialSuite))
+}
+
+func (s *peerRedialSuite) newPeerPair(bootstrap bool) (*Host, *Host, chan peer.ID) {
+	hosts := makeTestHosts(s.T(), 2)
+	hostA, hostB := hosts[0], hosts[1]
+
+	if bootstrap {
+		hostA.bootstrapPeers[hostB.ID()] = BootstrapPeer{AddrInfo: hostB.AddrInfo()}
+	}
+
+	failures := make(chan peer.ID, 1)
+	hostA.AddPeerFailureHandler(func(id peer.ID, _ error) {
+		select {
+		case failures <- id:
+		default:
+		}
+	})
+
+	return hostA, hostB, failures
+}
+
+func (s *peerRedialSuite) assertFailureReported(failures chan peer.ID) {
+	select {
+	case <-failures:
+	case <-time.After(5 * time.Second):
+		s.Fail("peer failure was not reported")
+	}
+}
+
+func (s *peerRedialSuite) assertNoFailure(failures chan peer.ID) {
+	select {
+	case <-failures:
+		s.Fail("unexpected peer failure")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+func (s *peerRedialSuite) TestSendFailure() {
+	testCases := []struct {
+		name            string
+		bootstrap       bool
+		disconnect      bool
+		noHandler       bool
+		expectSent      bool
+		expectConnected bool
+		expectFailure   bool
+	}{
+		{name: "disconnected bootstrap peer is redialed", bootstrap: true, disconnect: true, expectSent: true, expectConnected: true},
+		{name: "disconnected other peer is reported, not redialed", disconnect: true, expectFailure: true},
+		{name: "connected other peer with a failed send is kept", noHandler: true, expectConnected: true},
+		{name: "connected bootstrap peer with a failed send is kept", bootstrap: true, noHandler: true, expectConnected: true},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			const channelID = byte(0xad)
+
+			hostA, hostB, failures := s.newPeerPair(tc.bootstrap)
+
+			if !tc.noHandler {
+				hostB.SetStreamHandler(ProtocolID(channelID), func(stream network.Stream) {
+					_, _ = StreamReadClose(stream)
+				})
+			}
+
+			s.Require().NoError(hostA.Connect(context.Background(), hostB.AddrInfo()))
+
+			if tc.disconnect {
+				s.Require().NoError(hostA.Network().ClosePeer(hostB.ID()))
+			}
+
+			peerB, err := NewPeer(hostA, hostB.AddrInfo(), p2p.NopMetrics(), false, false, false)
+			s.Require().NoError(err)
+
+			sent := peerB.Send(p2p.Envelope{ChannelID: channelID, Message: types.ToRequestEcho("hi")})
+
+			s.Equal(tc.expectSent, sent)
+			s.Equal(tc.expectConnected, hostA.Network().Connectedness(hostB.ID()) == network.Connected)
+
+			if tc.expectFailure {
+				s.assertFailureReported(failures)
+				return
+			}
+
+			s.assertNoFailure(failures)
+		})
+	}
+}
+
+func (s *peerRedialSuite) TestHandleSendErr() {
+	testCases := []struct {
+		name       string
+		bootstrap  bool
+		err        error
+		expectEmit bool
+	}{
+		{name: "disconnected other peer with a non-dial error", err: errors.New("connection failed"), expectEmit: true},
+		{name: "disconnected other peer whose dials failed", err: swarm.ErrAllDialsFailed, expectEmit: true},
+		{name: "disconnected bootstrap peer with a non-dial error", bootstrap: true, err: errors.New("connection failed")},
+		{name: "disconnected bootstrap peer whose dials failed", bootstrap: true, err: swarm.ErrAllDialsFailed, expectEmit: true},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			hostA, hostB, failures := s.newPeerPair(tc.bootstrap)
+
+			peerB, err := NewPeer(hostA, hostB.AddrInfo(), p2p.NopMetrics(), false, false, false)
+			s.Require().NoError(err)
+
+			peerB.handleSendErr(tc.err)
+
+			if tc.expectEmit {
+				s.assertFailureReported(failures)
+				return
+			}
+
+			s.assertNoFailure(failures)
+		})
+	}
+}
+
+func (s *peerRedialSuite) TestSwitchRemovesUnreachablePeer() {
+	hostA, hostB, _ := s.newPeerPair(false)
+
+	sw, err := NewSwitch(nil, hostA, nil, p2p.NopMetrics(), hostA.Logger())
+	s.Require().NoError(err)
+	s.Require().NoError(sw.Start())
+	s.T().Cleanup(func() { _ = sw.Stop() })
+
+	s.Require().NoError(hostA.Connect(context.Background(), hostB.AddrInfo()))
+
+	added, err := sw.peerSet.Add(hostB.AddrInfo(), PeerAddOptions{})
+	s.Require().NoError(err)
+	s.Require().NoError(hostA.Network().ClosePeer(hostB.ID()))
+
+	s.False(added.Send(p2p.Envelope{ChannelID: 0xad, Message: types.ToRequestEcho("hi")}))
+
+	s.Eventually(func() bool { return sw.Peers().Get(added.ID()) == nil }, 5*time.Second, 20*time.Millisecond)
+	s.Never(func() bool {
+		return hostA.Network().Connectedness(hostB.ID()) == network.Connected
+	}, 500*time.Millisecond, 50*time.Millisecond)
 }
