@@ -86,6 +86,30 @@ func PrometheusMetrics(namespace string, labelsAndValues ...string) *Metrics {
 			Name:      "message_reactor_queue_concurrency",
 			Help:      "Concurrency of the incoming message queue for a given reactor",
 		}, append(labels, "reactor")).With(labelsAndValues...),
+		PexAddrBookSize: prometheus.NewGaugeFrom(stdprometheus.GaugeOpts{
+			Namespace: namespace,
+			Subsystem: MetricsSubsystem,
+			Name:      "pex_addr_book_size",
+			Help:      "Number of addresses in the libp2p peer exchange book, by how they were learned.",
+		}, append(labels, "source")).With(labelsAndValues...),
+		PexDials: prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: MetricsSubsystem,
+			Name:      "pex_dials",
+			Help:      "Number of libp2p peer exchange dials, by outcome.",
+		}, append(labels, "result")).With(labelsAndValues...),
+		PexMessagesDropped: prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: MetricsSubsystem,
+			Name:      "pex_messages_dropped",
+			Help:      "Number of libp2p peer exchange messages dropped, by reason.",
+		}, append(labels, "reason")).With(labelsAndValues...),
+		PexBans: prometheus.NewCounterFrom(stdprometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: MetricsSubsystem,
+			Name:      "pex_bans",
+			Help:      "Number of bans recorded by libp2p peer exchange.",
+		}, labels).With(labelsAndValues...),
 	}
 }
 
@@ -103,5 +127,9 @@ func NopMetrics() *Metrics {
 		MessagesReactorPendingDuration: discard.NewHistogram(),
 		MessageReactorReceiveDuration:  discard.NewHistogram(),
 		MessageReactorQueueConcurrency: discard.NewGauge(),
+		PexAddrBookSize:                discard.NewGauge(),
+		PexDials:                       discard.NewCounter(),
+		PexMessagesDropped:             discard.NewCounter(),
+		PexBans:                        discard.NewCounter(),
 	}
 }

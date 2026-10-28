@@ -755,6 +755,7 @@ func createAndStartPrivValidatorSocketClient(
 func createLibP2PPEXReactor(
 	config *cfg.P2PConfig,
 	host *lp2p.Host,
+	metrics *p2p.Metrics,
 	logger log.Logger,
 ) (*lp2ppex.Reactor, *lp2ppex.AddrBook, error) {
 	var reactor *lp2ppex.Reactor
@@ -789,7 +790,7 @@ func createLibP2PPEXReactor(
 
 	book := lp2ppex.NewAddrBook(path, bookCfg)
 	host.SetBanChecker(book)
-	reactor = lp2ppex.NewReactor(book, host, config.MaxNumOutboundPeers)
+	reactor = lp2ppex.NewReactor(book, host, config.MaxNumOutboundPeers, metrics)
 	reactor.SetLogger(logger.With("module", "pex"))
 
 	return reactor, book, nil

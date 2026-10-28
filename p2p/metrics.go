@@ -48,6 +48,14 @@ type Metrics struct {
 	MessageReactorReceiveDuration metrics.Histogram `metrics_labels:"message_type,reactor"`
 	// Concurrency of the incoming message queue for a given reactor
 	MessageReactorQueueConcurrency metrics.Gauge `metrics_labels:"reactor"`
+	// Number of addresses in the libp2p peer exchange book, by how they were learned.
+	PexAddrBookSize metrics.Gauge `metrics_labels:"source"`
+	// Number of libp2p peer exchange dials, by outcome.
+	PexDials metrics.Counter `metrics_labels:"result"`
+	// Number of libp2p peer exchange messages dropped, by reason.
+	PexMessagesDropped metrics.Counter `metrics_labels:"reason"`
+	// Number of bans recorded by libp2p peer exchange.
+	PexBans metrics.Counter
 }
 
 type metricsLabelCache struct {

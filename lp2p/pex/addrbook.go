@@ -46,6 +46,8 @@ const (
 	SourceDialed  Source = "dialed"
 )
 
+var allSources = [...]Source{SourceGossip, SourceInbound, SourceDialed}
+
 var (
 	ErrInvalidID      = errors.New("invalid peer ID")
 	ErrSelf           = errors.New("own peer ID")
@@ -334,6 +336,20 @@ func (b *AddrBook) Size() int {
 	return len(b.entries)
 }
 
+// SizeBySource returns the number of entries per source; sources with no
+// entries are absent.
+func (b *AddrBook) SizeBySource() map[Source]int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	sizes := make(map[Source]int)
+	for _, e := range b.entries {
+		sizes[e.Source]++
+	}
+
+	return sizes
+}
+
 // NeedMoreAddrs reports whether the book is below half its capacity.
 func (b *AddrBook) NeedMoreAddrs() bool {
 	return b.Size() < b.cfg.MaxSize/2
@@ -377,12 +393,14 @@ func (b *AddrBook) InCooldown(id peer.ID) bool {
 
 // Ban removes the peer and, while MaxBans allows, refuses it until the given
 // time. A ban is only ever extended. Bootstrap and private peers are never banned.
-func (b *AddrBook) Ban(id peer.ID, until time.Time) {
+// It reports whether a new ban was recorded.
+func (b *AddrBook) Ban(id peer.ID, until time.Time) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	delete(b.entries, id)
-	b.addBan(id, until)
+
+	return b.addBan(id, until)
 }
 
 // IsBanned reports whether the peer is banned.
@@ -738,15 +756,15 @@ func (b *AddrBook) isBanned(id peer.ID) bool {
 
 // addBan keeps the longest ban per peer. At MaxBans the earliest-expiring ban
 // gives way, unless the new one would expire first.
-func (b *AddrBook) addBan(id peer.ID, until time.Time) {
+func (b *AddrBook) addBan(id peer.ID, until time.Time) bool {
 	if !validID(id) || contains(b.cfg.Bootstrap, id) || contains(b.cfg.Private, id) || !until.After(b.now()) {
-		return
+		return false
 	}
 	until = clampTime(until)
 
-	if current, ok := b.bans[id]; ok {
+	if current, ok := b.bans[id]; ok && b.now().Before(current) {
 		b.bans[id] = latest(current, until)
-		return
+		return false
 	}
 
 	if len(b.bans) >= b.cfg.MaxBans {
@@ -760,12 +778,14 @@ func (b *AddrBook) addBan(id peer.ID, until time.Time) {
 			}
 		}
 		if at.IsZero() || !until.After(at) {
-			return
+			return false
 		}
 		delete(b.bans, soonest)
 	}
 
 	b.bans[id] = until
+
+	return true
 }
 
 func (b *AddrBook) pruneBans() {
