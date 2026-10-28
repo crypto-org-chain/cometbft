@@ -24,7 +24,7 @@ import (
 )
 
 // Channel is the PEX channel, shared with the classic transport.
-const Channel = byte(0x00)
+const Channel = lp2p.PEXChannel
 
 const (
 	maxAddrs = 128
@@ -36,7 +36,7 @@ const (
 	maxIDLen = 128
 
 	msgInterval    = 5 * time.Second
-	msgBurst       = 3
+	msgBurst       = lp2p.PEXPeerStreams - 1 // one reply per request, plus one stream for our own request
 	requestTimeout = 20 * time.Second
 	askInterval    = 30 * time.Second
 	saveInterval   = 2 * time.Minute

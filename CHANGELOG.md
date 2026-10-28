@@ -42,6 +42,8 @@
 
 ### FEATURES
 
+- `[lp2p]` limit peer exchange streams in the resource manager
+  ([\#89](https://github.com/crypto-org-chain/cometbft/pull/89))
 - `[lp2p]` cap inbound peers when peer exchange is enabled
   ([\#88](https://github.com/crypto-org-chain/cometbft/pull/88))
 - `[lp2p]` refuse connections from banned peers
