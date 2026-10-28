@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,8 +22,10 @@ import (
 	"github.com/cometbft/cometbft/test/utils"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -892,4 +895,221 @@ func (s *peerDirectionSuite) TestReconnectedPeerIsOutbound() {
 
 	outbound, inbound, _ := sw.NumPeers()
 	s.Equal([2]int{1, 0}, [2]int{outbound, inbound})
+}
+
+type peerRemovalSuite struct {
+	suite.Suite
+}
+
+func TestPeerRemovalSuite(t *testing.T) {
+	suite.Run(t, new(peerRemovalSuite))
+}
+
+func (s *peerRemovalSuite) newSwitch() (*Switch, *Host, *reactorMock) {
+	hosts := makeTestHosts(s.T(), 2)
+
+	reactor := newReactorMock([]*conn.ChannelDescriptor{{
+		ID:                  0xF5,
+		Priority:            1,
+		RecvMessageCapacity: 1024,
+		MessageType:         &types.RequestEcho{},
+	}}, hosts[0].Logger())
+
+	sw, err := NewSwitch(nil, hosts[0], []SwitchReactor{{Name: "mock", Reactor: reactor}}, p2p.NopMetrics(), hosts[0].Logger())
+	s.Require().NoError(err)
+	sw.peerStoppingWait = 300 * time.Millisecond
+	s.Require().NoError(sw.Start())
+	s.T().Cleanup(func() { _ = sw.Stop() })
+
+	s.Require().NoError(hosts[0].Connect(context.Background(), hosts[1].AddrInfo()))
+
+	return sw, hosts[1], reactor
+}
+
+func reactorOpts(sw *Switch) PeerAddOptions {
+	return PeerAddOptions{
+		OnBeforeStart: sw.reactors.InitPeer,
+		OnAfterStart:  sw.reactors.AddPeer,
+		OnStartFailed: sw.reactors.RemovePeer,
+	}
+}
+
+func (s *peerRemovalSuite) TestIncomingStreamWaitsForRemoval() {
+	testCases := []struct {
+		name           string
+		hold           time.Duration
+		expectErr      bool
+		expectedEvents []string
+	}{
+		{
+			name:           "removal finishes within the wait",
+			hold:           100 * time.Millisecond,
+			expectedEvents: []string{"init", "add", "remove", "init", "add"},
+		},
+		{
+			name:           "removal outlasts the wait",
+			hold:           600 * time.Millisecond,
+			expectErr:      true,
+			expectedEvents: []string{"init", "add", "remove"},
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			sw, other, reactor := s.newSwitch()
+			key := peerIDToKey(other.ID())
+
+			_, err := sw.peerSet.Add(other.AddrInfo(), reactorOpts(sw))
+			s.Require().NoError(err)
+
+			entered, removed := make(chan struct{}), make(chan struct{})
+			go func() {
+				defer close(removed)
+				_ = sw.peerSet.Remove(key, PeerRemovalOptions{OnAfterStop: func(p *Peer, reason any) {
+					close(entered)
+					time.Sleep(tc.hold)
+					sw.reactors.RemovePeer(p, reason)
+				}})
+			}()
+			<-entered
+
+			start := time.Now()
+			_, err = sw.resolvePeer(other.ID(), other.Addrs()[0])
+			elapsed := time.Since(start)
+			<-removed
+
+			s.Equal(tc.expectedEvents, reactor.peerEvents())
+
+			if tc.expectErr {
+				s.Error(err)
+				s.GreaterOrEqual(elapsed, sw.peerStoppingWait)
+				s.Less(elapsed, tc.hold)
+				return
+			}
+
+			s.Require().NoError(err)
+			s.GreaterOrEqual(elapsed, tc.hold/2)
+			s.Less(elapsed, sw.peerStoppingWait)
+			s.NotNil(sw.Peers().Get(key))
+		})
+	}
+}
+
+func (s *peerRemovalSuite) TestStopPeerForErrorWhileStarting() {
+	testCases := []struct {
+		name            string
+		persistent      bool
+		expectReconnect bool
+	}{
+		{name: "persistent peer is reconnected", persistent: true, expectReconnect: true},
+		{name: "other peer is removed", expectReconnect: false},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			sw, other, reactor := s.newSwitch()
+			key := peerIDToKey(other.ID())
+
+			opts := reactorOpts(sw)
+			opts.Persistent = tc.persistent
+			opts.OnBeforeStart = func(p *Peer) {
+				sw.reactors.InitPeer(p)
+				sw.StopPeerForError(p, errors.New("misbehaved"))
+				s.NotEqual(network.Connected, sw.host.Network().Connectedness(other.ID()))
+			}
+
+			_, err := sw.peerSet.Add(other.AddrInfo(), opts)
+			s.Require().ErrorIs(err, errPeerRemovedDuringStart)
+			s.Equal([]string{"init", "add", "remove"}, reactor.peerEvents()[:3])
+
+			if !tc.expectReconnect {
+				s.Never(func() bool { return sw.Peers().Get(key) != nil }, 300*time.Millisecond, 50*time.Millisecond)
+				s.Equal([]string{"init", "add", "remove"}, reactor.peerEvents())
+				return
+			}
+
+			s.Eventually(func() bool { return sw.Peers().Get(key) != nil }, 5*time.Second, 20*time.Millisecond)
+			s.True(sw.Peers().Get(key).IsOutbound())
+			s.Equal([]string{"init", "add", "remove", "init", "add"}, reactor.peerEvents())
+		})
+	}
+}
+
+func (s *peerRemovalSuite) TestStopPeerForErrorClosesConnection() {
+	sw, other, reactor := s.newSwitch()
+
+	p, err := sw.peerSet.Add(other.AddrInfo(), reactorOpts(sw))
+	s.Require().NoError(err)
+
+	sw.StopPeerForError(p, errors.New("misbehaved"))
+
+	s.Nil(sw.Peers().Get(p.ID()))
+	s.NotEqual(network.Connected, sw.host.Network().Connectedness(other.ID()))
+	s.Equal([]string{"init", "add", "remove"}, reactor.peerEvents())
+}
+
+func (s *peerRemovalSuite) TestDialPathsLeaveReconnectToRemoval() {
+	testCases := []struct {
+		name         string
+		dial         func(sw *Switch, addrInfo peer.AddrInfo, opts PeerAddOptions) error
+		savesDNSAddr bool
+	}{
+		{
+			name: "bootstrap",
+			dial: func(sw *Switch, addrInfo peer.AddrInfo, opts PeerAddOptions) error {
+				return sw.bootstrapPeer(context.Background(), addrInfo, opts)
+			},
+			savesDNSAddr: true,
+		},
+		{
+			name: "reconnect",
+			dial: func(sw *Switch, addrInfo peer.AddrInfo, opts PeerAddOptions) error {
+				sw.reconnectPeer(addrInfo, time.Second, opts)
+				return nil
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			sw, other, reactor := s.newSwitch()
+			key := peerIDToKey(other.ID())
+
+			var removals atomic.Int32
+			opts := reactorOpts(sw)
+			opts.OnBeforeStart = func(p *Peer) {
+				sw.reactors.InitPeer(p)
+				if removals.Add(1) == 1 {
+					sw.StopPeerForError(p, &p2p.ErrorTransient{Err: errors.New("flaky")})
+				}
+			}
+
+			addrInfo := other.AddrInfo()
+			_, port, err := manet.DialArgs(addrInfo.Addrs[0])
+			s.Require().NoError(err)
+			dnsAddr := ma.StringCast("/dns4/localhost/udp/" + port[strings.LastIndex(port, ":")+1:] + "/quic-v1")
+			addrInfo.Addrs = append(addrInfo.Addrs, dnsAddr)
+
+			done := make(chan error, 1)
+			go func() { done <- tc.dial(sw, addrInfo, opts) }()
+
+			select {
+			case err := <-done:
+				s.NoError(err)
+			case <-time.After(500 * time.Millisecond):
+				s.FailNow("dial path kept retrying after the removal took over")
+			}
+
+			for _, ttl := range []time.Duration{peerstore.TempAddrTTL, peerstore.RecentlyConnectedAddrTTL, peerstore.ConnectedAddrTTL} {
+				sw.host.Peerstore().UpdateAddrs(other.ID(), ttl, 0)
+			}
+			if tc.savesDNSAddr {
+				s.True(slices.ContainsFunc(sw.host.Peerstore().Addrs(other.ID()), dnsAddr.Equal))
+			}
+
+			s.Eventually(func() bool { return sw.Peers().Get(key) != nil }, 5*time.Second, 20*time.Millisecond)
+			s.Equal(int32(1), removals.Load())
+			s.Equal([]string{"init", "add", "remove", "init", "add"}, reactor.peerEvents())
+		})
+	}
 }

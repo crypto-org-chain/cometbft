@@ -8,6 +8,8 @@
 
 ### BUG FIXES
 
+- `[lp2p]` finish peer removal before freeing the peer slot
+  ([\#78](https://github.com/crypto-org-chain/cometbft/pull/78))
 - `[lp2p]` report real peer direction and count each peer once
   ([\#76](https://github.com/crypto-org-chain/cometbft/pull/76))
 - `[rpc]` reject out-of-range `/genesis_chunked` indices that wrap to a negative int instead of panicking

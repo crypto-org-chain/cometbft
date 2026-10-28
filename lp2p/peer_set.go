@@ -17,7 +17,7 @@ import (
 type PeerSet struct {
 	host *Host
 
-	peers map[peer.ID]*Peer
+	peers map[peer.ID]*peerEntry
 	mu    sync.RWMutex
 
 	metrics *p2p.Metrics
@@ -29,13 +29,29 @@ var _ p2p.IPeerSet = (*PeerSet)(nil)
 var (
 	ErrPeerExists = errors.New("peer already exists")
 	ErrSelfPeer   = errors.New("peer is self")
+
+	errPeerStarting           = errors.New("peer is starting; removal deferred")
+	errPeerRemovedDuringStart = errors.New("peer was removed while starting")
 )
+
+type peerEntry struct {
+	peer     *Peer
+	starting bool
+	removal  *PeerRemovalOptions
+	done     chan struct{}
+}
+
+type peerStoppingError struct {
+	done <-chan struct{}
+}
+
+func (peerStoppingError) Error() string { return "peer is being removed" }
 
 // NewPeerSet manager peers for a given switch
 func NewPeerSet(host *Host, metrics *p2p.Metrics, logger log.Logger) *PeerSet {
 	return &PeerSet{
 		host:    host,
-		peers:   make(map[peer.ID]*Peer),
+		peers:   make(map[peer.ID]*peerEntry),
 		metrics: metrics,
 		logger:  logger,
 	}
@@ -66,6 +82,7 @@ type PeerAddOptions struct {
 	Outbound      bool
 	OnBeforeStart func(p *Peer)
 	OnAfterStart  func(p *Peer)
+	// OnStartFailed runs if the peer fails to start or a start callback panics (the panic is then re-raised).
 	OnStartFailed func(p *Peer, reason any)
 }
 
@@ -73,6 +90,8 @@ type PeerAddOptions struct {
 // - peer is already present
 // - peer is self
 // - peer has no addresses
+// - peer is still being removed (retry after the removal completes)
+// - peer was removed while Add was running its callbacks
 func (ps *PeerSet) Add(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, error) {
 	id := addrInfo.ID
 
@@ -92,19 +111,27 @@ func (ps *PeerSet) Add(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, erro
 
 	p.outbound.Store(opts.Outbound)
 
-	if !ps.set(id, p) {
-		return nil, ErrPeerExists
+	e := &peerEntry{peer: p, starting: true, done: make(chan struct{})}
+	if err := ps.insert(id, e); err != nil {
+		return nil, err
 	}
+
+	var (
+		settled bool
+		failure any
+	)
+	defer func() {
+		if !settled {
+			ps.abortStart(id, e, opts.OnStartFailed, failure, recover())
+		}
+	}()
 
 	if opts.OnBeforeStart != nil {
 		opts.OnBeforeStart(p)
 	}
 
 	if err := p.Start(); err != nil {
-		ps.unset(id)
-		if opts.OnStartFailed != nil {
-			opts.OnStartFailed(p, err)
-		}
+		failure = err
 		return nil, errors.Wrap(err, "unable to start peer")
 	}
 
@@ -112,19 +139,33 @@ func (ps *PeerSet) Add(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, erro
 		opts.OnAfterStart(p)
 	}
 
+	ps.mu.Lock()
+	e.starting = false
+	removal := e.removal
 	ps.metrics.Peers.Add(1)
+	ps.mu.Unlock()
+
+	settled = true
+
+	if removal != nil {
+		ps.finishRemoval(id, e, *removal)
+		return nil, errPeerRemovedDuringStart
+	}
 
 	return p, nil
 }
 
 // PeerRemovalOptions options for removing a peer from the PeerSet.
-// If OnAfterStop is provided, it will be called after the peer is stopped.
+// If OnAfterStop is provided, it is called after the peer is stopped and before its slot is freed.
 // Note that Reason is any due to backwards compatibility.
 type PeerRemovalOptions struct {
 	Reason      any
 	OnAfterStop func(p *Peer, reason any)
 }
 
+// Remove stops the peer and runs opts.OnAfterStop before the peer's slot is freed, so the peer cannot be
+// re-added until removal completes. If the peer is still being added, the removal is deferred and performed
+// by Add once its callbacks finish (or dropped if the peer fails to start), and an error is returned.
 func (ps *PeerSet) Remove(key p2p.ID, opts PeerRemovalOptions) error {
 	id := ps.keyToPeerID(key)
 	if id == "" {
@@ -137,20 +178,22 @@ func (ps *PeerSet) Remove(key p2p.ID, opts PeerRemovalOptions) error {
 
 	ps.logger.Info("Removing peer", "peer_id", id.String(), "reason", opts.Reason)
 
-	p, ok := ps.unset(id)
-	if !ok {
+	ps.mu.Lock()
+	e, ok := ps.peers[id]
+	if !ok || e.removal != nil {
+		ps.mu.Unlock()
 		return errors.New("peer not found")
 	}
 
-	if err := p.Stop(); err != nil {
-		return errors.Wrap(err, "failed to stop peer")
+	e.removal = &opts
+	starting := e.starting
+	ps.mu.Unlock()
+
+	if starting {
+		return errPeerStarting
 	}
 
-	if opts.OnAfterStop != nil {
-		opts.OnAfterStop(p, opts.Reason)
-	}
-
-	ps.metrics.Peers.Add(-1)
+	ps.finishRemoval(id, e, opts)
 
 	return nil
 }
@@ -160,9 +203,50 @@ func (ps *PeerSet) RemoveAll(opts PeerRemovalOptions) {
 
 	for _, peer := range peers {
 		id := peer.ID()
-		if err := ps.Remove(id, opts); err != nil {
+		if err := ps.Remove(id, opts); err != nil && !errors.Is(err, errPeerStarting) {
 			ps.logger.Error("Failed to remove peer", "peer_id", id, "err", err)
 		}
+	}
+}
+
+func (ps *PeerSet) abortStart(id peer.ID, e *peerEntry, onFailed func(*Peer, any), failure, recovered any) {
+	defer ps.release(id, e)
+
+	ps.mu.Lock()
+	if e.removal != nil {
+		ps.logger.Debug("Dropping removal of a peer that failed to start", "peer_id", id.String())
+	}
+	e.removal = &PeerRemovalOptions{}
+	ps.mu.Unlock()
+
+	if recovered != nil {
+		failure = recovered
+	}
+
+	if e.peer.IsRunning() {
+		if err := e.peer.Stop(); err != nil {
+			ps.logger.Error("Failed to stop peer", "peer_id", id.String(), "err", err)
+		}
+	}
+
+	if onFailed != nil {
+		onFailed(e.peer, failure)
+	}
+
+	if recovered != nil {
+		panic(recovered)
+	}
+}
+
+func (ps *PeerSet) finishRemoval(id peer.ID, e *peerEntry, opts PeerRemovalOptions) {
+	defer ps.release(id, e)
+
+	if err := e.peer.Stop(); err != nil {
+		ps.logger.Error("Failed to stop peer", "peer_id", id.String(), "err", err)
+	}
+
+	if opts.OnAfterStop != nil {
+		opts.OnAfterStop(e.peer, opts.Reason)
 	}
 }
 
@@ -170,8 +254,10 @@ func (ps *PeerSet) ForEach(fn func(p2p.Peer)) {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 
-	for _, p := range ps.peers {
-		fn(p)
+	for _, e := range ps.peers {
+		if e.removal == nil {
+			fn(e.peer)
+		}
 	}
 }
 
@@ -198,8 +284,10 @@ func (ps *PeerSet) Copy() []p2p.Peer {
 	defer ps.mu.RUnlock()
 
 	results := make([]p2p.Peer, 0, len(ps.peers))
-	for _, p := range ps.peers {
-		results = append(results, p)
+	for _, e := range ps.peers {
+		if e.removal == nil {
+			results = append(results, e.peer)
+		}
 	}
 
 	sort.Slice(results, func(i, j int) bool {
@@ -214,7 +302,14 @@ func (ps *PeerSet) Size() int {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 
-	return len(ps.peers)
+	size := 0
+	for _, e := range ps.peers {
+		if e.removal == nil {
+			size++
+		}
+	}
+
+	return size
 }
 
 func (ps *PeerSet) getByKey(key p2p.ID) (*Peer, bool) {
@@ -226,46 +321,43 @@ func (ps *PeerSet) getByKey(key p2p.ID) (*Peer, bool) {
 	ps.mu.RLock()
 	defer ps.mu.RUnlock()
 
-	p, ok := ps.peers[id]
-	if !ok {
+	e, ok := ps.peers[id]
+	if !ok || e.removal != nil {
 		return nil, false
 	}
 
-	return p, true
+	return e.peer, true
 }
 
-// set adds a peer to the peer set and returns true if it was added
-func (ps *PeerSet) set(id peer.ID, p *Peer) bool {
+func (ps *PeerSet) insert(id peer.ID, e *peerEntry) error {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	if existing, ok := ps.peers[id]; ok {
-		if p.IsOutbound() {
-			existing.outbound.Store(true)
-		}
-
-		return false
+	existing, ok := ps.peers[id]
+	switch {
+	case !ok:
+		ps.peers[id] = e
+		return nil
+	case existing.removal != nil:
+		return peerStoppingError{done: existing.done}
 	}
 
-	ps.peers[id] = p
+	if e.peer.IsOutbound() {
+		existing.peer.outbound.Store(true)
+	}
 
-	return true
+	return ErrPeerExists
 }
 
-// unset removes a peer from the peer set and returns it
-// returns nil if peer is not found
-func (ps *PeerSet) unset(id peer.ID) (*Peer, bool) {
+func (ps *PeerSet) release(id peer.ID, e *peerEntry) {
 	ps.mu.Lock()
-	defer ps.mu.Unlock()
-
-	p, ok := ps.peers[id]
-	if !ok {
-		return nil, false
-	}
-
 	delete(ps.peers, id)
+	if !e.starting {
+		ps.metrics.Peers.Add(-1)
+	}
+	ps.mu.Unlock()
 
-	return p, true
+	close(e.done)
 }
 
 func (ps *PeerSet) keyToPeerID(key p2p.ID) peer.ID {
