@@ -8,6 +8,8 @@
 
 ### BUG FIXES
 
+- `[lp2p]` run one reconnect loop per peer
+  ([\#80](https://github.com/crypto-org-chain/cometbft/pull/80))
 - `[lp2p]` remove peers when their connection closes
   ([\#79](https://github.com/crypto-org-chain/cometbft/pull/79))
 - `[lp2p]` finish peer removal before freeing the peer slot

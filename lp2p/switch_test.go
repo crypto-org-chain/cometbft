@@ -887,7 +887,7 @@ func (s *peerDirectionSuite) TestReconnectedPeerIsOutbound() {
 	s.Require().NoError(sw.Start())
 	s.T().Cleanup(func() { _ = sw.Stop() })
 
-	sw.reconnectPeer(hosts[1].AddrInfo(), time.Second, PeerAddOptions{})
+	sw.reconnectPeer(hosts[1].AddrInfo(), time.Second, PeerAddOptions{}, nil)
 
 	p := sw.Peers().Get(peerIDToKey(hosts[1].ID()))
 	s.Require().NotNil(p)
@@ -1064,7 +1064,7 @@ func (s *peerRemovalSuite) TestDialPathsLeaveReconnectToRemoval() {
 		{
 			name: "reconnect",
 			dial: func(sw *Switch, addrInfo peer.AddrInfo, opts PeerAddOptions) error {
-				sw.reconnectPeer(addrInfo, time.Second, opts)
+				sw.reconnectPeer(addrInfo, time.Second, opts, nil)
 				return nil
 			},
 		},
