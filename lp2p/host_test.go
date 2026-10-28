@@ -21,6 +21,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	libp2pconnmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
@@ -518,6 +519,31 @@ func TestConnGaterInboundPeers(t *testing.T) {
 			cg := &ConnGater{bootstrapPeers: map[peer.ID]BootstrapPeer{ids[2]: {}}}
 
 			require.Equal(t, tc.expected, cg.inboundPeers(tc.conns))
+		})
+	}
+}
+
+func TestHostConnManagerWatermarks(t *testing.T) {
+	outbound := config.DefaultP2PConfig().MaxNumOutboundPeers
+
+	for _, tc := range []struct {
+		name       string
+		pex        bool
+		maxInbound int
+		low, high  int
+	}{
+		{name: "libp2p defaults without peer exchange", maxInbound: 300, low: 160, high: 192},
+		{name: "libp2p defaults cover small peer limits", pex: true, maxInbound: 40, low: 160, high: 192},
+		{name: "low watermark covers every admitted peer", pex: true, maxInbound: 300, low: 300 + outbound, high: 332 + outbound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := makeTestHost(t, utils.GetFreePorts(t, 1)[0], withMaxInboundPeers(tc.maxInbound), withModifiedConfig(func(cfg *config.LibP2PConfig) {
+				cfg.PEX.Enabled = tc.pex
+			}))
+
+			info := h.ConnManager().(*libp2pconnmgr.BasicConnMgr).GetInfo()
+			require.Equal(t, tc.low, info.LowWater)
+			require.Equal(t, tc.high, info.HighWater)
 		})
 	}
 }

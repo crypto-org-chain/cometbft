@@ -18,6 +18,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
+	libp2pconnmgr "github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	quic "github.com/libp2p/go-libp2p/p2p/transport/quic"
 	multiaddr "github.com/multiformats/go-multiaddr"
@@ -123,6 +124,15 @@ func NewHost(config *config.P2PConfig, nodeKey cmcrypto.PrivKey, logger log.Logg
 		opts = append(opts, withAddressFactory(externalAddr))
 	}
 
+	if config.LibP2PPEXEnabled() {
+		connMgr, err := pexConnManager(config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create connection manager: %w", err)
+		}
+
+		opts = append(opts, libp2p.ConnectionManager(connMgr))
+	}
+
 	host, err := libp2p.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create libp2p host: %w", err)
@@ -213,6 +223,20 @@ func BootstrapPeersFromConfig(config config.LibP2PConfig) (map[peer.ID]Bootstrap
 	}
 
 	return peers, nil
+}
+
+// Floor and slack match libp2p's default watermarks (160, 192).
+const (
+	connMgrMinLowWater = 160
+	connMgrSlack       = 32
+)
+
+// The connection manager trims unprotected peers down to low. Bootstrap peers
+// are protected, so low only needs to cover the inbound cap and outbound target.
+func pexConnManager(cfg *config.P2PConfig) (*libp2pconnmgr.BasicConnMgr, error) {
+	low := max(connMgrMinLowWater, cfg.MaxNumInboundPeers+cfg.MaxNumOutboundPeers)
+
+	return libp2pconnmgr.NewConnManager(low, low+connMgrSlack)
 }
 
 // PEXPeerStreams bounds PEX streams per peer and direction unless limits are
