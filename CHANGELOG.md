@@ -42,6 +42,8 @@
 
 ### FEATURES
 
+- `[lp2p]` add address book for peer exchange
+  ([\#83](https://github.com/crypto-org-chain/cometbft/pull/83))
 - `[lp2p]` add config for peer exchange and private peers
   ([\#81](https://github.com/crypto-org-chain/cometbft/pull/81))
 
