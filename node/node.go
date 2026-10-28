@@ -567,7 +567,7 @@ func NewNodeWithContext(
 		}
 
 		if config.P2P.LibP2PPEXEnabled() {
-			pexReactor, _, err := createLibP2PPEXReactor(config.P2P, host, logger)
+			pexReactor, _, err := createLibP2PPEXReactor(config.P2P, host, p2pMetrics, logger)
 			if err != nil {
 				_ = host.Close()
 				return nil, fmt.Errorf("unable to create libp2p pex reactor: %w", err)

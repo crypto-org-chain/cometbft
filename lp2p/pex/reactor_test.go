@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/cometbft/cometbft/p2p/mock"
 	tmp2p "github.com/cometbft/cometbft/proto/tendermint/p2p"
 	"github.com/cosmos/gogoproto/proto"
+	"github.com/go-kit/kit/metrics"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -41,6 +43,7 @@ type reactorSuite struct {
 	book    *AddrBook
 	sw      *fakeSwitch
 	reactor *Reactor
+	metrics *metricRecorder
 }
 
 func TestReactorSuite(t *testing.T) {
@@ -62,7 +65,8 @@ func (s *reactorSuite) SetupTest() {
 
 	s.sw = &fakeSwitch{peers: p2p.NewPeerSet()}
 	s.net = &fakeNetwork{Network: h.Network(), conns: map[peer.ID][]network.Conn{}}
-	s.reactor = NewReactor(s.book, &fakeHost{Host: h, net: s.net}, 10)
+	s.metrics = newMetricRecorder()
+	s.reactor = NewReactor(s.book, &fakeHost{Host: h, net: s.net}, 10, s.metrics.p2pMetrics())
 	s.reactor.now = func() time.Time { return s.clock }
 	s.reactor.SetLogger(log.NewNopLogger())
 	s.reactor.SetSwitch(s.sw)
@@ -70,6 +74,18 @@ func (s *reactorSuite) SetupTest() {
 
 func (s *reactorSuite) SetupSubTest() {
 	s.SetupTest()
+}
+
+func (s *reactorSuite) reloaded() (*Reactor, *AddrBook) {
+	loaded := NewAddrBook(s.book.path, s.book.cfg)
+	loaded.now = s.book.now
+	r := NewReactor(loaded, &fakeHost{Host: s.host, net: s.net}, 10, s.metrics.p2pMetrics())
+	r.now = s.reactor.now
+	r.SetLogger(log.NewNopLogger())
+	r.SetSwitch(s.sw)
+	s.T().Cleanup(func() { _ = r.Stop() })
+
+	return r, loaded
 }
 
 func (s *reactorSuite) newPeer(outbound, supportsPEX bool) *fakePeer {
@@ -123,6 +139,7 @@ func (s *reactorSuite) TestFilterRateLimitsEveryMessage() {
 
 			other := s.newPeer(false, true)
 			s.NoError(s.reactor.FilterMsgBytes(Channel, other, tc.payload))
+			s.Equal(3.0, s.metrics.value("dropped", "reason", dropRateLimited))
 		})
 	}
 }
@@ -289,6 +306,8 @@ func (s *reactorSuite) TestReceiveAddrs() {
 			}
 			s.Equal(tc.punished, s.book.IsBanned(src.id))
 			s.Equal(tc.punished, s.sw.stopped(src))
+			s.Equal(boolValue(tc.punished), s.metrics.value("bans"))
+			s.Equal(boolValue(!tc.requested), s.metrics.value("dropped", "reason", dropUnsolicited))
 			s.False(s.reactor.hasRequest(src.ID()))
 			if tc.punished {
 				s.clock = s.clock.Add(24*time.Hour - time.Second)
@@ -577,18 +596,88 @@ func (s *reactorSuite) TestVerifyInboundAddrs() {
 	}
 }
 
+func (s *reactorSuite) TestReportsBookSize() {
+	bookSize := func(source Source) float64 { return s.metrics.value("book", "source", string(source)) }
+	s.Require().NoError(s.book.AddGossiped(s.id(), addr("8.8.8.8", 1), s.id()))
+	s.Require().NoError(s.book.AddGossiped(s.id(), addr("8.8.4.4", 1), s.id()))
+	s.Require().NoError(s.book.AddVerified(s.id(), addr("9.9.9.9", 1), SourceDialed))
+	s.Require().NoError(s.book.Save())
+
+	r, loaded := s.reloaded()
+	r.dialEvery = 10 * time.Millisecond
+	s.Require().NoError(r.Start())
+
+	s.Equal(2.0, bookSize(SourceGossip))
+	s.Equal(1.0, bookSize(SourceDialed))
+	s.Equal(0.0, bookSize(SourceInbound))
+
+	inbound := s.id()
+	s.Require().NoError(loaded.AddVerified(inbound, addr("1.1.1.1", 1), SourceInbound))
+	s.Eventually(func() bool { return bookSize(SourceInbound) == 1 }, time.Second, 5*time.Millisecond)
+
+	loaded.Ban(inbound, s.clock.Add(time.Hour))
+	s.Eventually(func() bool { return bookSize(SourceInbound) == 0 }, time.Second, 5*time.Millisecond)
+	s.Equal(2.0, bookSize(SourceGossip))
+}
+
+var prometheusMetrics = sync.OnceValue(func() *p2p.Metrics { return p2p.PrometheusMetrics("pex_test") })
+
+func (s *reactorSuite) TestPrometheusLabels() {
+	s.reactor.metrics = prometheusMetrics()
+	src := s.newPeer(true, true)
+	id := s.id()
+	s.Require().NoError(s.book.AddGossiped(id, addr("8.8.8.8", 1), s.id()))
+	e, _ := s.book.Get(id)
+
+	s.NotPanics(func() {
+		s.reactor.reportBookSize()
+		s.reactor.recordDial(e, errors.New("connection refused"))
+		s.reactor.Receive(p2p.Envelope{Src: src, ChannelID: Channel, Message: &tmp2p.PexAddrs{}})
+		for range msgBurst + 1 {
+			_ = s.reactor.FilterMsgBytes(Channel, src, nil)
+		}
+		s.reactor.punish(src, src.id, errMalformed)
+	})
+}
+
+func (s *reactorSuite) TestPunishCountsNewBans() {
+	testCases := []struct {
+		name      string
+		bootstrap bool
+		punished  int
+		bans      float64
+	}{
+		{name: "bans the peer", punished: 1, bans: 1},
+		{name: "counts a repeated ban once", punished: 2, bans: 1},
+		{name: "never bans a bootstrap peer", bootstrap: true, punished: 1},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			src := s.newPeer(true, true)
+			if tc.bootstrap {
+				s.book.cfg.Bootstrap[src.id] = struct{}{}
+			}
+
+			for range tc.punished {
+				s.reactor.punish(src, src.id, errMalformed)
+			}
+
+			s.True(s.sw.stopped(src))
+			s.Equal(!tc.bootstrap, s.book.IsBanned(src.id))
+			s.Equal(tc.bans, s.metrics.value("bans"))
+		})
+	}
+}
+
 func (s *reactorSuite) TestStartLoadsAndStopSaves() {
 	id := s.id()
 	s.Require().NoError(s.book.AddVerified(id, addr("8.8.8.8", 1), SourceInbound))
 	s.Require().NoError(s.reactor.Start())
 	s.Require().NoError(s.reactor.Stop())
 
-	loaded := NewAddrBook(s.book.path, s.book.cfg)
-	restarted := NewReactor(loaded, s.host, 10)
-	restarted.SetLogger(log.NewNopLogger())
-	restarted.SetSwitch(s.sw)
+	restarted, loaded := s.reloaded()
 	s.Require().NoError(restarted.Start())
-	s.T().Cleanup(func() { _ = restarted.Stop() })
 
 	_, ok := loaded.Get(id)
 	s.True(ok)
@@ -601,19 +690,14 @@ func (s *reactorSuite) TestStartDisconnectsBannedPeers() {
 	s.net.conns[banned] = []network.Conn{&fakeConn{}}
 	s.net.conns[other] = []network.Conn{&fakeConn{}}
 
-	loaded := NewAddrBook(s.book.path, s.book.cfg)
-	loaded.now = s.book.now
-	r := NewReactor(loaded, &fakeHost{Host: s.host, net: s.net}, 10)
-	r.SetLogger(log.NewNopLogger())
-	r.SetSwitch(s.sw)
+	r, _ := s.reloaded()
 	s.Require().NoError(r.Start())
-	s.T().Cleanup(func() { _ = r.Stop() })
 
 	s.Equal([]peer.ID{banned}, s.net.closed)
 }
 
 func (s *reactorSuite) TestStartNeedsADialingSwitch() {
-	r := NewReactor(s.book, s.host, 10)
+	r := NewReactor(s.book, s.host, 10, p2p.NopMetrics())
 	r.SetLogger(log.NewNopLogger())
 	r.SetSwitch(struct{ p2p.Switcher }{})
 
@@ -742,27 +826,28 @@ func (s *reactorSuite) TestRecordDial() {
 		dialed      bool
 		cooldown    bool
 		attempts    int
+		result      string
 	}{
-		{name: "success at the dialed address", connectedAt: dialed, kept: true, dialed: true},
-		{name: "success at another address", connectedAt: addr("9.9.9.9", 1), kept: true},
-		{name: "peer ID mismatch", err: fmt.Errorf("dial: %w", sec.ErrPeerIDMismatch{})},
+		{name: "success at the dialed address", result: dialSuccess, connectedAt: dialed, kept: true, dialed: true},
+		{name: "success at another address", result: dialConnectedElsewhere, connectedAt: addr("9.9.9.9", 1), kept: true},
+		{name: "peer ID mismatch", result: dialPeerIDMismatch, err: fmt.Errorf("dial: %w", sec.ErrPeerIDMismatch{})},
 		{
-			name: "peer ID mismatch at the dialed address",
-			err:  &swarm.DialError{DialErrors: []swarm.TransportError{{Address: dialed, Cause: sec.ErrPeerIDMismatch{}}}},
+			name: "peer ID mismatch at the dialed address", result: dialPeerIDMismatch,
+			err: &swarm.DialError{DialErrors: []swarm.TransportError{{Address: dialed, Cause: sec.ErrPeerIDMismatch{}}}},
 		},
 		{
-			name:     "peer ID mismatch at another known address",
+			name: "peer ID mismatch at another known address", result: dialFailed,
 			err:      &swarm.DialError{DialErrors: []swarm.TransportError{{Address: addr("9.9.9.9", 1), Cause: sec.ErrPeerIDMismatch{}}}},
 			kept:     true,
 			attempts: 1,
 		},
-		{name: "peer ID mismatch after the address changed", err: sec.ErrPeerIDMismatch{}, moved: true, kept: true},
-		{name: "busy peer", err: lp2p.ErrDialBusy, kept: true, cooldown: true},
-		{name: "already connected peer", err: lp2p.ErrPeerConnected, kept: true, cooldown: true},
-		{name: "gater", err: swarm.ErrGaterDisallowedConnection, kept: true, cooldown: true},
-		{name: "dial backoff", err: swarm.ErrDialBackoff, kept: true, cooldown: true},
+		{name: "peer ID mismatch after the address changed", result: dialPeerIDMismatch, err: sec.ErrPeerIDMismatch{}, moved: true, kept: true},
+		{name: "busy peer", result: dialBusy, err: lp2p.ErrDialBusy, kept: true, cooldown: true},
+		{name: "already connected peer", result: dialBusy, err: lp2p.ErrPeerConnected, kept: true, cooldown: true},
+		{name: "gater", result: dialBusy, err: swarm.ErrGaterDisallowedConnection, kept: true, cooldown: true},
+		{name: "dial backoff", result: dialBusy, err: swarm.ErrDialBackoff, kept: true, cooldown: true},
 		{
-			name: "dial backoff only at another known address",
+			name: "dial backoff only at another known address", result: dialFailed,
 			err: &swarm.DialError{DialErrors: []swarm.TransportError{
 				{Address: addr("9.9.9.9", 1), Cause: swarm.ErrDialBackoff},
 				{Address: dialed, Cause: context.DeadlineExceeded},
@@ -771,16 +856,16 @@ func (s *reactorSuite) TestRecordDial() {
 			attempts: 1,
 		},
 		{
-			name:     "gater refusal of the peer",
+			name: "gater refusal of the peer", result: dialBusy,
 			err:      &swarm.DialError{Cause: swarm.ErrGaterDisallowedConnection},
 			kept:     true,
 			cooldown: true,
 		},
-		{name: "resource limit", err: network.ErrResourceLimitExceeded, kept: true, cooldown: true},
-		{name: "inactive switch", err: lp2p.ErrSwitchInactive, kept: true},
-		{name: "our own shutdown", err: context.Canceled, kept: true},
-		{name: "timeout", err: context.DeadlineExceeded, kept: true, attempts: 1},
-		{name: "remote failure", err: errors.New("connection refused"), kept: true, attempts: 1},
+		{name: "resource limit", result: dialBusy, err: network.ErrResourceLimitExceeded, kept: true, cooldown: true},
+		{name: "inactive switch", result: dialInterrupted, err: lp2p.ErrSwitchInactive, kept: true},
+		{name: "our own shutdown", result: dialInterrupted, err: context.Canceled, kept: true},
+		{name: "timeout", result: dialFailed, err: context.DeadlineExceeded, kept: true, attempts: 1},
+		{name: "remote failure", result: dialFailed, err: errors.New("connection refused"), kept: true, attempts: 1},
 	}
 
 	for _, tc := range testCases {
@@ -796,6 +881,7 @@ func (s *reactorSuite) TestRecordDial() {
 			}
 
 			s.reactor.recordDial(e, tc.err)
+			s.Equal(1.0, s.metrics.value("dials", "result", tc.result))
 
 			got, ok := s.book.Get(id)
 			s.Require().Equal(tc.kept, ok)
@@ -1057,3 +1143,69 @@ func (c *fakeConn) Stat() network.ConnStats {
 }
 
 func (c *fakeConn) RemoteMultiaddr() ma.Multiaddr { return c.remote }
+
+type metricRecorder struct {
+	mu     sync.Mutex
+	values map[string]float64
+}
+
+func newMetricRecorder() *metricRecorder {
+	return &metricRecorder{values: make(map[string]float64)}
+}
+
+func (r *metricRecorder) p2pMetrics() *p2p.Metrics {
+	m := p2p.NopMetrics()
+	m.PexAddrBookSize = recordedGauge{&recordedMetric{rec: r, key: "book"}}
+	m.PexDials = recordedCounter{&recordedMetric{rec: r, key: "dials"}}
+	m.PexMessagesDropped = recordedCounter{&recordedMetric{rec: r, key: "dropped"}}
+	m.PexBans = recordedCounter{&recordedMetric{rec: r, key: "bans"}}
+
+	return m
+}
+
+func (r *metricRecorder) value(name string, labelValues ...string) float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.values[strings.Join(append([]string{name}, labelValues...), ",")]
+}
+
+type recordedMetric struct {
+	rec *metricRecorder
+	key string
+}
+
+func (m *recordedMetric) with(labelValues ...string) *recordedMetric {
+	return &recordedMetric{rec: m.rec, key: strings.Join(append([]string{m.key}, labelValues...), ",")}
+}
+
+func (m *recordedMetric) update(f func(float64) float64) {
+	m.rec.mu.Lock()
+	defer m.rec.mu.Unlock()
+
+	m.rec.values[m.key] = f(m.rec.values[m.key])
+}
+
+func (m *recordedMetric) Add(delta float64) { m.update(func(v float64) float64 { return v + delta }) }
+
+type recordedCounter struct{ *recordedMetric }
+
+func (c recordedCounter) With(labelValues ...string) metrics.Counter {
+	return recordedCounter{c.with(labelValues...)}
+}
+
+type recordedGauge struct{ *recordedMetric }
+
+func (g recordedGauge) With(labelValues ...string) metrics.Gauge {
+	return recordedGauge{g.with(labelValues...)}
+}
+
+func (g recordedGauge) Set(value float64) { g.update(func(float64) float64 { return value }) }
+
+func boolValue(b bool) float64 {
+	if b {
+		return 1
+	}
+
+	return 0
+}

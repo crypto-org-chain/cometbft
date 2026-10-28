@@ -282,7 +282,7 @@ func TestCreateLibP2PPEXReactor(t *testing.T) {
 			peers := p2p.NewPeerSet()
 			require.NoError(t, peers.Add(&idPeer{Peer: p2pmock.NewPeer(nil), id: p2p.ID(connected.String())}))
 
-			reactor, book, err := createLibP2PPEXReactor(config.P2P, host, log.NewNopLogger())
+			reactor, book, err := createLibP2PPEXReactor(config.P2P, host, p2p.NopMetrics(), log.NewNopLogger())
 			require.NoError(t, err)
 			if !tc.noSwitch {
 				reactor.SetSwitch(&peersSwitch{peers: peers})

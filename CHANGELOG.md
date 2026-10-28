@@ -42,6 +42,8 @@
 
 ### FEATURES
 
+- `[lp2p]` add peer exchange metrics
+  ([\#91](https://github.com/crypto-org-chain/cometbft/pull/91))
 - `[lp2p]` raise connection manager watermarks to fit peer exchange limits
   ([\#90](https://github.com/crypto-org-chain/cometbft/pull/90))
 - `[lp2p]` limit peer exchange streams in the resource manager

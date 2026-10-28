@@ -69,7 +69,7 @@ func startPEXSwitchWith(
 	bookCfg.Strict = false
 	book := NewAddrBook(filepath.Join(cfg.RootDir, "addrbook.json"), bookCfg)
 
-	reactor := NewReactor(book, host, 10)
+	reactor := NewReactor(book, host, 10, p2p.NopMetrics())
 	if malleate != nil {
 		malleate(reactor)
 	}

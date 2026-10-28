@@ -49,6 +49,20 @@ const (
 
 var errMalformed = errors.New("malformed pex message")
 
+const (
+	dialSuccess            = "success"
+	dialConnectedElsewhere = "connected_elsewhere"
+	dialPeerIDMismatch     = "peer_id_mismatch"
+	dialInterrupted        = "interrupted"
+	dialBusy               = "busy"
+	dialFailed             = "failed"
+)
+
+const (
+	dropRateLimited = "rate_limited"
+	dropUnsolicited = "unsolicited"
+)
+
 var (
 	_ p2p.MsgBytesFilter = (*Reactor)(nil)
 	_ lp2p.PeerMarker    = (*Reactor)(nil)
@@ -73,6 +87,7 @@ type Reactor struct {
 	book        *AddrBook
 	host        Host
 	dialer      dialer
+	metrics     *p2p.Metrics
 	maxOutbound int
 	now         func() time.Time
 
@@ -100,10 +115,11 @@ type peerState struct {
 }
 
 // NewReactor creates a reactor that stores what it learns in book.
-func NewReactor(book *AddrBook, host Host, maxOutbound int) *Reactor {
+func NewReactor(book *AddrBook, host Host, maxOutbound int, metrics *p2p.Metrics) *Reactor {
 	r := &Reactor{
 		book:        book,
 		host:        host,
+		metrics:     metrics,
 		maxOutbound: maxOutbound,
 		now:         time.Now,
 		askEvery:    askInterval,
@@ -134,6 +150,7 @@ func (r *Reactor) OnStart() error {
 	if err := r.book.Load(); err != nil {
 		r.Logger.Error("Failed to load address book, starting empty", "err", err)
 	}
+	r.reportBookSize()
 
 	// The host accepts connections before the bans are loaded.
 	for _, id := range r.host.Network().Peers() {
@@ -206,6 +223,7 @@ func (r *Reactor) FilterMsgBytes(_ byte, p p2p.Peer, _ []byte) error {
 		return nil
 	}
 
+	r.countDrop(dropRateLimited)
 	return lp2p.ErrDropMessage
 }
 
@@ -251,6 +269,7 @@ func (r *Reactor) respond(src p2p.Peer) {
 func (r *Reactor) receiveAddrs(src p2p.Peer, addrs []tmp2p.NetAddress) {
 	if !r.takeRequest(src.ID()) {
 		r.Logger.Debug("Dropping unsolicited PEX addresses", "peer_id", src.ID())
+		r.countDrop(dropUnsolicited)
 		return
 	}
 
@@ -285,9 +304,14 @@ func (r *Reactor) receiveAddrs(src p2p.Peer, addrs []tmp2p.NetAddress) {
 	}
 }
 
+// punish disconnects the peer and bans it. The book declines bootstrap and
+// private peers, a full ban list, and peers already banned.
 func (r *Reactor) punish(src p2p.Peer, id peer.ID, err error) {
-	r.Logger.Info("Banning peer", "peer_id", id, "duration", banDuration, "err", err)
-	r.book.Ban(id, r.now().Add(banDuration))
+	newBan := r.book.Ban(id, r.now().Add(banDuration))
+	r.Logger.Info("Disconnecting peer", "peer_id", id, "new_ban", newBan, "err", err)
+	if newBan {
+		r.metrics.PexBans.Add(1)
+	}
 	r.Switch.StopPeerForError(src, err)
 }
 
@@ -382,6 +406,7 @@ func (r *Reactor) tick() {
 		case <-ask.C:
 			r.askRandomPeer()
 		case <-dial.C:
+			r.reportBookSize()
 			r.dialPeers()
 			dial.Reset(jitter(r.dialEvery))
 		case <-save.C:
@@ -391,6 +416,17 @@ func (r *Reactor) tick() {
 		case <-r.ctx.Done():
 			return
 		}
+	}
+}
+
+func (r *Reactor) countDrop(reason string) {
+	r.metrics.PexMessagesDropped.With("reason", reason).Add(1)
+}
+
+func (r *Reactor) reportBookSize() {
+	sizes := r.book.SizeBySource()
+	for _, source := range allSources {
+		r.metrics.PexAddrBookSize.With("source", string(source)).Set(float64(sizes[source]))
 	}
 }
 
@@ -495,31 +531,40 @@ func (r *Reactor) recordDial(e Entry, err error) {
 	var mismatch sec.ErrPeerIDMismatch
 	cause := dialCause(err, e.Addr)
 
+	var result string
 	switch {
 	case err == nil && !r.connectedAt(e.ID, e.Addr):
+		result = dialConnectedElsewhere
 		r.Logger.Debug("Dialed peer is connected at another address", "peer_id", e.ID, "addr", e.Addr)
 	case err == nil:
+		result = dialSuccess
 		r.Logger.Debug("Dialed peer", "peer_id", e.ID, "addr", e.Addr)
 		if err := r.book.AddVerified(e.ID, e.Addr, SourceDialed); err != nil {
 			r.Logger.Debug("Dropping dialed address", "peer_id", e.ID, "addr", e.Addr, "err", err)
 		}
 		r.book.MarkDialed(e.ID)
 	case errors.As(cause, &mismatch):
+		result = dialPeerIDMismatch
 		r.Logger.Debug("Dropping address of another peer", "peer_id", e.ID, "addr", e.Addr)
 		r.book.RemoveAddr(e.ID, e.Addr)
 	case errors.Is(cause, lp2p.ErrSwitchInactive), errors.Is(cause, context.Canceled):
+		result = dialInterrupted
 		r.Logger.Debug("Dial interrupted", "peer_id", e.ID, "err", err)
 	case errors.Is(cause, lp2p.ErrDialBusy),
 		errors.Is(cause, lp2p.ErrPeerConnected),
 		errors.Is(cause, swarm.ErrGaterDisallowedConnection),
 		errors.Is(cause, swarm.ErrDialBackoff),
 		errors.Is(cause, network.ErrResourceLimitExceeded):
+		result = dialBusy
 		r.Logger.Debug("Peer busy or dial limited", "peer_id", e.ID, "err", err)
 		r.book.SetCooldown(e.ID, r.now().Add(busyCooldown))
 	default:
+		result = dialFailed
 		r.Logger.Debug("Failed to dial peer", "peer_id", e.ID, "addr", e.Addr, "err", err)
 		r.book.MarkAttempt(e.ID)
 	}
+
+	r.metrics.PexDials.With("result", result).Add(1)
 }
 
 // dialCause narrows a swarm dial error to what happened at addr, since it

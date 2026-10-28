@@ -889,6 +889,25 @@ func (s *addrBookSuite) TestDialBackoff() {
 	}
 }
 
+func (s *addrBookSuite) TestSizeBySource() {
+	b := s.newBook(nil)
+	s.Empty(b.SizeBySource())
+
+	upgraded, banned := s.id(), s.id()
+	s.Require().NoError(b.AddGossiped(upgraded, addr("8.8.8.8", 1), s.id()))
+	s.Require().NoError(b.AddGossiped(banned, addr("8.8.4.4", 1), s.id()))
+	s.Require().NoError(b.AddGossiped(s.id(), addr("9.9.9.9", 1), s.id()))
+	s.Require().NoError(b.AddVerified(upgraded, addr("8.8.8.8", 1), SourceDialed))
+	b.Ban(banned, s.clock.Add(time.Hour))
+
+	s.Require().NoError(b.AddVerified(s.id(), addr("1.1.1.1", 1), SourceInbound))
+	sizes := b.SizeBySource()
+	s.Equal(map[Source]int{SourceGossip: 1, SourceInbound: 1, SourceDialed: 1}, sizes)
+	for source := range sizes {
+		s.Contains(allSources[:], source)
+	}
+}
+
 func (s *addrBookSuite) TestRemoveAddr() {
 	b := s.newBook(nil)
 	id := s.id()
@@ -945,13 +964,26 @@ func (s *addrBookSuite) TestBans() {
 		name     string
 		maxBans  int
 		bans     []time.Duration
+		recorded []bool
 		expected []bool
 	}{
-		{name: "ban", maxBans: 3, bans: []time.Duration{time.Hour}, expected: []bool{true}},
-		{name: "expired ban", maxBans: 3, bans: []time.Duration{-time.Second}, expected: []bool{false}},
-		{name: "full: earliest ban gives way", maxBans: 2, bans: []time.Duration{time.Hour, 2 * time.Hour, 3 * time.Hour}, expected: []bool{false, true, true}},
-		{name: "full: shorter new ban is dropped", maxBans: 2, bans: []time.Duration{2 * time.Hour, 3 * time.Hour, time.Hour}, expected: []bool{true, true, false}},
-		{name: "no bans allowed", maxBans: 0, bans: []time.Duration{time.Hour}, expected: []bool{false}},
+		{name: "ban", maxBans: 3, bans: []time.Duration{time.Hour}, recorded: []bool{true}, expected: []bool{true}},
+		{name: "expired ban", maxBans: 3, bans: []time.Duration{-time.Second}, recorded: []bool{false}, expected: []bool{false}},
+		{
+			name:     "full: earliest ban gives way",
+			maxBans:  2,
+			bans:     []time.Duration{time.Hour, 2 * time.Hour, 3 * time.Hour},
+			recorded: []bool{true, true, true},
+			expected: []bool{false, true, true},
+		},
+		{
+			name:     "full: shorter new ban is dropped",
+			maxBans:  2,
+			bans:     []time.Duration{2 * time.Hour, 3 * time.Hour, time.Hour},
+			recorded: []bool{true, true, false},
+			expected: []bool{true, true, false},
+		},
+		{name: "no bans allowed", maxBans: 0, bans: []time.Duration{time.Hour}, recorded: []bool{false}, expected: []bool{false}},
 	}
 
 	for _, tc := range testCases {
@@ -961,7 +993,7 @@ func (s *addrBookSuite) TestBans() {
 			ids := make([]peer.ID, len(tc.bans))
 			for i, d := range tc.bans {
 				ids[i] = s.id()
-				b.Ban(ids[i], s.clock.Add(d))
+				s.Equal(tc.recorded[i], b.Ban(ids[i], s.clock.Add(d)), "ban %d", i)
 			}
 
 			for i, id := range ids {
@@ -969,6 +1001,18 @@ func (s *addrBookSuite) TestBans() {
 			}
 		})
 	}
+}
+
+func (s *addrBookSuite) TestBanAfterExpiryIsNew() {
+	b := s.newBook(nil)
+	id := s.id()
+	s.True(b.Ban(id, s.clock.Add(time.Hour)))
+	s.False(b.Ban(id, s.clock.Add(2*time.Hour)))
+
+	s.clock = s.clock.Add(3 * time.Hour)
+	s.False(b.IsBanned(id))
+	s.True(b.Ban(id, s.clock.Add(time.Hour)))
+	s.True(b.IsBanned(id))
 }
 
 func (s *addrBookSuite) TestBanRules() {
