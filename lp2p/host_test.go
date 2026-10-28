@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
@@ -576,6 +578,7 @@ func TestResourceManager(t *testing.T) {
 		require.Less(t, systemLimits.GetStreamTotalLimit(), 1_000_000)
 		require.Less(t, peerLimits.GetStreamTotalLimit(), systemLimits.GetStreamTotalLimit())
 		require.Equal(t, 2, peerPingLimits.GetStreamLimit(network.DirInbound))
+		requirePEXLimits(t, limiter)
 	})
 
 	t.Run("custom", func(t *testing.T) {
@@ -625,7 +628,64 @@ func TestResourceManager(t *testing.T) {
 		require.NotEqual(t, math.MaxInt64, serviceLimits.GetStreamTotalLimit())
 		require.Less(t, peerLimits.GetStreamTotalLimit(), systemLimits.GetStreamTotalLimit())
 		require.Equal(t, 2, peerPingLimits.GetStreamLimit(network.DirInbound))
+		requirePEXLimits(t, limiter)
 	})
+
+	t.Run("pex streams per peer", func(t *testing.T) {
+		const attempts = PEXPeerStreams + 2
+		for _, tc := range []struct {
+			name     string
+			hold     bool
+			expected int32
+		}{
+			{name: "caps concurrent streams", hold: true, expected: PEXPeerStreams},
+			{name: "admits sequential streams", expected: attempts},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				// ARRANGE
+				ports := utils.GetFreePorts(t, 2)
+				server := makeTestHost(t, ports[0])
+				client := makeTestHost(t, ports[1], withModifiedConfig(func(cfg *config.LibP2PConfig) {
+					cfg.Limits.Mode = config.LibP2PLimitsModeDisabled
+				}))
+				var handled atomic.Int32
+				release := make(chan struct{})
+				t.Cleanup(func() { close(release) })
+				server.SetStreamHandler(ProtocolID(PEXChannel), func(s network.Stream) {
+					handled.Add(1)
+					if tc.hold {
+						<-release
+					}
+					_ = s.Reset()
+				})
+				require.NoError(t, client.Connect(t.Context(), server.AddrInfo()))
+
+				// ACT
+				for i := range attempts {
+					s, err := client.NewStream(t.Context(), server.ID(), ProtocolID(PEXChannel))
+					if err == nil {
+						_, _ = s.Write([]byte{0})
+					}
+					if !tc.hold {
+						require.Eventually(t, func() bool { return handled.Load() > int32(i) }, 2*time.Second, 10*time.Millisecond)
+					}
+				}
+
+				// ASSERT
+				require.Eventually(t, func() bool { return handled.Load() >= tc.expected }, 2*time.Second, 20*time.Millisecond)
+				require.Never(t, func() bool { return handled.Load() > tc.expected }, 300*time.Millisecond, 20*time.Millisecond)
+			})
+		}
+	})
+}
+
+func requirePEXLimits(t *testing.T, limiter rcmgr.Limiter) {
+	t.Helper()
+
+	pexPeerLimits := limiter.GetProtocolPeerLimits(ProtocolID(PEXChannel))
+	require.Equal(t, 4, pexPeerLimits.GetStreamLimit(network.DirInbound))
+	require.Equal(t, 4, pexPeerLimits.GetStreamLimit(network.DirOutbound))
+	require.Equal(t, 8, pexPeerLimits.GetStreamTotalLimit())
 }
 
 func TestBootstrapPeers(t *testing.T) {

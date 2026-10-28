@@ -215,6 +215,10 @@ func BootstrapPeersFromConfig(config config.LibP2PConfig) (map[peer.ID]Bootstrap
 	return peers, nil
 }
 
+// PEXPeerStreams bounds PEX streams per peer and direction unless limits are
+// disabled. There is no PEX-specific global cap, so a few peers cannot starve the rest.
+const PEXPeerStreams = 4
+
 // systemConnsPerPeer is the per-peer connection budget used to size the
 // system-wide connection limit in custom limits mode.
 const systemConnsPerPeer = 4
@@ -231,6 +235,17 @@ func ResourceManagerFromConfig(cfg config.LibP2PConfig) (network.ResourceManager
 
 	// cap limits for default lib-p2p protocols (identity, ping, ...)
 	libp2p.SetDefaultServiceLimits(&defaults)
+
+	defaults.AddProtocolPeerLimit(
+		ProtocolID(PEXChannel),
+		rcmgr.BaseLimit{
+			StreamsInbound:  PEXPeerStreams,
+			StreamsOutbound: PEXPeerStreams,
+			Streams:         2 * PEXPeerStreams,
+			Memory:          1 << 20,
+		},
+		rcmgr.BaseLimitIncrease{},
+	)
 
 	if cfg.Limits.Mode == config.LibP2PLimitsModeDefault {
 		limiter := rcmgr.NewFixedLimiter(defaults.AutoScale())

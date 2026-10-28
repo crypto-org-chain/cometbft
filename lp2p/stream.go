@@ -23,6 +23,9 @@ const TimeoutStream = 10 * time.Second
 // Protocols should configure their own maximum size.
 const MaxStreamSize = 4 * (1 << 20)
 
+// PEXChannel is the peer exchange channel.
+const PEXChannel = byte(0x00)
+
 // ProtocolID returns the protocol ID for a given channel
 // Byte is used for compatibility with the original CometBFT implementation.
 func ProtocolID(channelID byte) protocol.ID {

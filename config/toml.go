@@ -399,6 +399,9 @@ threshold_latency = "{{ .ThresholdLatency }}"
 #   and 1GB max. Suitable for most production deployments.
 # - custom: disable limits for app protocols but enforce max_peers and max_peer_streams.
 #   Use when you need tighter control over peer count and stream concurrency.
+#
+# Default and custom modes also allow at most 4 inbound and 4 outbound peer exchange streams
+# per peer (custom mode also applies max_peer_streams).
 mode = "{{ .P2P.LibP2PConfig.Limits.Mode }}"
 
 # Maximum number of peers (custom mode only).
