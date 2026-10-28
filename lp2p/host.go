@@ -97,6 +97,9 @@ func NewHost(config *config.P2PConfig, nodeKey cmcrypto.PrivKey, logger log.Logg
 		libp2p.Ping(true),
 		libp2p.Transport(quic.NewTransport),
 		libp2p.ResourceManager(resourceManager),
+		// Gossiped dead addresses must not make the swarm refuse dials to trusted peers.
+		libp2p.UDPBlackHoleSuccessCounter(nil),
+		libp2p.IPv6BlackHoleSuccessCounter(nil),
 	}
 
 	if connGaterEnabled {

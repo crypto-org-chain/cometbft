@@ -267,6 +267,65 @@ func (b *AddrBook) Gossipable(exclude peer.ID, n int) []Entry {
 	return entries
 }
 
+// DialCandidates returns up to n peers worth dialing: not connected, not
+// cooling down and past their dial backoff. About a third, rounded, are
+// unproven entries chosen at random; the rest are the most recently
+// successful, with unproven entries filling any gap. Each run takes up to two
+// proven entries and one unproven at a random position, so a short prefix
+// still explores.
+func (b *AddrBook) DialCandidates(n int) []Entry {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := b.now()
+	var proven, unproven []*Entry
+	for id, e := range b.entries {
+		if now.Before(e.CooldownUntil) || now.Before(e.LastAttempt.Add(dialBackoff(e.Attempts))) || b.isConnected(id) {
+			continue
+		}
+		if lastSuccess(e).IsZero() {
+			unproven = append(unproven, e)
+		} else {
+			proven = append(proven, e)
+		}
+	}
+
+	rand.Shuffle(len(unproven), func(i, j int) { unproven[i], unproven[j] = unproven[j], unproven[i] })
+	slices.SortFunc(proven, func(x, y *Entry) int { return lastSuccess(y).Compare(lastSuccess(x)) })
+
+	n = max(0, n)
+	fresh := min(len(unproven), (n+1)/3)
+	proven = proven[:min(n-fresh, len(proven))]
+	unproven = unproven[:min(n-len(proven), len(unproven))]
+
+	entries := make([]Entry, 0, len(proven)+len(unproven))
+	for len(proven) > 0 || len(unproven) > 0 {
+		run := make([]Entry, 0, 3)
+		for range min(2, len(proven)) {
+			run = append(run, *proven[0])
+			proven = proven[1:]
+		}
+		if len(unproven) > 0 {
+			run = slices.Insert(run, rand.IntN(len(run)+1), *unproven[0])
+			unproven = unproven[1:]
+		}
+		entries = append(entries, run...)
+	}
+
+	return entries
+}
+
+// RemoveAddr forgets the peer if it is still stored at addr, e.g. when that
+// address answered with another peer ID.
+func (b *AddrBook) RemoveAddr(id peer.ID, addr ma.Multiaddr) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if e, ok := b.entries[id]; ok && e.Addr.Equal(addr) {
+		delete(b.entries, id)
+	}
+}
+
 // Size returns the number of stored peers.
 func (b *AddrBook) Size() int {
 	b.mu.Lock()
@@ -759,6 +818,15 @@ func isUnprovenGossip(e *Entry) bool {
 
 func lastSuccess(e *Entry) time.Time {
 	return latest(e.LastDialedOK, e.LastGood)
+}
+
+// dialBackoff waits a minute after the first failed dial, doubling up to an hour.
+func dialBackoff(attempts int) time.Duration {
+	if attempts <= 0 {
+		return 0
+	}
+
+	return min(time.Minute<<min(attempts-1, 6), time.Hour)
 }
 
 func clampTime(t time.Time) time.Time {

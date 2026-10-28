@@ -239,6 +239,7 @@ type reactorMock struct {
 	received     []p2p.Envelope
 	events       []string
 	onRemovePeer func(p2p.Peer)
+	onInitPeer   func(p2p.Peer)
 	onStop       func()
 }
 
@@ -281,10 +282,15 @@ func (r *reactorMock) GetChannels() []*conn.ChannelDescriptor {
 
 func (r *reactorMock) InitPeer(peer p2p.Peer) p2p.Peer {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	r.initPeers = append(r.initPeers, peer)
 	r.events = append(r.events, "init")
+	hook := r.onInitPeer
+	r.mu.Unlock()
+
+	if hook != nil {
+		hook(peer)
+	}
+
 	return peer
 }
 

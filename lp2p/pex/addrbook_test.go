@@ -794,6 +794,141 @@ func (s *addrBookSuite) TestGossipable() {
 	}
 }
 
+func (s *addrBookSuite) TestDialCandidates() {
+	type spec struct {
+		prep    func(b *AddrBook, id peer.ID)
+		proven  bool
+		allowed bool
+	}
+	failedAgo := func(attempts int, ago time.Duration) func(b *AddrBook, id peer.ID) {
+		return func(b *AddrBook, id peer.ID) {
+			now := s.clock
+			s.clock = now.Add(-ago)
+			s.markAttempts(b, id, attempts)
+			s.clock = now
+		}
+	}
+
+	testCases := []struct {
+		name    string
+		entries []spec
+	}{
+		{name: "fresh entries", entries: []spec{{allowed: true}, {proven: true, allowed: true}}},
+		{name: "cooling down", entries: []spec{{prep: func(b *AddrBook, id peer.ID) { b.SetCooldown(id, s.clock.Add(time.Minute)) }}}},
+		{name: "inside the dial backoff", entries: []spec{{prep: failedAgo(2, time.Minute)}}},
+		{name: "past the dial backoff", entries: []spec{{prep: failedAgo(2, 2*time.Minute), allowed: true}}},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			b := s.newBook(nil)
+			var allowed []peer.ID
+			for i, e := range tc.entries {
+				id := s.id()
+				s.Require().NoError(b.AddGossiped(id, addr(fmt.Sprintf("%d.1.1.1", i+1), 1), s.id()))
+				if e.proven {
+					b.MarkDialed(id)
+				}
+				if e.prep != nil {
+					e.prep(b, id)
+				}
+				if e.allowed {
+					allowed = append(allowed, id)
+				}
+			}
+
+			s.ElementsMatch(allowed, entryIDs(b.DialCandidates(10)))
+		})
+	}
+}
+
+func (s *addrBookSuite) TestDialCandidatesMix() {
+	var connected peer.ID
+	b := s.newBook(func(cfg *Config) {
+		cfg.Connected = func(id peer.ID) bool { return id == connected }
+	})
+	proven := make([]peer.ID, 6)
+	for i := range proven {
+		proven[i] = s.id()
+		s.Require().NoError(b.AddGossiped(proven[i], addr(fmt.Sprintf("%d.1.1.1", i+1), 1), s.id()))
+		b.MarkDialed(proven[i])
+		s.clock = s.clock.Add(time.Second)
+	}
+	for i := range 6 {
+		s.Require().NoError(b.AddGossiped(s.id(), addr(fmt.Sprintf("%d.2.2.2", i+1), 1), s.id()))
+	}
+	connected = proven[5]
+
+	got := b.DialCandidates(6)
+
+	s.Len(got, 6)
+	var provenGot []peer.ID
+	for _, e := range got {
+		if !e.LastDialedOK.IsZero() {
+			provenGot = append(provenGot, e.ID)
+		}
+	}
+	s.Equal([]peer.ID{proven[4], proven[3], proven[2], proven[1]}, provenGot)
+	for run := range len(got) / 3 {
+		unprovenInRun := 0
+		for _, e := range got[3*run : 3*run+3] {
+			if e.LastDialedOK.IsZero() {
+				unprovenInRun++
+			}
+		}
+		s.Equal(1, unprovenInRun, "run %d", run)
+	}
+	s.Empty(b.DialCandidates(0))
+}
+
+func (s *addrBookSuite) TestDialBackoff() {
+	for attempts, expected := range map[int]time.Duration{
+		-3: 0, 0: 0, 1: time.Minute, 2: 2 * time.Minute, 7: time.Hour, 20: time.Hour,
+	} {
+		s.Equal(expected, dialBackoff(attempts), "attempts %d", attempts)
+	}
+}
+
+func (s *addrBookSuite) TestRemoveAddr() {
+	b := s.newBook(nil)
+	id := s.id()
+	s.Require().NoError(b.AddGossiped(id, addr("8.8.8.8", 1), s.id()))
+
+	b.RemoveAddr(id, addr("9.9.9.9", 1))
+	_, ok := b.Get(id)
+	s.True(ok)
+
+	b.RemoveAddr(id, addr("8.8.8.8", 1))
+	_, ok = b.Get(id)
+	s.False(ok)
+}
+
+func (s *addrBookSuite) TestDialCandidatesSmallNeeds() {
+	b := s.newBook(nil)
+	best := s.id()
+	s.Require().NoError(b.AddGossiped(best, addr("1.1.1.1", 1), s.id()))
+	b.MarkDialed(best)
+	unproven := make([]peer.ID, 3)
+	for i := range unproven {
+		unproven[i] = s.id()
+		s.Require().NoError(b.AddGossiped(unproven[i], addr(fmt.Sprintf("%d.2.2.2", i+1), 1), s.id()))
+	}
+
+	one := b.DialCandidates(1)
+	s.Require().Len(one, 1)
+	s.Equal(best, one[0].ID)
+
+	s.ElementsMatch(append([]peer.ID{best}, unproven...), entryIDs(b.DialCandidates(4)))
+}
+
+func entryIDs(entries []Entry) []peer.ID {
+	ids := make([]peer.ID, len(entries))
+	for i, e := range entries {
+		ids[i] = e.ID
+	}
+	return ids
+}
+
 func (s *addrBookSuite) TestNeedMoreAddrs() {
 	b := s.newBook(func(cfg *Config) { cfg.MaxSize = 4 })
 	s.True(b.NeedMoreAddrs())

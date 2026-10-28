@@ -1150,3 +1150,189 @@ type markingReactor struct {
 }
 
 func (r *markingReactor) MarkPeerAsGood(p p2p.Peer) { r.marked = append(r.marked, p) }
+
+func TestSwitchDialPeer(t *testing.T) {
+	testCases := []struct {
+		name     string
+		started  bool
+		setup    func(t *testing.T, sw *Switch, reactor *reactorMock, target *Host)
+		dialTo   func(t *testing.T, target *Host) peer.AddrInfo
+		timeout  time.Duration
+		duringGo func(sw *Switch)
+		cancelOn bool
+		expected error
+		present  bool
+		outbound bool
+		closed   bool
+	}{
+		{name: "adds the peer as outbound", started: true, present: true, outbound: true},
+		{
+			name:    "peer already dialed",
+			started: true,
+			setup: func(t *testing.T, sw *Switch, _ *reactorMock, target *Host) {
+				require.NoError(t, sw.DialPeer(t.Context(), target.AddrInfo()))
+			},
+			expected: ErrPeerConnected,
+			present:  true,
+			outbound: true,
+		},
+		{
+			name:    "inbound peer stays inbound",
+			started: true,
+			setup: func(t *testing.T, sw *Switch, _ *reactorMock, target *Host) {
+				require.NoError(t, target.Connect(t.Context(), sw.host.AddrInfo()))
+				_, err := sw.peerSet.Add(target.AddrInfo(), sw.peerOpts(false, false, false))
+				require.NoError(t, err)
+			},
+			expected: ErrPeerConnected,
+			present:  true,
+		},
+		{
+			name:    "inbound connection landing mid-dial is refused",
+			started: true,
+			setup: func(t *testing.T, sw *Switch, _ *reactorMock, target *Host) {
+				time.AfterFunc(500*time.Millisecond, func() { _ = target.Connect(t.Context(), sw.host.AddrInfo()) })
+			},
+			dialTo: func(t *testing.T, target *Host) peer.AddrInfo {
+				dead := makeTestHosts(t, 1)[0]
+				require.NoError(t, dead.Close())
+				return peer.AddrInfo{ID: target.ID(), Addrs: dead.AddrInfo().Addrs}
+			},
+			expected: ErrPeerConnected,
+		},
+		{
+			name:    "connected peer not yet added stays out",
+			started: true,
+			setup: func(t *testing.T, sw *Switch, _ *reactorMock, target *Host) {
+				require.NoError(t, target.Connect(t.Context(), sw.host.AddrInfo()))
+			},
+			expected: ErrPeerConnected,
+		},
+		{
+			name:    "peer removed while starting",
+			started: true,
+			setup: func(_ *testing.T, sw *Switch, reactor *reactorMock, _ *Host) {
+				reactor.onInitPeer = func(p p2p.Peer) { sw.StopPeerForError(p, errors.New("misbehaved")) }
+			},
+			expected: ErrDialBusy,
+		},
+		{
+			name:    "reactor panics while adding the peer",
+			started: true,
+			setup: func(_ *testing.T, _ *Switch, reactor *reactorMock, _ *Host) {
+				reactor.onInitPeer = func(p2p.Peer) { panic("boom") }
+			},
+			expected: errDialPanicked,
+			closed:   true,
+		},
+		{
+			name:    "peer drops the connection",
+			started: true,
+			setup: func(_ *testing.T, _ *Switch, _ *reactorMock, target *Host) {
+				target.Network().Notify(&network.NotifyBundle{ConnectedF: func(_ network.Network, c network.Conn) {
+					time.AfterFunc(200*time.Millisecond, func() { _ = c.Close() })
+				}})
+			},
+			expected: ErrDialBusy,
+		},
+		{
+			name:    "switch stops during the grace period",
+			started: true,
+			duringGo: func(sw *Switch) {
+				sw.host.Network().Notify(&network.NotifyBundle{ConnectedF: func(network.Network, network.Conn) {
+					go func() { _ = sw.Stop() }()
+				}})
+			},
+			expected: ErrSwitchInactive,
+		},
+		{
+			name:     "dial canceled during the grace period",
+			started:  true,
+			cancelOn: true,
+			expected: context.Canceled,
+			closed:   true,
+		},
+		{
+			name:    "identify never completes",
+			started: true,
+			setup: func(t *testing.T, _ *Switch, _ *reactorMock, target *Host) {
+				target.SetStreamHandler(identify.ID, func(s network.Stream) {
+					<-t.Context().Done()
+					_ = s.Reset()
+				})
+			},
+			timeout:  2 * time.Second,
+			expected: context.DeadlineExceeded,
+			closed:   true,
+		},
+		{name: "switch not running", expected: ErrSwitchInactive},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			hosts := makeTestHosts(t, 2)
+			reactor := newReactorMock([]*conn.ChannelDescriptor{{ID: 0xF7}}, hosts[0].Logger())
+			sw, err := NewSwitch(nil, hosts[0], []SwitchReactor{{Name: "mock", Reactor: reactor}}, p2p.NopMetrics(), hosts[0].Logger())
+			require.NoError(t, err)
+			if tc.started {
+				require.NoError(t, sw.Start())
+				t.Cleanup(func() { _ = sw.Stop() })
+			}
+			if tc.setup != nil {
+				tc.setup(t, sw, reactor, hosts[1])
+			}
+			if tc.duringGo != nil {
+				tc.duringGo(sw)
+			}
+
+			timeout := 15 * time.Second
+			if tc.timeout > 0 {
+				timeout = tc.timeout
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), timeout)
+			defer cancel()
+			if tc.cancelOn {
+				sw.host.Network().Notify(&network.NotifyBundle{ConnectedF: func(network.Network, network.Conn) {
+					time.AfterFunc(sw.dialGrace/2, cancel)
+				}})
+			}
+			dialTo := hosts[1].AddrInfo()
+			if tc.dialTo != nil {
+				dialTo = tc.dialTo(t, hosts[1])
+			}
+			err = sw.DialPeer(ctx, dialTo)
+
+			if tc.expected != nil {
+				require.ErrorIs(t, err, tc.expected)
+			} else {
+				require.NoError(t, err)
+			}
+			p := sw.Peers().Get(peerIDToKey(hosts[1].ID()))
+			require.Equal(t, tc.present, p != nil)
+			if p != nil {
+				require.Equal(t, tc.outbound, p.IsOutbound())
+			}
+			if tc.closed {
+				require.NotEqual(t, network.Connected, sw.host.Network().Connectedness(hosts[1].ID()))
+			}
+		})
+	}
+}
+
+func TestSwitchDialUnreachablePeer(t *testing.T) {
+	hosts := makeTestHosts(t, 2)
+	sw, err := NewSwitch(nil, hosts[0], nil, p2p.NopMetrics(), hosts[0].Logger())
+	require.NoError(t, err)
+	require.NoError(t, sw.Start())
+	t.Cleanup(func() { _ = sw.Stop() })
+	target := hosts[1].AddrInfo()
+	require.NoError(t, hosts[1].Close())
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	err = sw.DialPeer(ctx, target)
+
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrDialBusy)
+	require.NotErrorIs(t, err, ErrSwitchInactive)
+}

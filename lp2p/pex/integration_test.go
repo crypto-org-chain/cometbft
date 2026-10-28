@@ -40,6 +40,16 @@ func TestPEXBetweenSwitches(t *testing.T) {
 }
 
 func startPEXSwitch(t *testing.T, port int, bootstrap []config.LibP2PBootstrapPeer) (*lp2p.Host, *AddrBook) {
+	h, book, _ := startPEXSwitchWith(t, port, bootstrap, nil)
+	return h, book
+}
+
+func startPEXSwitchWith(
+	t *testing.T,
+	port int,
+	bootstrap []config.LibP2PBootstrapPeer,
+	malleate func(*Reactor),
+) (*lp2p.Host, *AddrBook, *lp2p.Switch) {
 	t.Helper()
 
 	cfg := config.DefaultP2PConfig()
@@ -59,11 +69,47 @@ func startPEXSwitch(t *testing.T, port int, bootstrap []config.LibP2PBootstrapPe
 	bookCfg.Strict = false
 	book := NewAddrBook(filepath.Join(cfg.RootDir, "addrbook.json"), bookCfg)
 
-	reactor := NewReactor(book, host)
+	reactor := NewReactor(book, host, 10)
+	if malleate != nil {
+		malleate(reactor)
+	}
 	sw, err := lp2p.NewSwitch(nil, host, []lp2p.SwitchReactor{{Name: "PEX", Reactor: reactor}}, p2p.NopMetrics(), logger)
 	require.NoError(t, err)
 	require.NoError(t, sw.Start())
 	t.Cleanup(func() { _ = sw.Stop() })
 
-	return host, book
+	return host, book, sw
+}
+
+func TestPEXDialsDiscoveredPeer(t *testing.T) {
+	ports := utils.GetFreePorts(t, 3)
+
+	target, _, _ := startPEXSwitchWith(t, ports[2], nil, nil)
+	server, serverBook, _ := startPEXSwitchWith(t, ports[0], nil, nil)
+	require.NoError(t, serverBook.AddVerified(target.ID(), target.Addrs()[0], SourceInbound))
+
+	_, clientBook, client := startPEXSwitchWith(t, ports[1], []config.LibP2PBootstrapPeer{{
+		Host: fmt.Sprintf("127.0.0.1:%d", ports[0]),
+		ID:   server.ID().String(),
+	}}, func(r *Reactor) { r.dialEvery = 50 * time.Millisecond })
+
+	require.Eventually(t, func() bool {
+		p := client.Peers().Get(p2p.ID(target.ID().String()))
+		e, ok := clientBook.Get(target.ID())
+		return p != nil && p.IsOutbound() && ok && e.Source == SourceDialed && !e.LastDialedOK.IsZero()
+	}, 10*time.Second, 50*time.Millisecond)
+}
+
+func TestPEXForgetsAddressOfAnotherPeer(t *testing.T) {
+	ports := utils.GetFreePorts(t, 2)
+	other, _, _ := startPEXSwitchWith(t, ports[0], nil, nil)
+	claimed := p2ptest.RandPeerIDFatal(t)
+
+	_, book, _ := startPEXSwitchWith(t, ports[1], nil, func(r *Reactor) { r.dialEvery = 50 * time.Millisecond })
+	require.NoError(t, book.AddVerified(claimed, other.Addrs()[0], SourceInbound))
+
+	require.Eventually(t, func() bool {
+		_, ok := book.Get(claimed)
+		return !ok
+	}, 10*time.Second, 50*time.Millisecond)
 }
