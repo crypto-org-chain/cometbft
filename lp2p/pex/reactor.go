@@ -416,10 +416,11 @@ func (r *Reactor) hasRequest(id p2p.ID) bool {
 	return ok && !st.requested.IsZero()
 }
 
-// askable reports whether the peer speaks PEX and is not banned.
+// askable reports whether the peer speaks PEX and is neither banned nor
+// private; a private peer's ID must not end up in the book as an origin.
 func (r *Reactor) askable(p p2p.Peer) bool {
 	id, err := peerID(p)
-	if err != nil || r.book.IsBanned(id) {
+	if err != nil || r.book.IsBanned(id) || contains(r.book.cfg.Private, id) {
 		return false
 	}
 

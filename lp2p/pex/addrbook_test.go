@@ -147,6 +147,14 @@ func (s *addrBookSuite) TestAdmission() {
 	}
 }
 
+func (s *addrBookSuite) TestRejectsPrivateOrigin() {
+	private := s.id()
+	b := s.newBook(func(cfg *Config) { cfg.Private = map[peer.ID]struct{}{private: {}} })
+
+	s.Require().ErrorIs(b.AddGossiped(s.id(), addr("8.8.8.8", 1), private), ErrPrivate)
+	s.Zero(b.Size())
+}
+
 func (s *addrBookSuite) TestRejectsInvalidSource() {
 	b := s.newBook(nil)
 
@@ -829,7 +837,7 @@ func (s *addrBookSuite) TestBans() {
 }
 
 func (s *addrBookSuite) TestBanRules() {
-	bootstrap := s.id()
+	bootstrap, private := s.id(), s.id()
 
 	testCases := []struct {
 		name     string
@@ -841,6 +849,7 @@ func (s *addrBookSuite) TestBanRules() {
 		{name: "bans only extend", maxBans: 2, bans: []time.Duration{24 * time.Hour, time.Hour}, expected: true},
 		{name: "bans extend at capacity", maxBans: 1, bans: []time.Duration{time.Hour, 3 * time.Hour}, expected: true},
 		{name: "bootstrap peers are never banned", maxBans: 2, id: bootstrap, bans: []time.Duration{3 * time.Hour}},
+		{name: "private peers are never banned", maxBans: 2, id: private, bans: []time.Duration{3 * time.Hour}},
 		{name: "invalid peer IDs are never banned", maxBans: 2, id: peer.ID("abc"), bans: []time.Duration{3 * time.Hour}},
 		{name: "peer IDs without a text form are never banned", maxBans: 2, id: sha1PeerID(), bans: []time.Duration{3 * time.Hour}},
 	}
@@ -850,6 +859,7 @@ func (s *addrBookSuite) TestBanRules() {
 			b := s.newBook(func(cfg *Config) {
 				cfg.MaxBans = tc.maxBans
 				cfg.Bootstrap = map[peer.ID]struct{}{bootstrap: {}}
+				cfg.Private = map[peer.ID]struct{}{private: {}}
 			})
 			id := tc.id
 			if id == "" {
@@ -1010,6 +1020,17 @@ func (s *addrBookSuite) TestLoadAppliesConfig() {
 			},
 			size:    4,
 			dropped: []peer.ID{best},
+			banned:  true,
+		},
+		{
+			name: "newly private origin",
+			malleate: func(cfg *Config) {
+				duplicates(cfg)
+				cfg.Private = map[peer.ID]struct{}{origin: {}}
+			},
+			size:    1,
+			kept:    []peer.ID{verified},
+			dropped: []peer.ID{best, newest},
 			banned:  true,
 		},
 		{

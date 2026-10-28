@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -23,6 +25,8 @@ import (
 	"github.com/cometbft/cometbft/internal/test"
 	"github.com/cometbft/cometbft/libs/log"
 	cmtrand "github.com/cometbft/cometbft/libs/rand"
+	"github.com/cometbft/cometbft/lp2p"
+	lp2ppex "github.com/cometbft/cometbft/lp2p/pex"
 	mempl "github.com/cometbft/cometbft/mempool"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/conn"
@@ -31,8 +35,11 @@ import (
 	"github.com/cometbft/cometbft/proxy"
 	sm "github.com/cometbft/cometbft/state"
 	"github.com/cometbft/cometbft/store"
+	"github.com/cometbft/cometbft/test/utils"
 	"github.com/cometbft/cometbft/types"
 	cmttime "github.com/cometbft/cometbft/types/time"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 )
 
 func TestNodeStartStop(t *testing.T) {
@@ -102,6 +109,7 @@ func TestWarnUnsupportedLibP2PSettings(t *testing.T) {
 		name     string
 		malleate func(*cfg.P2PConfig)
 		expected string
+		hint     bool
 	}{
 		{name: "defaults", malleate: func(*cfg.P2PConfig) {}},
 		{
@@ -112,16 +120,33 @@ func TestWarnUnsupportedLibP2PSettings(t *testing.T) {
 			},
 		},
 		{
-			name: "classic peer settings and pex",
+			name: "classic peer settings",
 			malleate: func(c *cfg.P2PConfig) {
 				c.Seeds = "id@host:26656"
 				c.PersistentPeers = "id@host:26656"
 				c.UnconditionalPeerIDs = "id"
 				c.PrivatePeerIDs = "id"
 				c.SeedMode = true
+				c.LibP2PConfig.Enabled = true
 				c.LibP2PConfig.PEX.Enabled = true
 			},
-			expected: "settings=\"[p2p.seeds p2p.persistent_peers p2p.unconditional_peer_ids p2p.private_peer_ids p2p.seed_mode p2p.libp2p.pex.enabled]\"",
+			expected: "settings=\"[p2p.seeds p2p.persistent_peers p2p.unconditional_peer_ids p2p.private_peer_ids p2p.seed_mode]\"",
+			hint:     true,
+		},
+		{
+			name: "private peers already set for libp2p",
+			malleate: func(c *cfg.P2PConfig) {
+				c.PrivatePeerIDs = "id"
+				c.LibP2PConfig.Enabled = true
+				c.LibP2PConfig.PEX.Enabled = true
+				c.LibP2PConfig.PrivatePeerIDs = []string{"id"}
+			},
+			expected: "settings=[p2p.private_peer_ids]",
+		},
+		{
+			name:     "private peers without peer exchange",
+			malleate: func(c *cfg.P2PConfig) { c.PrivatePeerIDs = "id" },
+			expected: "settings=[p2p.private_peer_ids]",
 		},
 	}
 
@@ -138,6 +163,159 @@ func TestWarnUnsupportedLibP2PSettings(t *testing.T) {
 				return
 			}
 			assert.Contains(t, buf.String(), tc.expected)
+			assert.Equal(t, tc.hint, strings.Contains(buf.String(), "p2p.libp2p.private_peer_ids"))
+		})
+	}
+}
+
+func TestCreateLibP2PPEXReactor(t *testing.T) {
+	privateID, bootstrapID, privateBootstrapID := randomPeerID(t), randomPeerID(t), randomPeerID(t)
+	public := func(port int) multiaddr.Multiaddr {
+		return multiaddr.StringCast(fmt.Sprintf("/ip4/8.8.8.8/udp/%d/quic-v1", port))
+	}
+
+	testCases := []struct {
+		name     string
+		malleate func(*cfg.P2PConfig)
+		check    func(t *testing.T, book *lp2ppex.AddrBook, host *lp2p.Host, connected peer.ID)
+		noSwitch bool
+	}{
+		{
+			name: "never stores self, private or bootstrap peers",
+			check: func(t *testing.T, book *lp2ppex.AddrBook, host *lp2p.Host, _ peer.ID) {
+				origin := randomPeerID(t)
+				require.ErrorIs(t, book.AddGossiped(privateID, public(1), origin), lp2ppex.ErrPrivate)
+				require.ErrorIs(t, book.AddGossiped(privateBootstrapID, public(1), origin), lp2ppex.ErrPrivate)
+				require.ErrorIs(t, book.AddGossiped(bootstrapID, public(1), origin), lp2ppex.ErrBootstrap)
+				require.ErrorIs(t, book.AddGossiped(host.ID(), public(1), origin), lp2ppex.ErrSelf)
+				require.ErrorIs(t, book.AddGossiped(randomPeerID(t), public(1), privateID), lp2ppex.ErrPrivate)
+				require.NoError(t, book.AddGossiped(randomPeerID(t), public(1), bootstrapID))
+			},
+		},
+		{
+			name: "strict book",
+			check: func(t *testing.T, book *lp2ppex.AddrBook, _ *lp2p.Host, _ peer.ID) {
+				local := multiaddr.StringCast("/ip4/127.0.0.1/udp/26656/quic-v1")
+				require.ErrorIs(t, book.AddGossiped(randomPeerID(t), local, randomPeerID(t)), lp2ppex.ErrUnroutable)
+			},
+		},
+		{
+			name:     "non-strict book",
+			malleate: func(c *cfg.P2PConfig) { c.AddrBookStrict = false },
+			check: func(t *testing.T, book *lp2ppex.AddrBook, _ *lp2p.Host, _ peer.ID) {
+				local := multiaddr.StringCast("/ip4/127.0.0.1/udp/26656/quic-v1")
+				require.NoError(t, book.AddGossiped(randomPeerID(t), local, randomPeerID(t)))
+			},
+		},
+		{
+			name:     "duplicate IPs allowed",
+			malleate: func(c *cfg.P2PConfig) { c.AllowDuplicateIP = true },
+			check: func(t *testing.T, book *lp2ppex.AddrBook, _ *lp2p.Host, _ peer.ID) {
+				for port := 1; port <= 3; port++ {
+					require.NoError(t, book.AddGossiped(randomPeerID(t), public(port), randomPeerID(t)))
+				}
+			},
+		},
+		{
+			name: "connected peers keep their group slot",
+			check: func(t *testing.T, book *lp2ppex.AddrBook, _ *lp2p.Host, connected peer.ID) {
+				other := randomPeerID(t)
+				require.NoError(t, book.AddGossiped(connected, public(1), randomPeerID(t)))
+				require.NoError(t, book.AddGossiped(other, public(2), randomPeerID(t)))
+
+				require.NoError(t, book.AddVerified(randomPeerID(t), public(3), lp2ppex.SourceInbound))
+
+				_, keptConnected := book.Get(connected)
+				_, keptOther := book.Get(other)
+				require.True(t, keptConnected)
+				require.False(t, keptOther)
+			},
+		},
+		{
+			name:     "nothing is connected before the switch is set",
+			noSwitch: true,
+			check: func(t *testing.T, book *lp2ppex.AddrBook, _ *lp2p.Host, connected peer.ID) {
+				require.NoError(t, book.AddGossiped(connected, public(1), randomPeerID(t)))
+				require.NoError(t, book.AddGossiped(randomPeerID(t), public(2), randomPeerID(t)))
+
+				require.NoError(t, book.AddVerified(randomPeerID(t), public(3), lp2ppex.SourceInbound))
+
+				_, keptConnected := book.Get(connected)
+				require.False(t, keptConnected)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := cfg.TestConfig().SetRoot(t.TempDir())
+			config.P2P.ListenAddress = fmt.Sprintf("127.0.0.1:%d", utils.GetFreePorts(t, 1)[0])
+			config.P2P.AddrBookStrict = true
+			config.P2P.AllowDuplicateIP = false
+			config.P2P.LibP2PConfig.Enabled = true
+			config.P2P.LibP2PConfig.PrivatePeerIDs = []string{privateID.String()}
+			config.P2P.LibP2PConfig.BootstrapPeers = []cfg.LibP2PBootstrapPeer{
+				{Host: "127.0.0.1:1", ID: bootstrapID.String()},
+				{Host: "127.0.0.1:2", ID: privateBootstrapID.String(), Private: true},
+			}
+			if tc.malleate != nil {
+				tc.malleate(config.P2P)
+			}
+			host, err := lp2p.NewHost(config.P2P, ed25519.GenPrivKey(), log.NewNopLogger())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = host.Close() })
+
+			connected := randomPeerID(t)
+			peers := p2p.NewPeerSet()
+			require.NoError(t, peers.Add(&idPeer{Peer: p2pmock.NewPeer(nil), id: p2p.ID(connected.String())}))
+
+			reactor, book, err := createLibP2PPEXReactor(config.P2P, host, log.NewNopLogger())
+			require.NoError(t, err)
+			if !tc.noSwitch {
+				reactor.SetSwitch(&peersSwitch{peers: peers})
+			}
+
+			tc.check(t, book, host, connected)
+			require.NoError(t, book.Save())
+			require.FileExists(t, config.P2P.LibP2PAddrBookFile())
+		})
+	}
+}
+
+func TestNodeClosesHostWhenPEXSetupFails(t *testing.T) {
+	config := newNodeTestConfig(t, "node_libp2p_pex_fail_test")
+	t.Cleanup(func() { _ = os.RemoveAll(config.RootDir) })
+	port := utils.GetFreePorts(t, 1)[0]
+	config.P2P.ListenAddress = fmt.Sprintf("127.0.0.1:%d", port)
+	config.P2P.LibP2PConfig.Enabled = true
+	config.P2P.LibP2PConfig.PEX.Enabled = true
+	config.P2P.LibP2PConfig.PrivatePeerIDs = []string{"nope"}
+
+	_, err := DefaultNewNode(config, log.TestingLogger())
+	require.ErrorContains(t, err, "invalid p2p.libp2p.private_peer_ids entry")
+
+	conn, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", port))
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+}
+
+func TestNodeRegistersLibP2PPEX(t *testing.T) {
+	for _, enabled := range []bool{true, false} {
+		t.Run(fmt.Sprintf("enabled=%t", enabled), func(t *testing.T) {
+			config := newNodeTestConfig(t, "node_libp2p_pex_test")
+			t.Cleanup(func() { _ = os.RemoveAll(config.RootDir) })
+			config.P2P.ListenAddress = fmt.Sprintf("127.0.0.1:%d", utils.GetFreePorts(t, 1)[0])
+			config.P2P.LibP2PConfig.Enabled = true
+			config.P2P.LibP2PConfig.PEX.Enabled = enabled
+
+			n, err := DefaultNewNode(config, log.TestingLogger())
+			require.NoError(t, err)
+			require.NoError(t, n.Start())
+			t.Cleanup(func() { _ = n.Stop() })
+
+			_, ok := n.sw.(*lp2p.Switch).Reactor("PEX")
+			require.Equal(t, enabled, ok)
+			require.Equal(t, enabled, slices.Contains(n.nodeInfo.(p2p.DefaultNodeInfo).Channels, lp2ppex.Channel))
 		})
 	}
 }
@@ -588,3 +766,26 @@ func state(nVals int, height int64) (sm.State, dbm.DB, []types.PrivValidator) {
 	}
 	return s, stateDB, privVals
 }
+
+func randomPeerID(t *testing.T) peer.ID {
+	t.Helper()
+
+	id, err := lp2p.IDFromPrivateKey(ed25519.GenPrivKey())
+	require.NoError(t, err)
+
+	return id
+}
+
+type peersSwitch struct {
+	p2p.Switcher
+	peers p2p.IPeerSet
+}
+
+func (s *peersSwitch) Peers() p2p.IPeerSet { return s.peers }
+
+type idPeer struct {
+	*p2pmock.Peer
+	id p2p.ID
+}
+
+func (p *idPeer) ID() p2p.ID { return p.id }

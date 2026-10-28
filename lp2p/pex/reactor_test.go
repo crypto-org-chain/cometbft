@@ -314,6 +314,7 @@ func (s *reactorSuite) TestAddPeerAsks() {
 		supportsPEX bool
 		bookFull    bool
 		banned      bool
+		private     bool
 		asked       bool
 	}{
 		{name: "outbound PEX peer", outbound: true, supportsPEX: true, asked: true},
@@ -321,6 +322,7 @@ func (s *reactorSuite) TestAddPeerAsks() {
 		{name: "peer without PEX", outbound: true},
 		{name: "book has enough addresses", outbound: true, supportsPEX: true, bookFull: true},
 		{name: "banned peer", outbound: true, supportsPEX: true, banned: true},
+		{name: "private peer", outbound: true, supportsPEX: true, private: true},
 	}
 
 	for _, tc := range testCases {
@@ -331,6 +333,9 @@ func (s *reactorSuite) TestAddPeerAsks() {
 			p := s.newPeer(tc.outbound, tc.supportsPEX)
 			if tc.banned {
 				s.book.Ban(p.id, s.clock.Add(time.Hour))
+			}
+			if tc.private {
+				s.book.cfg.Private[p.id] = struct{}{}
 			}
 
 			s.reactor.AddPeer(p)
