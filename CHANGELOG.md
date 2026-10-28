@@ -42,6 +42,8 @@
 
 ### FEATURES
 
+- `[lp2p]` dial peers found by peer exchange
+  ([\#86](https://github.com/crypto-org-chain/cometbft/pull/86))
 - `[lp2p]` gossip peer addresses when peer exchange is enabled
   ([\#85](https://github.com/crypto-org-chain/cometbft/pull/85))
 - `[lp2p]` add peer exchange reactor that gossips addresses

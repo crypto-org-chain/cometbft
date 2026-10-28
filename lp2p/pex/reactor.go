@@ -1,6 +1,7 @@
 package pex
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -17,6 +18,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/peerstore"
+	"github.com/libp2p/go-libp2p/core/sec"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	ma "github.com/multiformats/go-multiaddr"
 )
 
@@ -38,6 +41,10 @@ const (
 	askInterval    = 30 * time.Second
 	saveInterval   = 2 * time.Minute
 	banDuration    = 24 * time.Hour
+
+	dialInterval      = 30 * time.Second
+	groupDialInterval = time.Minute
+	busyCooldown      = time.Minute
 )
 
 var errMalformed = errors.New("malformed pex message")
@@ -51,26 +58,37 @@ var (
 type Host interface {
 	Peerstore() peerstore.Peerstore
 	EventBus() event.Bus
+	Network() network.Network
 }
 
-// Reactor gossips peer addresses over libp2p and fills the address book.
-// It never dials; it only learns and shares addresses.
+type dialer interface {
+	DialPeer(ctx context.Context, addrInfo peer.AddrInfo) error
+}
+
+// Reactor gossips peer addresses over libp2p, fills the address book and
+// dials peers from it until the node has maxOutbound outbound peers.
 type Reactor struct {
 	p2p.BaseReactor
 
-	book *AddrBook
-	host Host
-	now  func() time.Time
+	book        *AddrBook
+	host        Host
+	dialer      dialer
+	maxOutbound int
+	now         func() time.Time
 
 	askEvery  time.Duration
 	saveEvery time.Duration
+	dialEvery time.Duration
 
-	mu      sync.Mutex
-	peers   map[p2p.ID]*peerState
-	stopped bool
+	mu         sync.Mutex
+	peers      map[p2p.ID]*peerState
+	dialing    int
+	groupDials map[string]time.Time
+	stopped    bool
 
 	identifySub event.Subscription
-	done        chan struct{}
+	ctx         context.Context
+	cancel      context.CancelFunc
 	workers     sync.WaitGroup
 }
 
@@ -82,22 +100,36 @@ type peerState struct {
 }
 
 // NewReactor creates a reactor that stores what it learns in book.
-func NewReactor(book *AddrBook, host Host) *Reactor {
+func NewReactor(book *AddrBook, host Host, maxOutbound int) *Reactor {
 	r := &Reactor{
-		book:      book,
-		host:      host,
-		now:       time.Now,
-		askEvery:  askInterval,
-		saveEvery: saveInterval,
-		peers:     make(map[p2p.ID]*peerState),
+		book:        book,
+		host:        host,
+		maxOutbound: maxOutbound,
+		now:         time.Now,
+		askEvery:    askInterval,
+		saveEvery:   saveInterval,
+		dialEvery:   dialInterval,
+		peers:       make(map[p2p.ID]*peerState),
+		groupDials:  make(map[string]time.Time),
 	}
+	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.BaseReactor = *p2p.NewBaseReactor("PEX", r)
 
 	return r
 }
 
-// OnStart loads the book, then starts asking peers and verifying inbound addresses.
+// SetSwitch also picks up the switch's dialer, which OnStart requires.
+func (r *Reactor) SetSwitch(sw p2p.Switcher) {
+	r.BaseReactor.SetSwitch(sw)
+	r.dialer, _ = sw.(dialer)
+}
+
+// OnStart loads the book, then starts asking, dialing and verifying inbound addresses.
 func (r *Reactor) OnStart() error {
+	if r.dialer == nil {
+		return errors.New("switch cannot dial peers")
+	}
+
 	if err := r.book.Load(); err != nil {
 		r.Logger.Error("Failed to load address book, starting empty", "err", err)
 	}
@@ -108,7 +140,6 @@ func (r *Reactor) OnStart() error {
 	}
 
 	r.identifySub = sub
-	r.done = make(chan struct{})
 	r.workers.Add(2)
 	go r.verifyInboundAddrs()
 	go r.tick()
@@ -122,7 +153,7 @@ func (r *Reactor) OnStop() {
 	r.stopped = true
 	r.mu.Unlock()
 
-	close(r.done)
+	r.cancel()
 	_ = r.identifySub.Close()
 	r.workers.Wait()
 
@@ -331,16 +362,21 @@ func (r *Reactor) tick() {
 	defer ask.Stop()
 	save := time.NewTicker(r.saveEvery)
 	defer save.Stop()
+	dial := time.NewTimer(jitter(r.dialEvery))
+	defer dial.Stop()
 
 	for {
 		select {
 		case <-ask.C:
 			r.askRandomPeer()
+		case <-dial.C:
+			r.dialPeers()
+			dial.Reset(jitter(r.dialEvery))
 		case <-save.C:
 			if err := r.book.Save(); err != nil {
 				r.Logger.Error("Failed to save address book", "err", err)
 			}
-		case <-r.done:
+		case <-r.ctx.Done():
 			return
 		}
 	}
@@ -377,6 +413,131 @@ func (r *Reactor) askRandomPeer() {
 	if len(candidates) > 0 {
 		r.request(candidates[rand.IntN(len(candidates))])
 	}
+}
+
+// dialPeers dials book entries until outbound peers plus dials in flight
+// reach maxOutbound, at most one dial per IP group per groupDialInterval.
+// Candidates beyond need are requested so a skipped IP group does not cost a slot.
+func (r *Reactor) dialPeers() {
+	// Read dialing first: a dial finishing in between is then counted twice, never missed.
+	r.mu.Lock()
+	dialing := r.dialing
+	r.mu.Unlock()
+	outbound, _, _ := r.Switch.NumPeers()
+
+	need := r.maxOutbound - outbound - dialing
+	if need <= 0 {
+		return
+	}
+
+	for _, e := range r.book.DialCandidates(3 * need) {
+		if !r.reserveDial(e) {
+			continue
+		}
+		go r.dial(e)
+		if need--; need == 0 {
+			return
+		}
+	}
+}
+
+// reserveDial counts a dial in flight unless the reactor stopped or the
+// entry's IP group was dialed recently.
+func (r *Reactor) reserveDial(e Entry) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	group, now := ipGroup(e.ip), r.now()
+	if r.stopped || now.Sub(r.groupDials[group]) < groupDialInterval {
+		return false
+	}
+	for g, at := range r.groupDials {
+		if now.Sub(at) >= groupDialInterval {
+			delete(r.groupDials, g)
+		}
+	}
+
+	r.groupDials[group] = now
+	r.dialing++
+	r.workers.Add(1)
+
+	return true
+}
+
+func (r *Reactor) dial(e Entry) {
+	defer r.workers.Done()
+	defer func() {
+		r.mu.Lock()
+		r.dialing--
+		r.mu.Unlock()
+	}()
+
+	err := r.dialer.DialPeer(r.ctx, peer.AddrInfo{ID: e.ID, Addrs: []ma.Multiaddr{e.Addr}})
+	r.recordDial(e, err)
+}
+
+// recordDial counts success only if we are connected at the dialed address. A
+// peer ID mismatch only drops the address, since anyone can gossip an honest
+// ID with their own IP.
+func (r *Reactor) recordDial(e Entry, err error) {
+	var mismatch sec.ErrPeerIDMismatch
+	cause := dialCause(err, e.Addr)
+
+	switch {
+	case err == nil && !r.connectedAt(e.ID, e.Addr):
+		r.Logger.Debug("Dialed peer is connected at another address", "peer_id", e.ID, "addr", e.Addr)
+	case err == nil:
+		r.Logger.Debug("Dialed peer", "peer_id", e.ID, "addr", e.Addr)
+		if err := r.book.AddVerified(e.ID, e.Addr, SourceDialed); err != nil {
+			r.Logger.Debug("Dropping dialed address", "peer_id", e.ID, "addr", e.Addr, "err", err)
+		}
+		r.book.MarkDialed(e.ID)
+	case errors.As(cause, &mismatch):
+		r.Logger.Debug("Dropping address of another peer", "peer_id", e.ID, "addr", e.Addr)
+		r.book.RemoveAddr(e.ID, e.Addr)
+	case errors.Is(cause, lp2p.ErrSwitchInactive), errors.Is(cause, context.Canceled):
+		r.Logger.Debug("Dial interrupted", "peer_id", e.ID, "err", err)
+	case errors.Is(cause, lp2p.ErrDialBusy),
+		errors.Is(cause, lp2p.ErrPeerConnected),
+		errors.Is(cause, swarm.ErrGaterDisallowedConnection),
+		errors.Is(cause, swarm.ErrDialBackoff),
+		errors.Is(cause, network.ErrResourceLimitExceeded):
+		r.Logger.Debug("Peer busy or dial limited", "peer_id", e.ID, "err", err)
+		r.book.SetCooldown(e.ID, r.now().Add(busyCooldown))
+	default:
+		r.Logger.Debug("Failed to dial peer", "peer_id", e.ID, "addr", e.Addr, "err", err)
+		r.book.MarkAttempt(e.ID)
+	}
+}
+
+// dialCause narrows a swarm dial error to what happened at addr, since it
+// also carries errors from the peer's other known addresses. A nil err gives nil.
+func dialCause(err error, addr ma.Multiaddr) error {
+	var dialErr *swarm.DialError
+	if !errors.As(err, &dialErr) {
+		return err
+	}
+
+	for _, te := range dialErr.DialErrors {
+		if te.Address.Equal(addr) {
+			return te.Cause
+		}
+	}
+	return dialErr.Cause
+}
+
+func (r *Reactor) connectedAt(id peer.ID, addr ma.Multiaddr) bool {
+	for _, c := range r.host.Network().ConnsToPeer(id) {
+		if c.RemoteMultiaddr().Equal(addr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func jitter(d time.Duration) time.Duration {
+	return d + rand.N(d/10+1)
 }
 
 func (r *Reactor) expire(peers []p2p.Peer) {

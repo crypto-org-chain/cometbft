@@ -1,6 +1,8 @@
 package pex
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -22,7 +24,9 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/core/sec"
 	p2ptest "github.com/libp2p/go-libp2p/core/test"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/suite"
 )
@@ -32,6 +36,7 @@ type reactorSuite struct {
 
 	clock   time.Time
 	host    host.Host
+	net     *fakeNetwork
 	book    *AddrBook
 	sw      *fakeSwitch
 	reactor *Reactor
@@ -55,7 +60,8 @@ func (s *reactorSuite) SetupTest() {
 	s.book.now = func() time.Time { return s.clock }
 
 	s.sw = &fakeSwitch{peers: p2p.NewPeerSet()}
-	s.reactor = NewReactor(s.book, h)
+	s.net = &fakeNetwork{Network: h.Network(), conns: map[peer.ID][]network.Conn{}}
+	s.reactor = NewReactor(s.book, &fakeHost{Host: h, net: s.net}, 10)
 	s.reactor.now = func() time.Time { return s.clock }
 	s.reactor.SetLogger(log.NewNopLogger())
 	s.reactor.SetSwitch(s.sw)
@@ -577,13 +583,22 @@ func (s *reactorSuite) TestStartLoadsAndStopSaves() {
 	s.Require().NoError(s.reactor.Stop())
 
 	loaded := NewAddrBook(s.book.path, s.book.cfg)
-	restarted := NewReactor(loaded, s.host)
+	restarted := NewReactor(loaded, s.host, 10)
 	restarted.SetLogger(log.NewNopLogger())
+	restarted.SetSwitch(s.sw)
 	s.Require().NoError(restarted.Start())
 	s.T().Cleanup(func() { _ = restarted.Stop() })
 
 	_, ok := loaded.Get(id)
 	s.True(ok)
+}
+
+func (s *reactorSuite) TestStartNeedsADialingSwitch() {
+	r := NewReactor(s.book, s.host, 10)
+	r.SetLogger(log.NewNopLogger())
+	r.SetSwitch(struct{ p2p.Switcher }{})
+
+	s.Require().ErrorContains(r.Start(), "switch cannot dial peers")
 }
 
 func (s *reactorSuite) TestConcurrentUse() {
@@ -608,6 +623,251 @@ func (s *reactorSuite) TestConcurrentUse() {
 		})
 	}
 	wg.Wait()
+}
+
+func (s *reactorSuite) TestDialPeersFillsOutboundSlots() {
+	testCases := []struct {
+		name     string
+		outbound int
+		ips      []string
+		dialed   int
+	}{
+		{name: "dials up to the free slots", outbound: 8, ips: []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}, dialed: 2},
+		{name: "no free slots", outbound: 10, ips: []string{"1.1.1.1"}},
+		{name: "one dial per IP group", ips: []string{"1.1.1.1", "1.1.1.1"}, dialed: 1},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.sw.outbound = tc.outbound
+			for i, ip := range tc.ips {
+				s.Require().NoError(s.book.AddVerified(s.id(), addr(ip, i+1), SourceInbound))
+			}
+
+			s.reactor.dialPeers()
+
+			s.Eventually(func() bool { return len(s.sw.dialedIDs()) == tc.dialed }, time.Second, 5*time.Millisecond)
+			s.Never(func() bool { return len(s.sw.dialedIDs()) > tc.dialed }, 50*time.Millisecond, 5*time.Millisecond)
+			s.waitForDials()
+		})
+	}
+}
+
+func (s *reactorSuite) TestDialPeersWaitsOutTheGroupInterval() {
+	s.book.cfg.AllowDuplicateIP = true
+	for port := 1; port <= 2; port++ {
+		s.Require().NoError(s.book.AddVerified(s.id(), addr("1.1.1.1", port), SourceInbound))
+	}
+	s.sw.dialFn = func(context.Context, peer.AddrInfo) error { return errors.New("unreachable") }
+
+	s.reactor.dialPeers()
+	s.Eventually(func() bool { return len(s.sw.dialedIDs()) == 1 }, time.Second, 5*time.Millisecond)
+
+	s.waitForDials()
+	s.clock = s.clock.Add(groupDialInterval)
+	s.reactor.dialPeers()
+	s.Eventually(func() bool { return len(s.sw.dialedIDs()) == 2 }, time.Second, 5*time.Millisecond)
+	s.waitForDials()
+}
+
+// waitForDials keeps background dials from reading the clock after the test moves on.
+func (s *reactorSuite) waitForDials() {
+	s.Eventually(func() bool {
+		s.reactor.mu.Lock()
+		defer s.reactor.mu.Unlock()
+		return s.reactor.dialing == 0
+	}, time.Second, 5*time.Millisecond)
+}
+
+func (s *reactorSuite) TestDialsInFlightCountTowardOutbound() {
+	s.sw.outbound = 9
+	release := make(chan struct{})
+	s.sw.dialFn = func(context.Context, peer.AddrInfo) error {
+		<-release
+		return nil
+	}
+	for i, ip := range []string{"1.1.1.1", "2.2.2.2"} {
+		s.Require().NoError(s.book.AddVerified(s.id(), addr(ip, i+1), SourceInbound))
+	}
+
+	s.reactor.dialPeers()
+	s.Eventually(func() bool { return len(s.sw.dialedIDs()) == 1 }, time.Second, 5*time.Millisecond)
+	for range 10 {
+		s.reactor.dialPeers()
+	}
+
+	s.Never(func() bool { return len(s.sw.dialedIDs()) > 1 }, 50*time.Millisecond, 5*time.Millisecond)
+	close(release)
+	s.waitForDials()
+}
+
+func (s *reactorSuite) TestNoDialAfterStop() {
+	s.Require().NoError(s.book.AddVerified(s.id(), addr("1.1.1.1", 1), SourceInbound))
+	s.Require().NoError(s.reactor.Start())
+	s.Require().NoError(s.reactor.Stop())
+
+	s.reactor.dialPeers()
+
+	s.Never(func() bool { return len(s.sw.dialedIDs()) > 0 }, 50*time.Millisecond, 5*time.Millisecond)
+}
+
+func (s *reactorSuite) TestRecordDial() {
+	dialed := addr("8.8.8.8", 1)
+
+	testCases := []struct {
+		name        string
+		err         error
+		connectedAt ma.Multiaddr
+		moved       bool
+		kept        bool
+		dialed      bool
+		cooldown    bool
+		attempts    int
+	}{
+		{name: "success at the dialed address", connectedAt: dialed, kept: true, dialed: true},
+		{name: "success at another address", connectedAt: addr("9.9.9.9", 1), kept: true},
+		{name: "peer ID mismatch", err: fmt.Errorf("dial: %w", sec.ErrPeerIDMismatch{})},
+		{
+			name: "peer ID mismatch at the dialed address",
+			err:  &swarm.DialError{DialErrors: []swarm.TransportError{{Address: dialed, Cause: sec.ErrPeerIDMismatch{}}}},
+		},
+		{
+			name:     "peer ID mismatch at another known address",
+			err:      &swarm.DialError{DialErrors: []swarm.TransportError{{Address: addr("9.9.9.9", 1), Cause: sec.ErrPeerIDMismatch{}}}},
+			kept:     true,
+			attempts: 1,
+		},
+		{name: "peer ID mismatch after the address changed", err: sec.ErrPeerIDMismatch{}, moved: true, kept: true},
+		{name: "busy peer", err: lp2p.ErrDialBusy, kept: true, cooldown: true},
+		{name: "already connected peer", err: lp2p.ErrPeerConnected, kept: true, cooldown: true},
+		{name: "gater", err: swarm.ErrGaterDisallowedConnection, kept: true, cooldown: true},
+		{name: "dial backoff", err: swarm.ErrDialBackoff, kept: true, cooldown: true},
+		{
+			name: "dial backoff only at another known address",
+			err: &swarm.DialError{DialErrors: []swarm.TransportError{
+				{Address: addr("9.9.9.9", 1), Cause: swarm.ErrDialBackoff},
+				{Address: dialed, Cause: context.DeadlineExceeded},
+			}},
+			kept:     true,
+			attempts: 1,
+		},
+		{
+			name:     "gater refusal of the peer",
+			err:      &swarm.DialError{Cause: swarm.ErrGaterDisallowedConnection},
+			kept:     true,
+			cooldown: true,
+		},
+		{name: "resource limit", err: network.ErrResourceLimitExceeded, kept: true, cooldown: true},
+		{name: "inactive switch", err: lp2p.ErrSwitchInactive, kept: true},
+		{name: "our own shutdown", err: context.Canceled, kept: true},
+		{name: "timeout", err: context.DeadlineExceeded, kept: true, attempts: 1},
+		{name: "remote failure", err: errors.New("connection refused"), kept: true, attempts: 1},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			id := s.id()
+			s.Require().NoError(s.book.AddGossiped(id, dialed, s.id()))
+			e, _ := s.book.Get(id)
+			if tc.connectedAt != nil {
+				s.net.conns[id] = []network.Conn{&fakeConn{remote: tc.connectedAt}}
+			}
+			if tc.moved {
+				s.Require().NoError(s.book.AddVerified(id, addr("9.9.9.9", 1), SourceInbound))
+			}
+
+			s.reactor.recordDial(e, tc.err)
+
+			got, ok := s.book.Get(id)
+			s.Require().Equal(tc.kept, ok)
+			if !ok {
+				return
+			}
+			s.Equal(tc.attempts, got.Attempts)
+			s.Equal(tc.dialed, !got.LastDialedOK.IsZero())
+			s.Equal(tc.cooldown, s.book.InCooldown(id))
+			if tc.dialed {
+				s.Equal(SourceDialed, got.Source)
+			}
+		})
+	}
+}
+
+func (s *reactorSuite) TestDialPeersMixesProvenAndUnproven() {
+	s.sw.outbound = 7
+	proven := make([]peer.ID, 5)
+	for i := range proven {
+		proven[i] = s.id()
+		s.Require().NoError(s.book.AddVerified(proven[i], addr(fmt.Sprintf("%d.1.1.1", i+1), 1), SourceInbound))
+		s.book.MarkDialed(proven[i])
+	}
+	for i := range 20 {
+		s.Require().NoError(s.book.AddVerified(s.id(), addr(fmt.Sprintf("%d.2.2.2", i+21), 1), SourceInbound))
+	}
+	s.clock = s.clock.Add(2 * time.Minute)
+
+	s.reactor.dialPeers()
+
+	s.Eventually(func() bool { return len(s.sw.dialedIDs()) == 3 }, time.Second, 5*time.Millisecond)
+	dialedProven := 0
+	for _, id := range s.sw.dialedIDs() {
+		if slices.Contains(proven, id) {
+			dialedProven++
+		}
+	}
+	s.Equal(2, dialedProven)
+	s.waitForDials()
+}
+
+func (s *reactorSuite) TestReserveDialForgetsExpiredGroups() {
+	s.reactor.groupDials["old"] = s.clock.Add(-groupDialInterval)
+
+	s.True(s.reactor.reserveDial(Entry{ip: net.ParseIP("1.1.1.1")}))
+
+	s.NotContains(s.reactor.groupDials, "old")
+	s.reactor.workers.Done()
+}
+
+func (s *reactorSuite) TestDialPeersSkippedGroupsDoNotCostASlot() {
+	for i := range 5 {
+		s.Run(fmt.Sprintf("shuffle %d", i), func() {
+			s.sw.outbound = 9
+			for port := 1; port <= 2; port++ {
+				s.Require().NoError(s.book.AddVerified(s.id(), addr("1.1.1.1", port), SourceInbound))
+			}
+			free := s.id()
+			s.Require().NoError(s.book.AddVerified(free, addr("2.2.2.2", 1), SourceInbound))
+			s.reactor.groupDials[ipGroup(net.ParseIP("1.1.1.1"))] = s.clock
+
+			s.reactor.dialPeers()
+
+			s.Eventually(func() bool { return slices.Equal(s.sw.dialedIDs(), []peer.ID{free}) }, time.Second, 5*time.Millisecond)
+			s.waitForDials()
+		})
+	}
+}
+
+func (s *reactorSuite) TestStopCancelsDials() {
+	s.reactor.dialEvery = 10 * time.Millisecond
+	id := s.id()
+	s.Require().NoError(s.book.AddVerified(id, addr("8.8.8.8", 1), SourceInbound))
+	started := make(chan struct{}, 1)
+	s.sw.dialFn = func(ctx context.Context, _ peer.AddrInfo) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	s.Require().NoError(s.reactor.Start())
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		s.FailNow("dial did not start")
+	}
+
+	s.Require().NoError(s.reactor.Stop())
+
+	e, _ := s.book.Get(id)
+	s.Zero(e.Attempts)
 }
 
 func (s *reactorSuite) TestStartWithUnreadableBook() {
@@ -653,10 +913,34 @@ func (s *reactorSuite) TestParseNetAddress() {
 type fakeSwitch struct {
 	p2p.Switcher
 
-	peers *p2p.PeerSet
+	peers    *p2p.PeerSet
+	outbound int
+	dialFn   func(ctx context.Context, addrInfo peer.AddrInfo) error
 
 	mu         sync.Mutex
 	stoppedIDs []p2p.ID
+	dialed     []peer.ID
+}
+
+func (sw *fakeSwitch) NumPeers() (int, int, int) { return sw.outbound, 0, 0 }
+
+func (sw *fakeSwitch) DialPeer(ctx context.Context, addrInfo peer.AddrInfo) error {
+	sw.mu.Lock()
+	sw.dialed = append(sw.dialed, addrInfo.ID)
+	sw.mu.Unlock()
+
+	if sw.dialFn == nil {
+		return nil
+	}
+
+	return sw.dialFn(ctx, addrInfo)
+}
+
+func (sw *fakeSwitch) dialedIDs() []peer.ID {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+
+	return slices.Clone(sw.dialed)
 }
 
 func (sw *fakeSwitch) Peers() p2p.IPeerSet { return sw.peers }
@@ -719,6 +1003,20 @@ func (p *fakePeer) sentMessages() []any {
 
 	return msgs
 }
+
+type fakeHost struct {
+	host.Host
+	net network.Network
+}
+
+func (h *fakeHost) Network() network.Network { return h.net }
+
+type fakeNetwork struct {
+	network.Network
+	conns map[peer.ID][]network.Conn
+}
+
+func (n *fakeNetwork) ConnsToPeer(id peer.ID) []network.Conn { return n.conns[id] }
 
 type fakeConn struct {
 	network.Conn

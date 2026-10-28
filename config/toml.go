@@ -407,7 +407,8 @@ max_peers = {{ .P2P.LibP2PConfig.Limits.MaxPeers }}
 # Maximum number of concurrent streams per peer (custom mode only)
 max_peer_streams = {{ .P2P.LibP2PConfig.Limits.MaxPeerStreams }}
 
-# Peer exchange (auto discovery). Gossips addresses; dialing them is not active yet.
+# Peer exchange (auto discovery). Dials discovered peers up to p2p.max_num_outbound_peers,
+# at most one per IP (IPv6 /64) per minute.
 # The address book follows p2p.addr_book_strict and p2p.allow_duplicate_ip.
 [p2p.libp2p.pex]
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +39,7 @@ type Switch struct {
 	metrics *p2p.Metrics
 
 	peerStoppingWait  time.Duration
+	dialGrace         time.Duration
 	reconcileInterval time.Duration
 	flaps             *flapBackoff
 
@@ -73,6 +75,23 @@ var ErrUnsupportedPeerFormat = errors.New("unsupported peer format")
 // ErrDropMessage lets a reactor's MsgBytesFilter drop a message without stopping the peer.
 var ErrDropMessage = errors.New("message dropped")
 
+// ErrDialBusy means the peer accepted a dial but dropped it or was removed while starting.
+var ErrDialBusy = errors.New("peer busy")
+
+// ErrPeerConnected means the peer is already connected, so dialing it would not prove the address.
+var ErrPeerConnected = errors.New("peer already connected")
+
+// ErrSwitchInactive means the switch is not accepting peers.
+var ErrSwitchInactive = errors.New("switch is not active")
+
+var errDialPanicked = errors.New("panic while adding dialed peer")
+
+const (
+	// defaultDialGrace is how long a dialed connection must stay up before the peer is added.
+	defaultDialGrace = time.Second
+	dialTimeout      = 10 * time.Second
+)
+
 // PeerMarker is implemented by reactors that keep peer reputation.
 type PeerMarker interface {
 	MarkPeerAsGood(p2p.Peer)
@@ -95,6 +114,7 @@ func NewSwitch(
 		metrics: metrics,
 
 		peerStoppingWait:  defaultPeerStoppingWait,
+		dialGrace:         defaultDialGrace,
 		reconcileInterval: defaultReconcileInterval,
 		flaps:             newFlapBackoff(time.Second, MaxReconnectBackoff, time.Minute),
 		disconnects:       newDisconnectQueue(),
@@ -343,14 +363,7 @@ func (s *Switch) onPeerRemoved(p *Peer, reason any) {
 		return
 	}
 
-	opts := PeerAddOptions{
-		Persistent:    p.IsPersistent(),
-		Unconditional: p.IsUnconditional(),
-		Private:       p.IsPrivate(),
-		OnBeforeStart: s.reactors.InitPeer,
-		OnAfterStart:  s.reactors.AddPeer,
-		OnStartFailed: s.reactors.RemovePeer,
-	}
+	opts := s.peerOpts(p.IsPrivate(), p.IsPersistent(), p.IsUnconditional())
 
 	var delay time.Duration
 	if connectionClosed {
@@ -572,14 +585,7 @@ func (s *Switch) resolvePeer(id peer.ID, connRemoteAddr ma.Multiaddr) (p2p.Peer,
 	}
 
 	// let's try to provision it
-	opts := PeerAddOptions{
-		Private:       isPrivate,
-		Persistent:    isPersistent,
-		Unconditional: isUnconditional,
-		OnBeforeStart: s.reactors.InitPeer,
-		OnAfterStart:  s.reactors.AddPeer,
-		OnStartFailed: s.reactors.RemovePeer,
-	}
+	opts := s.peerOpts(isPrivate, isPersistent, isUnconditional)
 
 	peer, err := s.addPeer(addrInfo, opts)
 	switch {
@@ -599,10 +605,14 @@ func (s *Switch) resolvePeer(id peer.ID, connRemoteAddr ma.Multiaddr) (p2p.Peer,
 }
 
 func (s *Switch) bootstrapPeerOpts(bp BootstrapPeer) PeerAddOptions {
+	return s.peerOpts(bp.Private, bp.Persistent, bp.Unconditional)
+}
+
+func (s *Switch) peerOpts(private, persistent, unconditional bool) PeerAddOptions {
 	return PeerAddOptions{
-		Private:       bp.Private,
-		Persistent:    bp.Persistent,
-		Unconditional: bp.Unconditional,
+		Private:       private,
+		Persistent:    persistent,
+		Unconditional: unconditional,
 		OnBeforeStart: s.reactors.InitPeer,
 		OnAfterStart:  s.reactors.AddPeer,
 		OnStartFailed: s.reactors.RemovePeer,
@@ -656,6 +666,76 @@ func (s *Switch) bootstrapPeer(ctx context.Context, addrInfo peer.AddrInfo, opts
 	go s.pingPeer(addrInfo)
 
 	return nil
+}
+
+// DialPeer connects to a discovered peer, bounded by dialTimeout, and adds it
+// as outbound once the connection survives the dial grace. It refuses peers
+// without an outbound connection, since Connect may return an inbound one.
+// Connect may dial other known addresses, so a nil error does not prove
+// addrInfo.Addrs are reachable. On failure it closes the outbound connections
+// it opened, which no peer owns.
+func (s *Switch) DialPeer(ctx context.Context, addrInfo peer.AddrInfo) (err error) {
+	switch {
+	case !s.isActive():
+		return ErrSwitchInactive
+	case s.host.Network().Connectedness(addrInfo.ID) == network.Connected:
+		return ErrPeerConnected
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			s.Logger.Error(
+				"Panic in (*lp2p.Switch).DialPeer",
+				"peer_id", addrInfo.ID.String(),
+				"panic", r,
+				"stack", string(debug.Stack()),
+			)
+			err = fmt.Errorf("%w: %v", errDialPanicked, r)
+		}
+		if err != nil {
+			s.closeOutboundConns(addrInfo.ID)
+		}
+	}()
+
+	connectCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	if err := s.host.Connect(connectCtx, addrInfo); err != nil {
+		return err
+	}
+
+	select {
+	case <-time.After(s.dialGrace):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	conns := s.host.Network().ConnsToPeer(addrInfo.ID)
+	switch {
+	case !s.isActive():
+		return ErrSwitchInactive
+	case len(conns) == 0:
+		return ErrDialBusy
+	case !slices.ContainsFunc(conns, isOutbound):
+		return ErrPeerConnected
+	}
+
+	_, err = s.addDialedPeer(addrInfo, s.peerOpts(false, false, false))
+	switch {
+	case errors.Is(err, ErrPeerExists):
+		return nil
+	case errors.Is(err, errPeerRemovedDuringStart):
+		return ErrDialBusy
+	default:
+		return err
+	}
+}
+
+func (s *Switch) closeOutboundConns(id peer.ID) {
+	for _, c := range s.host.Network().ConnsToPeer(id) {
+		if isOutbound(c) {
+			_ = c.Close()
+		}
+	}
 }
 
 func (s *Switch) addDialedPeer(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, error) {
@@ -801,4 +881,8 @@ func (s *Switch) pingPeer(addrInfo peer.AddrInfo) {
 
 func (s *Switch) isActive() bool {
 	return s.active.Load()
+}
+
+func isOutbound(c network.Conn) bool {
+	return c.Stat().Direction == network.DirOutbound
 }
