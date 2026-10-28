@@ -42,6 +42,8 @@
 
 ### FEATURES
 
+- `[lp2p]` cap inbound peers when peer exchange is enabled
+  ([\#88](https://github.com/crypto-org-chain/cometbft/pull/88))
 - `[lp2p]` refuse connections from banned peers
   ([\#87](https://github.com/crypto-org-chain/cometbft/pull/87))
 - `[lp2p]` dial peers found by peer exchange

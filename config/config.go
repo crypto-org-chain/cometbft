@@ -580,7 +580,8 @@ type P2PConfig struct {
 	// Set false for private or local networks
 	AddrBookStrict bool `mapstructure:"addr_book_strict"`
 
-	// Maximum number of inbound peers
+	// Maximum number of inbound peers.
+	// With libp2p, enforced only when PEX is enabled, and bootstrap peers are exempt.
 	MaxNumInboundPeers int `mapstructure:"max_num_inbound_peers"`
 
 	// Maximum number of outbound peers to connect to, excluding persistent peers

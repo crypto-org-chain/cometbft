@@ -219,8 +219,8 @@ func TestHost(t *testing.T) {
 func TestHostConnGater(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
 		// ARRANGE
-		cfg := config.DefaultP2PConfig().LibP2PConfig
-		cfg.Limits.Mode = config.LibP2PLimitsModeDefault
+		cfg := config.DefaultP2PConfig()
+		cfg.LibP2PConfig.Limits.Mode = config.LibP2PLimitsModeDefault
 
 		// ACT
 		connGater, enabled := ConnectionGaterFromConfig(cfg, nil)
@@ -232,8 +232,8 @@ func TestHostConnGater(t *testing.T) {
 
 	t.Run("disabled", func(t *testing.T) {
 		// ARRANGE
-		cfg := config.DefaultP2PConfig().LibP2PConfig
-		cfg.Limits.Mode = config.LibP2PLimitsModeDisabled
+		cfg := config.DefaultP2PConfig()
+		cfg.LibP2PConfig.Limits.Mode = config.LibP2PLimitsModeDisabled
 
 		// ACT
 		connGater, enabled := ConnectionGaterFromConfig(cfg, nil)
@@ -245,8 +245,8 @@ func TestHostConnGater(t *testing.T) {
 
 	t.Run("peer exchange", func(t *testing.T) {
 		// ARRANGE
-		cfg := config.DefaultP2PConfig().LibP2PConfig
-		cfg.PEX.Enabled = true
+		cfg := config.DefaultP2PConfig()
+		cfg.LibP2PConfig.PEX.Enabled = true
 
 		// ACT
 		connGater, enabled := ConnectionGaterFromConfig(cfg, nil)
@@ -254,6 +254,92 @@ func TestHostConnGater(t *testing.T) {
 		// ASSERT
 		require.True(t, enabled)
 		require.Zero(t, connGater.maxPeers)
+		require.True(t, connGater.limitInbound)
+		require.Equal(t, cfg.MaxNumInboundPeers, connGater.maxInbound)
+	})
+
+	t.Run("custom limits without peer exchange", func(t *testing.T) {
+		// ARRANGE
+		cfg := config.DefaultP2PConfig()
+		cfg.LibP2PConfig.Limits.Mode = config.LibP2PLimitsModeCustom
+		cfg.LibP2PConfig.Limits.MaxPeers = 10
+
+		// ACT
+		connGater, enabled := ConnectionGaterFromConfig(cfg, nil)
+
+		// ASSERT
+		require.True(t, enabled)
+		require.Equal(t, 10, connGater.maxPeers)
+		require.False(t, connGater.limitInbound)
+	})
+
+	t.Run("custom limits with peer exchange", func(t *testing.T) {
+		// ARRANGE
+		cfg := config.DefaultP2PConfig()
+		cfg.LibP2PConfig.Limits.Mode = config.LibP2PLimitsModeCustom
+		cfg.LibP2PConfig.Limits.MaxPeers = 100
+		cfg.LibP2PConfig.PEX.Enabled = true
+
+		// ACT
+		connGater, enabled := ConnectionGaterFromConfig(cfg, nil)
+
+		// ASSERT
+		require.True(t, enabled)
+		require.Equal(t, 100, connGater.maxPeers)
+		require.True(t, connGater.limitInbound)
+		require.Equal(t, cfg.MaxNumInboundPeers, connGater.maxInbound)
+	})
+
+	t.Run("inbound cap", func(t *testing.T) {
+		for _, tc := range []struct {
+			name           string
+			maxInbound     int
+			firstBootstrap bool
+			firstOutbound  bool
+			extraBootstrap bool
+			connected      bool
+		}{
+			{name: "rejects inbound peer beyond the cap", maxInbound: 1},
+			{name: "admits inbound bootstrap peer beyond the cap", maxInbound: 1, extraBootstrap: true, connected: true},
+			{name: "outbound peers take no inbound slot", maxInbound: 1, firstOutbound: true, connected: true},
+			{name: "bootstrap peers take no inbound slot", maxInbound: 1, firstBootstrap: true, connected: true},
+			{name: "zero cap rejects inbound peers", firstOutbound: true},
+			{name: "zero cap admits inbound bootstrap peers", firstOutbound: true, extraBootstrap: true, connected: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				// ARRANGE
+				ports := utils.GetFreePorts(t, 3)
+				first, extra := makeTestHost(t, ports[1]), makeTestHost(t, ports[2])
+
+				var bootstrapPeers []config.LibP2PBootstrapPeer
+				if tc.firstBootstrap {
+					bootstrapPeers = append(bootstrapPeers, config.LibP2PBootstrapPeer{Host: fmt.Sprintf("127.0.0.1:%d", ports[1]), ID: first.ID().String()})
+				}
+				if tc.extraBootstrap {
+					bootstrapPeers = append(bootstrapPeers, config.LibP2PBootstrapPeer{Host: fmt.Sprintf("127.0.0.1:%d", ports[2]), ID: extra.ID().String()})
+				}
+				h := makeTestHost(t, ports[0], withBootstrapPeers(bootstrapPeers), withMaxInboundPeers(tc.maxInbound), withModifiedConfig(func(cfg *config.LibP2PConfig) {
+					cfg.PEX.Enabled = true
+				}))
+				if tc.firstOutbound {
+					require.NoError(t, h.Connect(t.Context(), first.AddrInfo()))
+				} else {
+					require.NoError(t, first.Connect(t.Context(), h.AddrInfo()))
+				}
+				require.Eventually(t, func() bool { return len(h.Network().Peers()) == 1 }, 2*time.Second, 50*time.Millisecond)
+
+				// ACT
+				_ = extra.Connect(t.Context(), h.AddrInfo())
+
+				// ASSERT
+				isConnected := func() bool { return h.Network().Connectedness(extra.ID()) == network.Connected }
+				if tc.connected {
+					require.Eventually(t, isConnected, 2*time.Second, 50*time.Millisecond)
+					return
+				}
+				require.Never(t, isConnected, 500*time.Millisecond, 50*time.Millisecond)
+			})
+		}
 	})
 
 	t.Run("bans", func(t *testing.T) {
@@ -400,6 +486,38 @@ func TestHostConnGater(t *testing.T) {
 
 		require.True(t, cg.InterceptPeerDial(h.ID()))
 	})
+}
+
+func TestConnGaterInboundPeers(t *testing.T) {
+	ids := make([]peer.ID, 3)
+	for i := range ids {
+		id, err := IDFromPrivateKey(ed25519.GenPrivKey())
+		require.NoError(t, err)
+		ids[i] = id
+	}
+	in := func(i int) network.Conn { return &dirConn{id: ids[i], dir: network.DirInbound} }
+	out := func(i int) network.Conn { return &dirConn{id: ids[i], dir: network.DirOutbound} }
+
+	for _, tc := range []struct {
+		name     string
+		conns    []network.Conn
+		expected int
+	}{
+		{name: "no connections"},
+		{name: "inbound peers", conns: []network.Conn{in(0), in(1)}, expected: 2},
+		{name: "outbound peer", conns: []network.Conn{out(0)}},
+		{name: "peer with two inbound connections", conns: []network.Conn{in(0), in(0)}, expected: 1},
+		{name: "outbound then inbound connection", conns: []network.Conn{out(0), in(0)}},
+		{name: "inbound then outbound connection", conns: []network.Conn{in(0), out(0)}},
+		{name: "bootstrap peer", conns: []network.Conn{in(2)}},
+		{name: "mixed", conns: []network.Conn{in(0), out(1), in(1), in(2)}, expected: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cg := &ConnGater{bootstrapPeers: map[peer.ID]BootstrapPeer{ids[2]: {}}}
+
+			require.Equal(t, tc.expected, cg.inboundPeers(tc.conns))
+		})
+	}
 }
 
 func TestHostProtectsBootstrapPeers(t *testing.T) {
@@ -596,6 +714,7 @@ type testOpts struct {
 	bootstrapPeers []config.LibP2PBootstrapPeer
 	enableLogging  bool
 	modifyConfig   func(*config.LibP2PConfig)
+	maxInbound     *int
 }
 
 type testOption func(*testOpts)
@@ -614,6 +733,10 @@ func withPrivateKey(pk ed25519.PrivKey) testOption {
 
 func withModifiedConfig(modifier func(*config.LibP2PConfig)) testOption {
 	return func(opts *testOpts) { opts.modifyConfig = modifier }
+}
+
+func withMaxInboundPeers(n int) testOption {
+	return func(opts *testOpts) { opts.maxInbound = &n }
 }
 
 func makeTestHost(t *testing.T, port int, opts ...testOption) *Host {
@@ -637,6 +760,9 @@ func makeTestHost(t *testing.T, port int, opts ...testOption) *Host {
 
 	cfg.LibP2PConfig.Enabled = true
 	cfg.LibP2PConfig.BootstrapPeers = optsVal.bootstrapPeers
+	if optsVal.maxInbound != nil {
+		cfg.MaxNumInboundPeers = *optsVal.maxInbound
+	}
 	if optsVal.modifyConfig != nil {
 		optsVal.modifyConfig(&cfg.LibP2PConfig)
 	}
@@ -684,3 +810,16 @@ func makeTestHosts(t *testing.T, numHosts int, opts ...testOption) []*Host {
 type banList []peer.ID
 
 func (b banList) IsBanned(id peer.ID) bool { return slices.Contains(b, id) }
+
+type dirConn struct {
+	network.Conn
+
+	id  peer.ID
+	dir network.Direction
+}
+
+func (c *dirConn) RemotePeer() peer.ID { return c.id }
+
+func (c *dirConn) Stat() network.ConnStats {
+	return network.ConnStats{Stats: network.Stats{Direction: c.dir}}
+}
