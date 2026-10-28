@@ -42,6 +42,8 @@
 
 ### FEATURES
 
+- `[lp2p]` gossip peer addresses when peer exchange is enabled
+  ([\#85](https://github.com/crypto-org-chain/cometbft/pull/85))
 - `[lp2p]` add peer exchange reactor that gossips addresses
   ([\#84](https://github.com/crypto-org-chain/cometbft/pull/84))
 - `[lp2p]` add address book for peer exchange

@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -330,6 +331,47 @@ func TestP2PConfigValidateBasic(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestLibP2PPEXEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		libp2p, pex, expected bool
+	}{
+		{name: "libp2p and pex", libp2p: true, pex: true, expected: true},
+		{name: "libp2p only", libp2p: true},
+		{name: "pex only", pex: true},
+		{name: "neither"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.DefaultP2PConfig()
+			cfg.LibP2PConfig.Enabled = tc.libp2p
+			cfg.LibP2PConfig.PEX.Enabled = tc.pex
+
+			require.Equal(t, tc.expected, cfg.LibP2PPEXEnabled())
+		})
+	}
+}
+
+func TestLibP2PAddrBookFile(t *testing.T) {
+	root, absolute := t.TempDir(), filepath.Join(t.TempDir(), "book.json")
+
+	for _, tc := range []struct {
+		name     string
+		path     string
+		expected string
+	}{
+		{name: "relative to the root", path: filepath.Join("config", "book.json"), expected: filepath.Join(root, "config", "book.json")},
+		{name: "absolute", path: absolute, expected: absolute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.DefaultP2PConfig()
+			cfg.RootDir = root
+			cfg.LibP2PConfig.PEX.AddrBookFile = tc.path
+
+			require.Equal(t, tc.expected, cfg.LibP2PAddrBookFile())
+		})
+	}
 }
 
 func TestMempoolConfigValidateBasic(t *testing.T) {

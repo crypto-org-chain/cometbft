@@ -481,7 +481,7 @@ func NewNodeWithContext(
 
 	if config.P2P.PexReactor && !useCometNetworking {
 		config.P2P.PexReactor = false
-		logger.Info("PEX reactor is disabled when using go-libp2p transport")
+		logger.Info("Classic PEX reactor is disabled when using go-libp2p transport")
 	}
 
 	nodeInfo, err := makeNodeInfo(config, nodeKey, txIndexer, genDoc, state)
@@ -564,6 +564,15 @@ func NewNodeWithContext(
 		host, err := lp2p.NewHost(config.P2P, nodeKey.PrivKey, p2pLogger)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create libp2p host: %w", err)
+		}
+
+		if config.P2P.LibP2PPEXEnabled() {
+			pexReactor, _, err := createLibP2PPEXReactor(config.P2P, host, logger)
+			if err != nil {
+				_ = host.Close()
+				return nil, fmt.Errorf("unable to create libp2p pex reactor: %w", err)
+			}
+			reactors = append(reactors, lp2p.SwitchReactor{Name: "PEX", Reactor: pexReactor})
 		}
 
 		sw, err = lp2p.NewSwitch(nodeInfo, host, reactors, p2pMetrics, p2pLogger)
@@ -1134,7 +1143,7 @@ func makeNodeInfo(
 		},
 	}
 
-	if config.P2P.PexReactor {
+	if config.P2P.PexReactor || config.P2P.LibP2PPEXEnabled() {
 		nodeInfo.Channels = append(nodeInfo.Channels, pex.PexChannel)
 	}
 

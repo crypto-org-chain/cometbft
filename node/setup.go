@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,7 +24,10 @@ import (
 
 	cmtjson "github.com/cometbft/cometbft/libs/json"
 	"github.com/cometbft/cometbft/libs/log"
+	cmtos "github.com/cometbft/cometbft/libs/os"
 	"github.com/cometbft/cometbft/light"
+	"github.com/cometbft/cometbft/lp2p"
+	lp2ppex "github.com/cometbft/cometbft/lp2p/pex"
 	mempl "github.com/cometbft/cometbft/mempool"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/pex"
@@ -36,6 +40,7 @@ import (
 	"github.com/cometbft/cometbft/store"
 	"github.com/cometbft/cometbft/types"
 	"github.com/cometbft/cometbft/version"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	_ "github.com/lib/pq" // provide the psql db driver
 )
@@ -747,32 +752,75 @@ func createAndStartPrivValidatorSocketClient(
 	return pvscWithRetries, nil
 }
 
+func createLibP2PPEXReactor(
+	config *cfg.P2PConfig,
+	host *lp2p.Host,
+	logger log.Logger,
+) (*lp2ppex.Reactor, *lp2ppex.AddrBook, error) {
+	var reactor *lp2ppex.Reactor
+
+	bookCfg := lp2ppex.DefaultConfig()
+	bookCfg.Self = host.ID()
+	bookCfg.Strict = config.AddrBookStrict
+	bookCfg.AllowDuplicateIP = config.AllowDuplicateIP
+	bookCfg.Connected = func(id peer.ID) bool {
+		sw := reactor.Switch
+		return sw != nil && sw.Peers().Has(p2p.ID(id.String()))
+	}
+
+	for _, s := range config.LibP2PConfig.PrivatePeerIDs {
+		id, err := peer.Decode(s)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid p2p.libp2p.private_peer_ids entry %q: %w", s, err)
+		}
+		bookCfg.Private[id] = struct{}{}
+	}
+	for id, bp := range host.BootstrapPeers() {
+		bookCfg.Bootstrap[id] = struct{}{}
+		if bp.Private {
+			bookCfg.Private[id] = struct{}{}
+		}
+	}
+
+	path := config.LibP2PAddrBookFile()
+	if err := cmtos.EnsureDir(filepath.Dir(path), cfg.DefaultDirPerm); err != nil {
+		return nil, nil, err
+	}
+
+	book := lp2ppex.NewAddrBook(path, bookCfg)
+	reactor = lp2ppex.NewReactor(book, host)
+	reactor.SetLogger(logger.With("module", "pex"))
+
+	return reactor, book, nil
+}
+
 func warnUnsupportedLibP2PSettings(config *cfg.P2PConfig, logger log.Logger) {
-	lists := []struct {
-		name  string
-		value string
+	hasEntries := func(s string) bool { return len(splitAndTrimEmpty(s, ",", " ")) > 0 }
+	classicPrivate := hasEntries(config.PrivatePeerIDs)
+
+	settings := []struct {
+		name string
+		set  bool
 	}{
-		{name: "p2p.seeds", value: config.Seeds},
-		{name: "p2p.persistent_peers", value: config.PersistentPeers},
-		{name: "p2p.unconditional_peer_ids", value: config.UnconditionalPeerIDs},
-		{name: "p2p.private_peer_ids", value: config.PrivatePeerIDs},
+		{name: "p2p.seeds", set: hasEntries(config.Seeds)},
+		{name: "p2p.persistent_peers", set: hasEntries(config.PersistentPeers)},
+		{name: "p2p.unconditional_peer_ids", set: hasEntries(config.UnconditionalPeerIDs)},
+		{name: "p2p.private_peer_ids", set: classicPrivate},
+		{name: "p2p.seed_mode", set: config.SeedMode},
 	}
 
 	var unsupported []string
-	for _, list := range lists {
-		if len(splitAndTrimEmpty(list.value, ",", " ")) > 0 {
-			unsupported = append(unsupported, list.name)
+	for _, setting := range settings {
+		if setting.set {
+			unsupported = append(unsupported, setting.name)
 		}
-	}
-	if config.SeedMode {
-		unsupported = append(unsupported, "p2p.seed_mode")
-	}
-	if config.LibP2PConfig.PEX.Enabled {
-		unsupported = append(unsupported, "p2p.libp2p.pex.enabled")
 	}
 
 	if len(unsupported) > 0 {
 		logger.Warn("Settings not supported by the libp2p transport are ignored", "settings", unsupported)
+	}
+	if classicPrivate && config.LibP2PPEXEnabled() && len(config.LibP2PConfig.PrivatePeerIDs) == 0 {
+		logger.Warn("Use p2p.libp2p.private_peer_ids to keep peers private from libp2p peer exchange")
 	}
 }
 

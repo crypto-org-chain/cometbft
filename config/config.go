@@ -649,7 +649,7 @@ type LibP2PConfig struct {
 	// Limits configuration for libp2p resource manager.
 	Limits LibP2PLimits `mapstructure:"limits"`
 
-	// PrivatePeerIDs peer IDs that are never gossiped or stored
+	// PrivatePeerIDs peer IDs that peer exchange never asks, gossips or stores
 	PrivatePeerIDs []string `mapstructure:"private_peer_ids"`
 
 	// PEX peer exchange (auto discovery) configuration
@@ -760,6 +760,11 @@ func (cfg *P2PConfig) AddrBookFile() string {
 	return rootify(cfg.AddrBook, cfg.RootDir)
 }
 
+// LibP2PAddrBookFile returns the full path to the libp2p peer exchange address book.
+func (cfg *P2PConfig) LibP2PAddrBookFile() string {
+	return rootify(cfg.LibP2PConfig.PEX.AddrBookFile, cfg.RootDir)
+}
+
 // ValidateBasic performs basic validation (checking param bounds, etc.) and
 // returns an error if any check fails.
 func (cfg *P2PConfig) ValidateBasic() error {
@@ -806,6 +811,11 @@ func (cfg *P2PConfig) ValidateBasic() error {
 
 func (cfg *P2PConfig) LibP2PEnabled() bool {
 	return cfg.LibP2PConfig.Enabled
+}
+
+// LibP2PPEXEnabled reports whether libp2p peer exchange runs.
+func (cfg *P2PConfig) LibP2PPEXEnabled() bool {
+	return cfg.LibP2PEnabled() && cfg.LibP2PConfig.PEX.Enabled
 }
 
 func DefaultLibP2PConfig() LibP2PConfig {

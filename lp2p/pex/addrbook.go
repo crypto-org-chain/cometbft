@@ -61,7 +61,8 @@ var (
 	ErrBookFull       = errors.New("address book is full")
 )
 
-// Config sets the address book limits and the peers it never stores.
+// Config sets the address book limits. Private peers are never stored, banned
+// or accepted as gossip origins; bootstrap peers are never stored or banned.
 // Start from DefaultConfig: zero limits are not treated as unlimited.
 type Config struct {
 	Self      peer.ID
@@ -163,6 +164,9 @@ func (b *AddrBook) AddGossiped(id peer.ID, addr ma.Multiaddr, origin peer.ID) er
 
 	if !validID(origin) {
 		return ErrInvalidSource
+	}
+	if contains(b.cfg.Private, origin) {
+		return ErrPrivate
 	}
 	if b.isBanned(origin) {
 		return ErrBanned
@@ -313,7 +317,7 @@ func (b *AddrBook) InCooldown(id peer.ID) bool {
 }
 
 // Ban removes the peer and, while MaxBans allows, refuses it until the given
-// time. A ban is only ever extended. Bootstrap peers are never banned.
+// time. A ban is only ever extended. Bootstrap and private peers are never banned.
 func (b *AddrBook) Ban(id peer.ID, until time.Time) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -410,7 +414,7 @@ func (b *AddrBook) load(e *Entry) {
 
 	switch e.Source {
 	case SourceGossip:
-		if !validID(e.Origin) || b.countOrigin(e.Origin) >= b.cfg.MaxPerOrigin {
+		if !validID(e.Origin) || contains(b.cfg.Private, e.Origin) || b.countOrigin(e.Origin) >= b.cfg.MaxPerOrigin {
 			return
 		}
 	case SourceInbound, SourceDialed:
@@ -676,7 +680,7 @@ func (b *AddrBook) isBanned(id peer.ID) bool {
 // addBan keeps the longest ban per peer. At MaxBans the earliest-expiring ban
 // gives way, unless the new one would expire first.
 func (b *AddrBook) addBan(id peer.ID, until time.Time) {
-	if !validID(id) || contains(b.cfg.Bootstrap, id) || !until.After(b.now()) {
+	if !validID(id) || contains(b.cfg.Bootstrap, id) || contains(b.cfg.Private, id) || !until.After(b.now()) {
 		return
 	}
 	until = clampTime(until)

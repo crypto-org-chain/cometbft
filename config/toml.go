@@ -353,7 +353,7 @@ bootstrap_peers = [{{ range $bps }}
 ]
 {{- end }}
 
-# List of peer IDs that peer exchange never gossips or stores (peer exchange is not active yet).
+# List of peer IDs that peer exchange never asks, gossips or stores.
 # Unlike p2p.private_peer_ids, this is a list, not a comma-separated string.
 private_peer_ids = [{{ range $i, $id := .P2P.LibP2PConfig.PrivatePeerIDs }}{{ if $i }}, {{ end }}"{{ js $id }}"{{ end }}]
 
@@ -407,12 +407,13 @@ max_peers = {{ .P2P.LibP2PConfig.Limits.MaxPeers }}
 # Maximum number of concurrent streams per peer (custom mode only)
 max_peer_streams = {{ .P2P.LibP2PConfig.Limits.MaxPeerStreams }}
 
-# Peer exchange (auto discovery). Not active yet.
+# Peer exchange (auto discovery). Gossips addresses; dialing them is not active yet.
+# The address book follows p2p.addr_book_strict and p2p.allow_duplicate_ip.
 [p2p.libp2p.pex]
 
 enabled = {{ .P2P.LibP2PConfig.PEX.Enabled }}
 
-# Path to the address book
+# Path to the address book, relative to the home directory unless absolute
 addr_book_file = "{{ js .P2P.LibP2PConfig.PEX.AddrBookFile }}"
 
 #######################################################
