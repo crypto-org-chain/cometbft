@@ -8,6 +8,8 @@
 
 ### BUG FIXES
 
+- `[lp2p]` never gate or trim bootstrap peers
+  ([\#82](https://github.com/crypto-org-chain/cometbft/pull/82))
 - `[lp2p]` run one reconnect loop per peer
   ([\#80](https://github.com/crypto-org-chain/cometbft/pull/80))
 - `[lp2p]` remove peers when their connection closes

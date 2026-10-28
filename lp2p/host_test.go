@@ -241,63 +241,111 @@ func TestHostConnGater(t *testing.T) {
 		require.False(t, enabled)
 	})
 
-	t.Run("rejectThirdPeer", func(t *testing.T) {
-		// ARRANGE
-		const (
-			waitTimeout  = 2 * time.Second
-			waitInterval = 50 * time.Millisecond
-		)
+	t.Run("maxPeers", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			bootstrap bool
+			outbound  bool
+			connected bool
+		}{
+			{name: "rejects inbound peer"},
+			{name: "rejects outbound peer", outbound: true},
+			{name: "admits inbound bootstrap peer", bootstrap: true, connected: true},
+			{name: "admits outbound bootstrap peer", bootstrap: true, outbound: true, connected: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				// ARRANGE
+				ctx := context.Background()
+				ports := utils.GetFreePorts(t, 4)
+				extra := makeTestHost(t, ports[3])
 
-		var (
-			ctx   = context.Background()
-			ports = utils.GetFreePorts(t, 4)
-			cfg1  = func(cfg *config.LibP2PConfig) {
-				cfg.Limits.Mode = config.LibP2PLimitsModeCustom
-				cfg.Limits.MaxPeers = 2
-				cfg.Limits.MaxPeerStreams = 2
-			}
+				var bootstrapPeers []config.LibP2PBootstrapPeer
+				if tc.bootstrap {
+					bootstrapPeers = []config.LibP2PBootstrapPeer{{
+						Host: fmt.Sprintf("127.0.0.1:%d", ports[3]),
+						ID:   extra.ID().String(),
+					}}
+				}
 
-			// given 4 hosts, and host1 has custom max peers config
-			host1 = makeTestHost(t, ports[0], withLogging(), withModifiedConfig(cfg1))
-			host2 = makeTestHost(t, ports[1], withLogging())
-			host3 = makeTestHost(t, ports[2], withLogging())
-			host4 = makeTestHost(t, ports[3], withLogging())
+				// given host1 that is full with host2 and host3
+				host1 := makeTestHost(t, ports[0], withBootstrapPeers(bootstrapPeers), withModifiedConfig(func(cfg *config.LibP2PConfig) {
+					cfg.Limits.Mode = config.LibP2PLimitsModeCustom
+					cfg.Limits.MaxPeers = 2
+					cfg.Limits.MaxPeerStreams = 2
+				}))
+				for _, port := range ports[1:3] {
+					require.NoError(t, makeTestHost(t, port).Connect(ctx, host1.AddrInfo()))
+				}
+				require.Eventually(t, func() bool { return len(host1.Network().Peers()) == 2 }, 2*time.Second, 50*time.Millisecond)
 
-			network1 = host1.Network()
-		)
+				// ACT
+				// an inbound connect may return nil before host1 closes the connection
+				if tc.outbound {
+					_ = host1.Connect(ctx, extra.AddrInfo())
+				} else {
+					_ = extra.Connect(ctx, host1.AddrInfo())
+				}
 
-		require.NoError(t, host2.Connect(ctx, host1.AddrInfo()))
-		require.NoError(t, host3.Connect(ctx, host1.AddrInfo()))
-
-		require.Eventually(t, func() bool {
-			return network1.Connectedness(host2.ID()) == network.Connected &&
-				network1.Connectedness(host3.ID()) == network.Connected
-		}, waitTimeout, waitInterval)
-
-		// ACT
-		// try to connect host4->host1
-		// note the err is most likely nil because the connection is established, but will be quickly rejected.
-		_ = host4.Connect(ctx, host1.AddrInfo())
-
-		// ASSERT
-		checkNotConnected := func() bool {
-			return network1.Connectedness(host4.ID()) == network.NotConnected && len(network1.Peers()) == 2
+				// ASSERT
+				isConnected := func() bool { return host1.Network().Connectedness(extra.ID()) == network.Connected }
+				if tc.connected {
+					require.Eventually(t, isConnected, 2*time.Second, 50*time.Millisecond)
+					require.Len(t, host1.Network().Peers(), 3)
+					return
+				}
+				require.Never(t, isConnected, 500*time.Millisecond, 50*time.Millisecond)
+				require.Len(t, host1.Network().Peers(), 2)
+			})
 		}
-
-		require.Eventually(t, checkNotConnected, waitTimeout, waitInterval)
-		require.ElementsMatch(t, []peer.ID{host2.ID(), host3.ID()}, host1.Network().Peers())
 	})
 
-	t.Run("rejectWhenHostNil", func(t *testing.T) {
-		// ConnGater rejects all connections when host is not yet set (allowMorePeers returns false)
-		cg := &ConnGater{host: nil, maxPeers: 10}
+	t.Run("hostNotSet", func(t *testing.T) {
+		bootstrapID, err := IDFromPrivateKey(ed25519.GenPrivKey())
+		require.NoError(t, err)
+		cg := &ConnGater{maxPeers: 10, bootstrapPeers: map[peer.ID]BootstrapPeer{bootstrapID: {}}}
 		addr, err := ma.NewMultiaddr("/ip4/127.0.0.1/udp/26656/quic-v1")
 		require.NoError(t, err)
 		cm := &connMultiaddrsMock{local: addr, remote: addr}
-		require.False(t, cg.InterceptAccept(cm))
+
+		require.False(t, cg.InterceptSecured(network.DirInbound, peer.ID(""), cm))
 		require.False(t, cg.InterceptAddrDial(peer.ID(""), addr))
 		require.False(t, cg.InterceptPeerDial(peer.ID("")))
+		require.True(t, cg.InterceptSecured(network.DirInbound, bootstrapID, cm))
+		require.True(t, cg.InterceptPeerDial(bootstrapID))
+		require.True(t, cg.InterceptAddrDial(bootstrapID, addr))
+		require.True(t, cg.InterceptAccept(cm))
+		require.True(t, cg.InterceptSecured(network.DirOutbound, peer.ID(""), cm))
 	})
+
+	t.Run("setHostWhileIntercepting", func(t *testing.T) {
+		cg := &ConnGater{maxPeers: 10}
+		h := makeTestHosts(t, 1)[0]
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			cg.SetHost(h)
+		}()
+		_ = cg.InterceptPeerDial(h.ID())
+		<-done
+
+		require.True(t, cg.InterceptPeerDial(h.ID()))
+	})
+}
+
+func TestHostProtectsBootstrapPeers(t *testing.T) {
+	ports := utils.GetFreePorts(t, 2)
+	bootstrap := makeTestHost(t, ports[1])
+
+	h := makeTestHost(t, ports[0], withBootstrapPeers([]config.LibP2PBootstrapPeer{{
+		Host: fmt.Sprintf("127.0.0.1:%d", ports[1]),
+		ID:   bootstrap.ID().String(),
+	}}))
+
+	require.True(t, h.ConnManager().IsProtected(bootstrap.ID(), connMgrBootstrapTag))
+	other, err := IDFromPrivateKey(ed25519.GenPrivKey())
+	require.NoError(t, err)
+	require.False(t, h.ConnManager().IsProtected(other, ""))
 }
 
 func TestResourceManager(t *testing.T) {
