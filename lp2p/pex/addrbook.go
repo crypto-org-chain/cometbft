@@ -1,4 +1,4 @@
-// Package pex provides the address book for libp2p peer exchange.
+// Package pex provides the address book and reactor for libp2p peer exchange.
 package pex
 
 import (
@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math/rand/v2"
 	"net"
 	"os"
 	"slices"
@@ -20,6 +21,9 @@ import (
 )
 
 const bookVersion = 2
+
+// maxIDBytes bounds raw peer IDs; real ones are at most 39 bytes.
+const maxIDBytes = 64
 
 const (
 	retriesBeforeBad  = 3
@@ -160,6 +164,9 @@ func (b *AddrBook) AddGossiped(id peer.ID, addr ma.Multiaddr, origin peer.ID) er
 	if !validID(origin) {
 		return ErrInvalidSource
 	}
+	if b.isBanned(origin) {
+		return ErrBanned
+	}
 
 	ip, err := b.admit(id, addr)
 	if err != nil {
@@ -229,6 +236,31 @@ func (b *AddrBook) Get(id peer.ID) (Entry, bool) {
 	}
 
 	return *e, true
+}
+
+// Gossipable returns up to n random entries that are safe to share: verified
+// addresses and gossip we dialed that are not bad, never the excluded peer.
+func (b *AddrBook) Gossipable(exclude peer.ID, n int) []Entry {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := b.now()
+	candidates := make([]*Entry, 0, len(b.entries))
+	for id, e := range b.entries {
+		if rank, _ := b.rank(e, now); id != exclude && rank != rankBad && rank != rankUnprovenGossip {
+			candidates = append(candidates, e)
+		}
+	}
+
+	n = max(0, min(n, len(candidates)))
+	entries := make([]Entry, n)
+	for i := range n {
+		j := i + rand.IntN(len(candidates)-i)
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+		entries[i] = *candidates[i]
+	}
+
+	return entries
 }
 
 // Size returns the number of stored peers.
@@ -744,8 +776,13 @@ func latest(a, b time.Time) time.Time {
 	return b
 }
 
-// validID accepts only IDs that survive a text round trip, so Save output stays loadable.
+// validID accepts only short IDs that survive a text round trip, so Save output
+// stays loadable and decoding stays cheap.
 func validID(id peer.ID) bool {
+	if len(id) > maxIDBytes {
+		return false
+	}
+
 	decoded, err := peer.Decode(id.String())
 	return err == nil && decoded == id
 }

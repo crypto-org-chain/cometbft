@@ -65,6 +65,16 @@ func sha1PeerID() peer.ID {
 	return peer.ID(append([]byte{0x11, 20}, make([]byte, 20)...))
 }
 
+// identityPeerID is a valid identity peer ID of 2+digest raw bytes.
+func identityPeerID(digest int) peer.ID {
+	return peer.ID(append([]byte{0x00, byte(digest)}, make([]byte, digest)...))
+}
+
+// hugePeerID is a valid identity peer ID far longer than any real one.
+func hugePeerID() peer.ID {
+	return peer.ID(append([]byte{0x00, 0xc8, 0x01}, make([]byte, 200)...))
+}
+
 func addr(ip string, port int) ma.Multiaddr {
 	proto := "ip4"
 	if strings.Contains(ip, ":") {
@@ -88,6 +98,9 @@ func (s *addrBookSuite) TestAdmission() {
 		{name: "invalid peer ID", id: peer.ID("abc"), addr: addr("8.8.8.8", 26656), strict: true, expected: ErrInvalidID},
 		{name: "empty peer ID", id: "", addr: addr("8.8.8.8", 26656), strict: true, expected: ErrInvalidID},
 		{name: "peer ID without a text form", id: sha1PeerID(), addr: addr("8.8.8.8", 26656), strict: true, expected: ErrInvalidID},
+		{name: "oversized peer ID", id: hugePeerID(), addr: addr("8.8.8.8", 26656), strict: true, expected: ErrInvalidID},
+		{name: "peer ID at the size limit", id: identityPeerID(maxIDBytes - 2), addr: addr("8.8.8.8", 26656), strict: true},
+		{name: "peer ID over the size limit", id: identityPeerID(maxIDBytes - 1), addr: addr("8.8.8.8", 26656), strict: true, expected: ErrInvalidID},
 		{name: "self", id: self, addr: addr("8.8.8.8", 26656), strict: true, expected: ErrSelf},
 		{name: "private peer", id: private, addr: addr("8.8.8.8", 26656), strict: true, expected: ErrPrivate},
 		{name: "bootstrap peer", id: bootstrap, addr: addr("8.8.8.8", 26656), strict: true, expected: ErrBootstrap},
@@ -141,6 +154,10 @@ func (s *addrBookSuite) TestRejectsInvalidSource() {
 	s.Require().ErrorIs(b.AddGossiped(s.id(), addr("8.8.8.8", 1), ""), ErrInvalidSource)
 	s.Require().ErrorIs(b.AddGossiped(s.id(), addr("8.8.8.8", 1), peer.ID("zz")), ErrInvalidSource)
 	s.Require().ErrorIs(b.AddGossiped(s.id(), addr("8.8.8.8", 1), sha1PeerID()), ErrInvalidSource)
+
+	banned := s.id()
+	b.Ban(banned, s.clock.Add(time.Hour))
+	s.Require().ErrorIs(b.AddGossiped(s.id(), addr("8.8.8.8", 1), banned), ErrBanned)
 	s.Zero(b.Size())
 }
 
@@ -732,6 +749,41 @@ func (s *addrBookSuite) TestDialBookkeeping() {
 	s.True(b.InCooldown(id))
 	s.clock = s.clock.Add(time.Minute)
 	s.False(b.InCooldown(id))
+}
+
+func (s *addrBookSuite) TestGossipable() {
+	b := s.newBook(nil)
+	requester, verified, dialed, unproven, bad := s.id(), s.id(), s.id(), s.id(), s.id()
+	s.Require().NoError(b.AddVerified(requester, addr("1.1.1.1", 1), SourceInbound))
+	s.Require().NoError(b.AddVerified(verified, addr("2.2.2.2", 1), SourceInbound))
+	s.Require().NoError(b.AddGossiped(dialed, addr("3.3.3.3", 1), s.id()))
+	b.MarkDialed(dialed)
+	s.Require().NoError(b.AddGossiped(unproven, addr("4.4.4.4", 1), s.id()))
+	s.Require().NoError(b.AddVerified(bad, addr("5.5.5.5", 1), SourceInbound))
+	s.markAttempts(b, bad, 3)
+	s.clock = s.clock.Add(2 * recentAttempt)
+
+	testCases := []struct {
+		name     string
+		n        int
+		expected int
+	}{
+		{name: "all shareable entries", n: 10, expected: 2},
+		{name: "capped", n: 1, expected: 1},
+		{name: "none", n: 0},
+		{name: "negative", n: -1},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			got := b.Gossipable(requester, tc.n)
+
+			s.Len(got, tc.expected)
+			for _, e := range got {
+				s.Contains([]peer.ID{verified, dialed}, e.ID)
+			}
+		})
+	}
 }
 
 func (s *addrBookSuite) TestNeedMoreAddrs() {
