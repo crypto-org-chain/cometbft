@@ -89,7 +89,7 @@ func NewHost(config *config.P2PConfig, nodeKey cmcrypto.PrivKey, logger log.Logg
 	}
 
 	// host will be set later
-	connGater, connGaterEnabled := ConnectionGaterFromConfig(config.LibP2PConfig, bootstrapPeers)
+	connGater, connGaterEnabled := ConnectionGaterFromConfig(config, bootstrapPeers)
 
 	resourceManager, _, err := ResourceManagerFromConfig(config.LibP2PConfig)
 	if err != nil {
@@ -278,8 +278,10 @@ func ResourceManagerFromConfig(cfg config.LibP2PConfig) (network.ResourceManager
 	return nil, nil, fmt.Errorf("unknown limits mode: %q", cfg.Limits.Mode)
 }
 
-// ConnGater refuses banned peers and, when `lp2p.limits.mode = "custom"`,
-// peers beyond `lp2p.limits.max_peers`. Bootstrap peers are never gated.
+// ConnGater refuses banned peers, inbound peers beyond
+// `p2p.max_num_inbound_peers` when PEX is enabled, and, when
+// `lp2p.limits.mode = "custom"`, peers beyond `lp2p.limits.max_peers`.
+// Bootstrap peers are never gated.
 //
 // The host is injected after host creation because libp2p requires the
 // connection gater option during `libp2p.New(...)`, before the host exists.
@@ -287,6 +289,8 @@ type ConnGater struct {
 	host           atomic.Pointer[Host]
 	bans           atomic.Pointer[banChecker]
 	maxPeers       int // 0 means no cap
+	limitInbound   bool
+	maxInbound     int // with limitInbound, 0 refuses all non-bootstrap inbound peers
 	bootstrapPeers map[peer.ID]BootstrapPeer
 }
 
@@ -295,15 +299,20 @@ type banChecker struct{ BanChecker }
 var _ connmgr.ConnectionGater = (*ConnGater)(nil)
 
 // ConnectionGaterFromConfig creates a connection gater from the given config or returns false if disabled.
-func ConnectionGaterFromConfig(cfg config.LibP2PConfig, bootstrapPeers map[peer.ID]BootstrapPeer) (*ConnGater, bool) {
-	custom := cfg.Limits.Mode == config.LibP2PLimitsModeCustom
-	if !custom && !cfg.PEX.Enabled {
+func ConnectionGaterFromConfig(cfg *config.P2PConfig, bootstrapPeers map[peer.ID]BootstrapPeer) (*ConnGater, bool) {
+	custom := cfg.LibP2PConfig.Limits.Mode == config.LibP2PLimitsModeCustom
+	pex := cfg.LibP2PConfig.PEX.Enabled
+	if !custom && !pex {
 		return nil, false
 	}
 
 	gater := &ConnGater{bootstrapPeers: bootstrapPeers}
 	if custom {
-		gater.maxPeers = cfg.Limits.MaxPeers
+		gater.maxPeers = cfg.LibP2PConfig.Limits.MaxPeers
+	}
+	if pex {
+		gater.limitInbound = true
+		gater.maxInbound = cfg.MaxNumInboundPeers
 	}
 
 	return gater, true
@@ -320,11 +329,11 @@ func (c *ConnGater) InterceptAccept(network.ConnMultiaddrs) bool {
 }
 
 func (c *ConnGater) InterceptAddrDial(pid peer.ID, _ multiaddr.Multiaddr) bool {
-	return c.allowPeer(pid, "InterceptAddrDial")
+	return c.allowPeer(pid, "InterceptAddrDial", false)
 }
 
 func (c *ConnGater) InterceptPeerDial(pid peer.ID) bool {
-	return c.allowPeer(pid, "InterceptPeerDial")
+	return c.allowPeer(pid, "InterceptPeerDial", false)
 }
 
 // InterceptSecured gates inbound connections.
@@ -334,14 +343,14 @@ func (c *ConnGater) InterceptSecured(dir network.Direction, pid peer.ID, _ netwo
 		return true
 	}
 
-	return c.allowPeer(pid, "InterceptSecured")
+	return c.allowPeer(pid, "InterceptSecured", true)
 }
 
 func (c *ConnGater) InterceptUpgraded(network.Conn) (allow bool, reason control.DisconnectReason) {
 	return true, 0
 }
 
-func (c *ConnGater) allowPeer(pid peer.ID, caller string) bool {
+func (c *ConnGater) allowPeer(pid peer.ID, caller string, inbound bool) bool {
 	if _, ok := c.bootstrapPeers[pid]; ok {
 		return true
 	}
@@ -353,6 +362,11 @@ func (c *ConnGater) allowPeer(pid peer.ID, caller string) bool {
 
 	if bans := c.bans.Load(); bans != nil && bans.IsBanned(pid) {
 		h.logger.Debug("Rejecting banned peer", "caller", caller, "peer_id", pid.String())
+		return false
+	}
+
+	if inbound && !c.allowInbound(h) {
+		h.logger.Debug("Rejecting peer due to max inbound peers limit", "caller", caller, "peer_id", pid.String(), "max_inbound_peers", c.maxInbound)
 		return false
 	}
 
@@ -374,4 +388,26 @@ func (c *ConnGater) allowPeer(pid peer.ID, caller string) bool {
 	)
 
 	return false
+}
+
+func (c *ConnGater) allowInbound(h *Host) bool {
+	return !c.limitInbound || (c.maxInbound > 0 && c.inboundPeers(h.Network().Conns()) < c.maxInbound)
+}
+
+// Neither a bootstrap peer nor a peer we dialed takes an inbound slot.
+func (c *ConnGater) inboundPeers(conns []network.Conn) int {
+	hasOutbound := make(map[peer.ID]bool)
+	for _, conn := range conns {
+		id := conn.RemotePeer()
+		hasOutbound[id] = hasOutbound[id] || isOutbound(conn)
+	}
+
+	inbound := 0
+	for id, out := range hasOutbound {
+		if _, bootstrap := c.bootstrapPeers[id]; !out && !bootstrap {
+			inbound++
+		}
+	}
+
+	return inbound
 }

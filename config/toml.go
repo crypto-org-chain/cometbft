@@ -292,7 +292,8 @@ addr_book_file = "{{ js .P2P.AddrBook }}"
 # Set false for private or local networks
 addr_book_strict = {{ .P2P.AddrBookStrict }}
 
-# Maximum number of inbound peers
+# Maximum number of inbound peers.
+# With libp2p, enforced only when p2p.libp2p.pex.enabled, and bootstrap peers are exempt.
 max_num_inbound_peers = {{ .P2P.MaxNumInboundPeers }}
 
 # Maximum number of outbound peers to connect to, excluding persistent peers
@@ -408,7 +409,8 @@ max_peers = {{ .P2P.LibP2PConfig.Limits.MaxPeers }}
 max_peer_streams = {{ .P2P.LibP2PConfig.Limits.MaxPeerStreams }}
 
 # Peer exchange (auto discovery). Dials discovered peers up to p2p.max_num_outbound_peers,
-# at most one per IP (IPv6 /64) per minute.
+# at most one per IP (IPv6 /64) per minute, and caps inbound peers other than bootstrap peers
+# at p2p.max_num_inbound_peers.
 # The address book follows p2p.addr_book_strict and p2p.allow_duplicate_ip.
 [p2p.libp2p.pex]
 
