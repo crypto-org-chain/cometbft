@@ -715,6 +715,7 @@ type LibP2PLimits struct {
 	// Mode controls how limits are configured: disabled, default or custom (see below).
 	Mode string `mapstructure:"mode"`
 	// MaxPeers caps the number of simultaneously connected peers. Only used when mode is custom.
+	// Bootstrap peers are always admitted and count toward this limit.
 	MaxPeers int `mapstructure:"max_peers"`
 	// MaxPeerStreams caps the number of concurrent streams per peer. Only used when mode is custom.
 	MaxPeerStreams int `mapstructure:"max_peer_streams"`

@@ -400,7 +400,8 @@ threshold_latency = "{{ .ThresholdLatency }}"
 #   Use when you need tighter control over peer count and stream concurrency.
 mode = "{{ .P2P.LibP2PConfig.Limits.Mode }}"
 
-# Maximum number of peers (custom mode only)
+# Maximum number of peers (custom mode only).
+# Bootstrap peers are always admitted and count toward this limit.
 max_peers = {{ .P2P.LibP2PConfig.Limits.MaxPeers }}
 
 # Maximum number of concurrent streams per peer (custom mode only)
