@@ -141,8 +141,14 @@ func goroutineStacks() string {
 func (s *disconnectSuite) TestConnectionReopenedDuringRemovalStaysOpen() {
 	sw, other, reactor, _ := s.newSwitch(time.Hour, nil)
 
+	reconnected := make(chan struct{})
 	reactor.onRemovePeer = func(p2p.Peer) {
-		_ = other.Connect(context.Background(), sw.host.AddrInfo())
+		defer close(reconnected)
+		// Connect returns early while other still sees the closing connection.
+		s.Eventually(func() bool {
+			return other.Network().Connectedness(sw.host.ID()) != network.Connected
+		}, 5*time.Second, 5*time.Millisecond)
+		s.NoError(other.Connect(context.Background(), sw.host.AddrInfo()))
 	}
 
 	_, err := sw.peerSet.Add(other.AddrInfo(), reactorOpts(sw))
@@ -150,7 +156,11 @@ func (s *disconnectSuite) TestConnectionReopenedDuringRemovalStaysOpen() {
 
 	s.Require().NoError(other.Network().ClosePeer(sw.host.ID()))
 
-	s.Eventually(func() bool { return len(reactor.peerEvents()) == 3 }, 5*time.Second, 20*time.Millisecond)
+	select {
+	case <-reconnected:
+	case <-time.After(5 * time.Second):
+		s.FailNow("peer was not removed")
+	}
 	s.Never(func() bool {
 		return sw.host.Network().Connectedness(other.ID()) != network.Connected
 	}, 300*time.Millisecond, 50*time.Millisecond)
