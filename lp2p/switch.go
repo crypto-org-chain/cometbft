@@ -206,16 +206,18 @@ func (s *Switch) Peers() p2p.IPeerSet {
 }
 
 func (s *Switch) NumPeers() (outbound, inbound, dialing int) {
-	for _, c := range s.host.Network().Conns() {
-		switch c.Stat().Direction {
-		case network.DirInbound:
-			inbound++
-		case network.DirOutbound:
-			outbound++
+	s.peerSet.ForEach(func(p p2p.Peer) {
+		if p.(*Peer).IsUnconditional() {
+			return
 		}
-	}
 
-	// todo note we don't count dialing peers here
+		if p.IsOutbound() {
+			outbound++
+			return
+		}
+
+		inbound++
+	})
 
 	return outbound, inbound, dialing
 }
@@ -556,7 +558,7 @@ func (s *Switch) bootstrapPeer(ctx context.Context, addrInfo peer.AddrInfo, opts
 		return errors.Wrap(err, "unable to connect to peer")
 	}
 
-	if _, err := s.peerSet.Add(addrInfo, opts); err != nil {
+	if _, err := s.addDialedPeer(addrInfo, opts); err != nil {
 		return errors.Wrap(err, "unable to add peer")
 	}
 
@@ -577,6 +579,12 @@ func (s *Switch) bootstrapPeer(ctx context.Context, addrInfo peer.AddrInfo, opts
 	go s.pingPeer(addrInfo)
 
 	return nil
+}
+
+func (s *Switch) addDialedPeer(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, error) {
+	opts.Outbound = true
+
+	return s.peerSet.Add(addrInfo, opts)
 }
 
 // reconnectPeer reconnects persistent peers back to the host.
@@ -632,7 +640,7 @@ func (s *Switch) reconnectPeer(addrInfo peer.AddrInfo, backoffMax time.Duration,
 		}
 
 		// 2. add peer to the peer set
-		_, err := s.peerSet.Add(addrInfo, opts)
+		_, err := s.addDialedPeer(addrInfo, opts)
 		if err != nil && !errors.Is(err, ErrPeerExists) {
 			s.Logger.Error(
 				"Failed to add peer after reconnection",

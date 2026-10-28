@@ -24,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 )
 
 func TestSwitch(t *testing.T) {
@@ -624,12 +625,11 @@ func TestSwitch(t *testing.T) {
 			return switchA.Peers().Size() == 1
 		}, time.Second, 20*time.Millisecond, "A should see B as peer")
 
-		// Pre-condition: B's peerstore must not have A's address yet.
-		// libp2p only populates the peerstore via identify, not from the raw
-		// connection dial. Blocking A's identify responder keeps B's peerstore
-		// for A empty.
-		require.Empty(t, hostB.Peerstore().Addrs(hostA.ID()),
-			"B should not know A's address yet (identify blocked)")
+		// Pre-condition: B's peerstore has no address for A. Waiting for A's
+		// connection can outlast the identify delay on a slow runner, so clear
+		// the addresses rather than rely on timing.
+		hostB.Peerstore().ClearAddrs(hostA.ID())
+		require.Empty(t, hostB.Peerstore().Addrs(hostA.ID()))
 
 		// ACT
 		switchA.BroadcastAsync(p2p.Envelope{
@@ -760,4 +760,136 @@ func connectSwitches(t *testing.T, switches []*Switch) {
 		require.NoError(t, sw1.Start())
 		t.Cleanup(func() { _ = sw1.Stop() })
 	}
+}
+
+type peerDirectionSuite struct {
+	suite.Suite
+}
+
+func TestPeerDirectionSuite(t *testing.T) {
+	suite.Run(t, new(peerDirectionSuite))
+}
+
+func (s *peerDirectionSuite) TestNumPeers() {
+	testCases := []struct {
+		name             string
+		adds             []PeerAddOptions
+		expectedOutbound bool
+		expectedCounts   [2]int
+	}{
+		{
+			name:             "added by a dial path",
+			adds:             []PeerAddOptions{{Outbound: true}},
+			expectedOutbound: true,
+			expectedCounts:   [2]int{1, 0},
+		},
+		{
+			name:           "provisioned from an inbound stream",
+			adds:           []PeerAddOptions{{}},
+			expectedCounts: [2]int{0, 1},
+		},
+		{
+			name:             "dialing an existing inbound peer makes it outbound",
+			adds:             []PeerAddOptions{{}, {Outbound: true}},
+			expectedOutbound: true,
+			expectedCounts:   [2]int{1, 0},
+		},
+		{
+			name:             "inbound stream from an existing outbound peer keeps it outbound",
+			adds:             []PeerAddOptions{{Outbound: true}, {}},
+			expectedOutbound: true,
+			expectedCounts:   [2]int{1, 0},
+		},
+		{
+			name:             "unconditional outbound peers are not counted",
+			adds:             []PeerAddOptions{{Outbound: true, Unconditional: true}},
+			expectedOutbound: true,
+		},
+		{
+			name: "unconditional inbound peers are not counted",
+			adds: []PeerAddOptions{{Unconditional: true}},
+		},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			hosts := makeTestHosts(s.T(), 2)
+
+			sw, err := NewSwitch(nil, hosts[0], nil, p2p.NopMetrics(), hosts[0].Logger())
+			s.Require().NoError(err)
+
+			for i, opts := range tc.adds {
+				_, err := sw.peerSet.Add(hosts[1].AddrInfo(), opts)
+				if i > 0 {
+					s.Require().ErrorIs(err, ErrPeerExists)
+					continue
+				}
+				s.Require().NoError(err)
+			}
+
+			p := sw.Peers().Get(peerIDToKey(hosts[1].ID()))
+			s.Require().NotNil(p)
+			s.Equal(tc.expectedOutbound, p.IsOutbound())
+
+			outbound, inbound, _ := sw.NumPeers()
+			s.Equal(tc.expectedCounts, [2]int{outbound, inbound})
+		})
+	}
+}
+
+func (s *peerDirectionSuite) TestDialerOutboundReceiverInbound() {
+	const channelID = byte(0xF4)
+
+	hosts := makeTestHosts(s.T(), 2)
+	hostA, hostB := hosts[0], hosts[1]
+
+	channelDescriptor := &conn.ChannelDescriptor{
+		ID:                  channelID,
+		Priority:            1,
+		RecvMessageCapacity: 1024,
+		MessageType:         &types.RequestEcho{},
+	}
+
+	newSwitch := func(h *Host) (*Switch, *reactorMock) {
+		reactor := newReactorMock([]*conn.ChannelDescriptor{channelDescriptor}, h.Logger())
+		sw, err := NewSwitch(nil, h, []SwitchReactor{{Name: "echo", Reactor: reactor}}, p2p.NopMetrics(), h.Logger())
+		s.Require().NoError(err)
+		s.Require().NoError(sw.Start())
+		s.T().Cleanup(func() { _ = sw.Stop() })
+
+		return sw, reactor
+	}
+
+	switchA, _ := newSwitch(hostA)
+	switchB, reactorB := newSwitch(hostB)
+
+	s.Require().NoError(switchA.bootstrapPeer(context.Background(), hostB.AddrInfo(), PeerAddOptions{}))
+
+	switchA.BroadcastAsync(p2p.Envelope{ChannelID: channelID, Message: &types.RequestEcho{Message: "hi"}})
+	s.Require().Eventually(func() bool { return len(reactorB.receivedEnvelopes()) == 1 }, 5*time.Second, 20*time.Millisecond)
+
+	s.True(switchA.Peers().Get(peerIDToKey(hostB.ID())).IsOutbound())
+	s.False(switchB.Peers().Get(peerIDToKey(hostA.ID())).IsOutbound())
+
+	outA, inA, _ := switchA.NumPeers()
+	outB, inB, _ := switchB.NumPeers()
+	s.Equal([4]int{1, 0, 0, 1}, [4]int{outA, inA, outB, inB})
+}
+
+func (s *peerDirectionSuite) TestReconnectedPeerIsOutbound() {
+	hosts := makeTestHosts(s.T(), 2)
+
+	sw, err := NewSwitch(nil, hosts[0], nil, p2p.NopMetrics(), hosts[0].Logger())
+	s.Require().NoError(err)
+	s.Require().NoError(sw.Start())
+	s.T().Cleanup(func() { _ = sw.Stop() })
+
+	sw.reconnectPeer(hosts[1].AddrInfo(), time.Second, PeerAddOptions{})
+
+	p := sw.Peers().Get(peerIDToKey(hosts[1].ID()))
+	s.Require().NotNil(p)
+	s.True(p.IsOutbound())
+
+	outbound, inbound, _ := sw.NumPeers()
+	s.Equal([2]int{1, 0}, [2]int{outbound, inbound})
 }

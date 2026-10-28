@@ -62,6 +62,8 @@ type PeerAddOptions struct {
 	Private       bool
 	Persistent    bool
 	Unconditional bool
+	// Outbound is set only by Switch.addDialedPeer; it also marks an existing inbound peer outbound.
+	Outbound      bool
 	OnBeforeStart func(p *Peer)
 	OnAfterStart  func(p *Peer)
 	OnStartFailed func(p *Peer, reason any)
@@ -88,8 +90,9 @@ func (ps *PeerSet) Add(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, erro
 		return nil, errors.Wrap(err, "failed to create peer")
 	}
 
-	set := ps.set(id, p)
-	if !set {
+	p.outbound.Store(opts.Outbound)
+
+	if !ps.set(id, p) {
 		return nil, ErrPeerExists
 	}
 
@@ -236,7 +239,11 @@ func (ps *PeerSet) set(id peer.ID, p *Peer) bool {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
-	if _, ok := ps.peers[id]; ok {
+	if existing, ok := ps.peers[id]; ok {
+		if p.IsOutbound() {
+			existing.outbound.Store(true)
+		}
+
 		return false
 	}
 
