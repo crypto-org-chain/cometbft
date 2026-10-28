@@ -201,6 +201,9 @@ type ManifestNode struct {
 	// use the default CometBFT networking layer.
 	UseLibp2p bool `toml:"use_libp2p"`
 
+	// Libp2pPEX enables peer exchange on a node that uses go-libp2p.
+	Libp2pPEX bool `toml:"libp2p_pex"`
+
 	// MempoolType determines the type of mempool to use for cometbft
 	// @see MempoolConfig
 	MempoolType string `toml:"mempool_type"`

@@ -129,6 +129,7 @@ type Node struct {
 	SendNoLoad            bool
 	Prometheus            bool
 	UseLibp2p             bool
+	Libp2pPEX             bool
 	MempoolType           string
 	PrometheusProxyPort   uint32
 }
@@ -254,6 +255,7 @@ func NewTestnetFromManifest(manifest Manifest, file string, ifd InfrastructureDa
 			Perturbations:         []Perturbation{},
 			SendNoLoad:            nodeManifest.SendNoLoad,
 			UseLibp2p:             nodeManifest.UseLibp2p,
+			Libp2pPEX:             nodeManifest.Libp2pPEX,
 			MempoolType:           nodeManifest.MempoolType,
 			Prometheus:            testnet.Prometheus,
 		}
@@ -457,6 +459,9 @@ func (n Node) Validate(testnet Testnet) error {
 	}
 	if n.Mode == ModeLight && n.ABCIProtocol != ProtocolBuiltin && n.ABCIProtocol != ProtocolBuiltinConnSync {
 		return errors.New("light client must use builtin protocol")
+	}
+	if n.Libp2pPEX && !n.UseLibp2p {
+		return errors.New("libp2p_pex requires use_libp2p")
 	}
 	switch n.PrivvalProtocol {
 	case ProtocolFile, ProtocolUNIX, ProtocolTCP:
