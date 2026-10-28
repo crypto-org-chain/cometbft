@@ -625,12 +625,11 @@ func TestSwitch(t *testing.T) {
 			return switchA.Peers().Size() == 1
 		}, time.Second, 20*time.Millisecond, "A should see B as peer")
 
-		// Pre-condition: B's peerstore must not have A's address yet.
-		// libp2p only populates the peerstore via identify, not from the raw
-		// connection dial. Blocking A's identify responder keeps B's peerstore
-		// for A empty.
-		require.Empty(t, hostB.Peerstore().Addrs(hostA.ID()),
-			"B should not know A's address yet (identify blocked)")
+		// Pre-condition: B's peerstore has no address for A. Waiting for A's
+		// connection can outlast the identify delay on a slow runner, so clear
+		// the addresses rather than rely on timing.
+		hostB.Peerstore().ClearAddrs(hostA.ID())
+		require.Empty(t, hostB.Peerstore().Addrs(hostA.ID()))
 
 		// ACT
 		switchA.BroadcastAsync(p2p.Envelope{
