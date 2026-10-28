@@ -1,0 +1,30 @@
+# lib-p2p peer exchange: leaves bootstrap only from the hub (non-persistent),
+# so they can only find each other through peer exchange.
+
+# A seed keeps the hub from defaulting to persistent links with every node.
+[node.validator01]
+use_libp2p = true
+libp2p_pex = true
+seeds = ["full01"]
+
+[node.validator02]
+use_libp2p = true
+libp2p_pex = true
+seeds = ["validator01"]
+
+[node.validator03]
+use_libp2p = true
+libp2p_pex = true
+seeds = ["validator01"]
+perturb = ["restart"]
+
+[node.validator04]
+use_libp2p = true
+libp2p_pex = true
+seeds = ["validator01"]
+
+# The hub's own bootstrap peer runs without peer exchange.
+[node.full01]
+mode = "full"
+use_libp2p = true
+seeds = ["validator01"]

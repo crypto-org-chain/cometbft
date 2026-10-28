@@ -280,6 +280,7 @@ func MakeConfig(node *e2e.Node) (*config.Config, error) {
 		}
 
 		cfg.P2P.LibP2PConfig.BootstrapPeers = bootstrapPeers
+		cfg.P2P.LibP2PConfig.PEX.Enabled = node.Libp2pPEX
 	}
 
 	if node.Testnet.LogLevel != "" {

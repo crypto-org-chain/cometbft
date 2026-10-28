@@ -36,6 +36,8 @@
 
 ### IMPROVEMENTS
 
+- `[e2e]` add a libp2p peer exchange network
+  ([\#92](https://github.com/crypto-org-chain/cometbft/pull/92))
 - `[state]` use fast validator loading for `BlockExecutor` commit-info paths,
   avoiding unnecessary proposer-priority reconstruction on cache misses
   ([\#6039](https://github.com/cometbft/cometbft/pull/6039))
