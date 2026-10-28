@@ -747,6 +747,35 @@ func createAndStartPrivValidatorSocketClient(
 	return pvscWithRetries, nil
 }
 
+func warnUnsupportedLibP2PSettings(config *cfg.P2PConfig, logger log.Logger) {
+	lists := []struct {
+		name  string
+		value string
+	}{
+		{name: "p2p.seeds", value: config.Seeds},
+		{name: "p2p.persistent_peers", value: config.PersistentPeers},
+		{name: "p2p.unconditional_peer_ids", value: config.UnconditionalPeerIDs},
+		{name: "p2p.private_peer_ids", value: config.PrivatePeerIDs},
+	}
+
+	var unsupported []string
+	for _, list := range lists {
+		if len(splitAndTrimEmpty(list.value, ",", " ")) > 0 {
+			unsupported = append(unsupported, list.name)
+		}
+	}
+	if config.SeedMode {
+		unsupported = append(unsupported, "p2p.seed_mode")
+	}
+	if config.LibP2PConfig.PEX.Enabled {
+		unsupported = append(unsupported, "p2p.libp2p.pex.enabled")
+	}
+
+	if len(unsupported) > 0 {
+		logger.Warn("Settings not supported by the libp2p transport are ignored", "settings", unsupported)
+	}
+}
+
 // splitAndTrimEmpty slices s into all subslices separated by sep and returns a
 // slice of the string s with all leading and trailing Unicode code points
 // contained in cutset removed. If sep is empty, SplitAndTrim splits after each

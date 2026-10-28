@@ -353,6 +353,10 @@ bootstrap_peers = [{{ range $bps }}
 ]
 {{- end }}
 
+# List of peer IDs that peer exchange never gossips or stores (peer exchange is not active yet).
+# Unlike p2p.private_peer_ids, this is a list, not a comma-separated string.
+private_peer_ids = [{{ range $i, $id := .P2P.LibP2PConfig.PrivatePeerIDs }}{{ if $i }}, {{ end }}"{{ js $id }}"{{ end }}]
+
 # Options for scaling concurrent p2p message queues.
 # Tune workers to keep the system near the ideal operating point:
 # enough concurrency for throughput while keeping processing latency low.
@@ -401,6 +405,14 @@ max_peers = {{ .P2P.LibP2PConfig.Limits.MaxPeers }}
 
 # Maximum number of concurrent streams per peer (custom mode only)
 max_peer_streams = {{ .P2P.LibP2PConfig.Limits.MaxPeerStreams }}
+
+# Peer exchange (auto discovery). Not active yet.
+[p2p.libp2p.pex]
+
+enabled = {{ .P2P.LibP2PConfig.PEX.Enabled }}
+
+# Path to the address book
+addr_book_file = "{{ js .P2P.LibP2PConfig.PEX.AddrBookFile }}"
 
 #######################################################
 ###          Mempool Configuration Option          ###

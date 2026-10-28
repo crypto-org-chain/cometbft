@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -93,6 +94,51 @@ func TestSplitAndTrimEmpty(t *testing.T) {
 
 	for _, tc := range testCases {
 		assert.Equal(t, tc.expected, splitAndTrimEmpty(tc.s, tc.sep, tc.cutset), "%s", tc.s)
+	}
+}
+
+func TestWarnUnsupportedLibP2PSettings(t *testing.T) {
+	testCases := []struct {
+		name     string
+		malleate func(*cfg.P2PConfig)
+		expected string
+	}{
+		{name: "defaults", malleate: func(*cfg.P2PConfig) {}},
+		{
+			name: "blank lists",
+			malleate: func(c *cfg.P2PConfig) {
+				c.Seeds = " , "
+				c.PersistentPeers = " "
+			},
+		},
+		{
+			name: "classic peer settings and pex",
+			malleate: func(c *cfg.P2PConfig) {
+				c.Seeds = "id@host:26656"
+				c.PersistentPeers = "id@host:26656"
+				c.UnconditionalPeerIDs = "id"
+				c.PrivatePeerIDs = "id"
+				c.SeedMode = true
+				c.LibP2PConfig.PEX.Enabled = true
+			},
+			expected: "settings=\"[p2p.seeds p2p.persistent_peers p2p.unconditional_peer_ids p2p.private_peer_ids p2p.seed_mode p2p.libp2p.pex.enabled]\"",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := cfg.DefaultP2PConfig()
+			tc.malleate(c)
+
+			var buf bytes.Buffer
+			warnUnsupportedLibP2PSettings(c, log.NewTMLogger(&buf))
+
+			if tc.expected == "" {
+				assert.Empty(t, buf.String())
+				return
+			}
+			assert.Contains(t, buf.String(), tc.expected)
+		})
 	}
 }
 

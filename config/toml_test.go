@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -79,5 +80,49 @@ func assertValidConfig(t *testing.T, configFile string) {
 	}
 	for _, e := range elems {
 		assert.Contains(t, configFile, e)
+	}
+}
+
+func TestLibP2PConfigRoundTrip(t *testing.T) {
+	custom := config.DefaultConfig()
+	custom.P2P.LibP2PConfig.PrivatePeerIDs = []string{"peerA", "peerB"}
+	custom.P2P.LibP2PConfig.PEX = config.LibP2PPEX{Enabled: true, AddrBookFile: `C:\data\addr book.json`}
+
+	defaults := config.DefaultLibP2PConfig()
+
+	testCases := []struct {
+		name     string
+		write    func(path string)
+		expected config.LibP2PConfig
+	}{
+		{
+			name:     "custom values",
+			write:    func(path string) { config.WriteConfigFile(path, custom) },
+			expected: custom.P2P.LibP2PConfig,
+		},
+		{
+			name: "file without the new keys",
+			write: func(path string) {
+				require.NoError(t, os.WriteFile(path, []byte("[p2p.libp2p]\nenabled = false\n"), 0o600))
+			},
+			expected: defaults,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), config.DefaultConfigFileName)
+			tc.write(path)
+
+			v := viper.New()
+			v.SetConfigFile(path)
+			require.NoError(t, v.ReadInConfig())
+
+			actual := config.DefaultConfig()
+			require.NoError(t, v.Unmarshal(actual))
+
+			assert.Equal(t, tc.expected.PrivatePeerIDs, actual.P2P.LibP2PConfig.PrivatePeerIDs)
+			assert.Equal(t, tc.expected.PEX, actual.P2P.LibP2PConfig.PEX)
+		})
 	}
 }

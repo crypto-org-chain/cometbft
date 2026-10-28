@@ -235,6 +235,81 @@ func TestP2PConfigValidateBasic(t *testing.T) {
 				},
 				errContains: "p2p.libp2p.limits.max_peer_streams is required",
 			},
+			{
+				name: "allowsPrivatePeerIDs",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.PrivatePeerIDs = []string{"12D3KooWJx9i35Vx1h6T6nVqQz4YW1r2J1Y2P2nY3N4N5N6N7N8N"}
+				},
+			},
+			{
+				name: "rejectsBlankPrivatePeerID",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.PrivatePeerIDs = []string{"peerA", ""}
+				},
+				errContains: "invalid field p2p.libp2p.private_peer_ids.1 must contain only letters and digits",
+			},
+			{
+				name: "rejectsPrivatePeerIDWithSpaces",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.PrivatePeerIDs = []string{" peerA"}
+				},
+				errContains: "invalid field p2p.libp2p.private_peer_ids.0 must contain only letters and digits",
+			},
+			{
+				name: "rejectsPrivatePeerIDWithQuote",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.PrivatePeerIDs = []string{"peer'A"}
+				},
+				errContains: "invalid field p2p.libp2p.private_peer_ids.0 must contain only letters and digits",
+			},
+			{
+				name: "requiresPEXAddrBookFile",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.PEX.Enabled = true
+					cfg.LibP2PConfig.PEX.AddrBookFile = " "
+				},
+				errContains: "p2p.libp2p.pex.addr_book_file is required",
+			},
+			{
+				name: "allowsMissingAddrBookFileWithoutPEX",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.PEX.AddrBookFile = ""
+				},
+			},
+			{
+				name: "allowsPEXWithDefaultLimits",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.PEX.Enabled = true
+					cfg.MaxNumInboundPeers = 1000
+				},
+			},
+			{
+				name: "allowsPEXWithinCustomMaxPeers",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.PEX.Enabled = true
+					cfg.LibP2PConfig.Limits.Mode = config.LibP2PLimitsModeCustom
+					cfg.LibP2PConfig.Limits.MaxPeers = cfg.MaxNumInboundPeers + cfg.MaxNumOutboundPeers
+					cfg.LibP2PConfig.Limits.MaxPeerStreams = 32
+				},
+			},
+			{
+				name: "rejectsPEXAboveCustomMaxPeers",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.PEX.Enabled = true
+					cfg.LibP2PConfig.Limits.Mode = config.LibP2PLimitsModeCustom
+					cfg.LibP2PConfig.Limits.MaxPeers = cfg.MaxNumInboundPeers + cfg.MaxNumOutboundPeers - 1
+					cfg.LibP2PConfig.Limits.MaxPeerStreams = 32
+				},
+				errContains: "invalid field p2p.libp2p.limits.max_peers must be at least max_num_inbound_peers + max_num_outbound_peers (50) when pex is enabled",
+			},
+			{
+				name: "allowsPeerCountsAboveCustomMaxPeersWithoutPEX",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.Limits.Mode = config.LibP2PLimitsModeCustom
+					cfg.LibP2PConfig.Limits.MaxPeers = 1
+					cfg.LibP2PConfig.Limits.MaxPeerStreams = 32
+				},
+			},
 		} {
 			t.Run(tt.name, func(t *testing.T) {
 				// ARRANGE
