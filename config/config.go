@@ -43,6 +43,8 @@ const (
 	DefaultNodeKeyName  = "node_key.json"
 	DefaultAddrBookName = "addrbook.json"
 
+	defaultLibP2PAddrBookName = "addrbook-libp2p.json"
+
 	MempoolTypeFlood = "flood"
 	MempoolTypeNop   = "nop"
 	MempoolTypeApp   = "app"
@@ -70,6 +72,10 @@ var (
 
 	defaultNodeKeyPath  = filepath.Join(DefaultConfigDir, DefaultNodeKeyName)
 	defaultAddrBookPath = filepath.Join(DefaultConfigDir, DefaultAddrBookName)
+
+	defaultLibP2PAddrBookPath = filepath.Join(DefaultConfigDir, defaultLibP2PAddrBookName)
+
+	libp2pPeerIDRegexp = regexp.MustCompile(`^[A-Za-z0-9]+$`)
 
 	minSubscriptionBufferSize     = 100
 	defaultSubscriptionBufferSize = 200
@@ -642,6 +648,18 @@ type LibP2PConfig struct {
 
 	// Limits configuration for libp2p resource manager.
 	Limits LibP2PLimits `mapstructure:"limits"`
+
+	// PrivatePeerIDs peer IDs that are never gossiped or stored
+	PrivatePeerIDs []string `mapstructure:"private_peer_ids"`
+
+	// PEX peer exchange (auto discovery) configuration
+	PEX LibP2PPEX `mapstructure:"pex"`
+}
+
+// LibP2PPEX peer exchange configuration for go-libp2p
+type LibP2PPEX struct {
+	Enabled      bool   `mapstructure:"enabled"`
+	AddrBookFile string `mapstructure:"addr_book_file"`
 }
 
 // LibP2PBootstrapPeer is a bootstrap peer for this node
@@ -765,8 +783,21 @@ func (cfg *P2PConfig) ValidateBasic() error {
 	if cfg.RecvRate < 0 {
 		return cmterrors.ErrNegativeField{Field: "recv_rate"}
 	}
-	if cfg.LibP2PEnabled() {
-		return cfg.LibP2PConfig.ValidateBasic()
+	if !cfg.LibP2PEnabled() {
+		return nil
+	}
+
+	if err := cfg.LibP2PConfig.ValidateBasic(); err != nil {
+		return err
+	}
+
+	limits := cfg.LibP2PConfig.Limits
+	pexPeers := cfg.MaxNumInboundPeers + cfg.MaxNumOutboundPeers
+	if cfg.LibP2PConfig.PEX.Enabled && limits.Mode == LibP2PLimitsModeCustom && pexPeers > limits.MaxPeers {
+		return cmterrors.ErrInvalidField{
+			Field:  "p2p.libp2p.limits.max_peers",
+			Reason: fmt.Sprintf("must be at least max_num_inbound_peers + max_num_outbound_peers (%d) when pex is enabled", pexPeers),
+		}
 	}
 
 	return nil
@@ -782,6 +813,11 @@ func DefaultLibP2PConfig() LibP2PConfig {
 		BootstrapPeers: []LibP2PBootstrapPeer{},
 		Scaler:         DefaultLibP2PScaler(),
 		Limits:         DefaultLibP2PLimits(),
+		PrivatePeerIDs: []string{},
+		PEX: LibP2PPEX{
+			Enabled:      false,
+			AddrBookFile: defaultLibP2PAddrBookPath,
+		},
 	}
 }
 
@@ -808,6 +844,16 @@ func (cfg *LibP2PConfig) ValidateBasic() error {
 	// 3. validate limits
 	if err := cfg.Limits.ValidateBasic(); err != nil {
 		return err
+	}
+
+	for i, id := range cfg.PrivatePeerIDs {
+		if !libp2pPeerIDRegexp.MatchString(id) {
+			return cmterrors.ErrInvalidField{Field: key("private_peer_ids.%d", i), Reason: "must contain only letters and digits"}
+		}
+	}
+
+	if cfg.PEX.Enabled && strings.TrimSpace(cfg.PEX.AddrBookFile) == "" {
+		return cmterrors.ErrRequiredField{Field: key("pex.addr_book_file")}
 	}
 
 	return nil

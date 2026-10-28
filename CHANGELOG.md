@@ -40,6 +40,9 @@
 
 ### FEATURES
 
+- `[lp2p]` add config for peer exchange and private peers
+  ([\#81](https://github.com/crypto-org-chain/cometbft/pull/81))
+
 ### STATE-BREAKING
 
 ### API-BREAKING

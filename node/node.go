@@ -572,6 +572,7 @@ func NewNodeWithContext(
 		}
 
 		p2pLogger.Info("Using libp2p transport", "host_id", host.ID().String())
+		warnUnsupportedLibP2PSettings(config.P2P, p2pLogger)
 		if state.LastBlockHeight != 0 {
 			p2pLogger.Warn("EXPERIMENTAL: go-libp2p transport is enabled. Only enable this setting if it can be activated simultaneously for all validators on the network and peer IDs have been predetermined and exchanged.")
 		}
