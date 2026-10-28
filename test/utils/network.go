@@ -1,18 +1,20 @@
 package utils
 
 import (
+	"io"
 	"net"
 	"testing"
 )
 
-// GetFreePorts returns n free ports
+// GetFreePorts returns n ports that are free for both TCP and UDP, since QUIC
+// listeners bind UDP.
 func GetFreePorts(t *testing.T, n int) []int {
 	var (
-		ports     = make([]int, 0, n)
-		listeners = make([]net.Listener, 0, n)
+		ports   = make([]int, 0, n)
+		holders = make([]io.Closer, 0, 2*n)
 	)
 
-	for i := 0; i < n; i++ {
+	for len(ports) < n {
 		addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
 		if err != nil {
 			t.Fatalf("unable to resolve port: %v", err)
@@ -22,17 +24,21 @@ func GetFreePorts(t *testing.T, n int) []int {
 		if err != nil {
 			t.Fatalf("unable to listen to tcp: %v", err)
 		}
+		holders = append(holders, l)
 
 		port := l.Addr().(*net.TCPAddr).Port
-		ports = append(ports, port)
+		pc, err := net.ListenPacket("udp", l.Addr().String())
+		if err != nil {
+			continue
+		}
+		holders = append(holders, pc)
 
-		// keep the listener open to avoid port collisions
-		listeners = append(listeners, l)
+		ports = append(ports, port)
 	}
 
-	// close the listeners to free the ports
-	for _, l := range listeners {
-		if err := l.Close(); err != nil {
+	// keep every port held until all are chosen to avoid duplicates
+	for _, h := range holders {
+		if err := h.Close(); err != nil {
 			t.Fatalf("unable to close listener: %v", err)
 		}
 	}
