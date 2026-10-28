@@ -238,6 +238,8 @@ type reactorMock struct {
 	removedPeers []p2p.Peer
 	received     []p2p.Envelope
 	events       []string
+	onRemovePeer func(p2p.Peer)
+	onStop       func()
 }
 
 func newReactorSetTestSuite(t *testing.T, opts ...testOption) *reactorSetTestSuite {
@@ -296,10 +298,20 @@ func (r *reactorMock) AddPeer(peer p2p.Peer) {
 
 func (r *reactorMock) RemovePeer(peer p2p.Peer, _ any) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	r.removedPeers = append(r.removedPeers, peer)
 	r.events = append(r.events, "remove")
+	hook := r.onRemovePeer
+	r.mu.Unlock()
+
+	if hook != nil {
+		hook(peer)
+	}
+}
+
+func (r *reactorMock) OnStop() {
+	if r.onStop != nil {
+		r.onStop()
+	}
 }
 
 func (r *reactorMock) peerEvents() []string {

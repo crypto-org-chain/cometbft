@@ -556,3 +556,51 @@ func (s *peerSetLifecycleSuite) TestConcurrentChurn() {
 	s.Equal(started, finished)
 	s.Positive(started)
 }
+
+func (s *peerSetLifecycleSuite) TestRemoveCondition() {
+	testCases := []struct {
+		name      string
+		starting  bool
+		condition bool
+	}{
+		{name: "live peer, condition holds", condition: true},
+		{name: "live peer, condition fails"},
+		{name: "starting peer, condition holds", starting: true, condition: true},
+		{name: "starting peer, condition fails", starting: true},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			s.SetupTest()
+
+			var removeErr error
+			remove := func(id p2p.ID) error {
+				return s.ps.Remove(id, PeerRemovalOptions{Condition: func() bool { return tc.condition }})
+			}
+
+			opts := PeerAddOptions{}
+			if tc.starting {
+				opts.OnBeforeStart = func(p *Peer) { removeErr = remove(p.ID()) }
+			}
+
+			_, addErr := s.ps.Add(s.other.AddrInfo(), opts)
+			if !tc.starting {
+				s.Require().NoError(addErr)
+				removeErr = remove(s.key())
+			}
+
+			switch {
+			case !tc.condition:
+				s.ErrorIs(removeErr, errRemovalSkipped)
+				s.NoError(addErr)
+			case tc.starting:
+				s.ErrorIs(removeErr, errPeerStarting)
+				s.ErrorIs(addErr, errPeerRemovedDuringStart)
+			default:
+				s.NoError(removeErr)
+			}
+
+			s.Equal(!tc.condition, s.ps.Get(s.key()) != nil)
+		})
+	}
+}
