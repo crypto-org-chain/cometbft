@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/libp2p/go-libp2p/p2p/protocol/identify"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
 	ma "github.com/multiformats/go-multiaddr"
@@ -239,6 +241,73 @@ func TestHostConnGater(t *testing.T) {
 		// ASSERT
 		require.Nil(t, connGater)
 		require.False(t, enabled)
+	})
+
+	t.Run("peer exchange", func(t *testing.T) {
+		// ARRANGE
+		cfg := config.DefaultP2PConfig().LibP2PConfig
+		cfg.PEX.Enabled = true
+
+		// ACT
+		connGater, enabled := ConnectionGaterFromConfig(cfg, nil)
+
+		// ASSERT
+		require.True(t, enabled)
+		require.Zero(t, connGater.maxPeers)
+	})
+
+	t.Run("bans", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			banned    bool
+			bootstrap bool
+			outbound  bool
+		}{
+			{name: "rejects banned inbound peer", banned: true},
+			{name: "rejects banned outbound peer", banned: true, outbound: true},
+			{name: "admits banned inbound bootstrap peer", banned: true, bootstrap: true},
+			{name: "admits banned outbound bootstrap peer", banned: true, bootstrap: true, outbound: true},
+			{name: "admits peer that is not banned"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ports := utils.GetFreePorts(t, 2)
+				other := makeTestHost(t, ports[1])
+
+				var bootstrapPeers []config.LibP2PBootstrapPeer
+				if tc.bootstrap {
+					bootstrapPeers = []config.LibP2PBootstrapPeer{{
+						Host: fmt.Sprintf("127.0.0.1:%d", ports[1]),
+						ID:   other.ID().String(),
+					}}
+				}
+				h := makeTestHost(t, ports[0], withBootstrapPeers(bootstrapPeers), withModifiedConfig(func(cfg *config.LibP2PConfig) {
+					cfg.PEX.Enabled = true
+				}))
+				var bans banList
+				if tc.banned {
+					bans = banList{other.ID()}
+				}
+				h.SetBanChecker(bans)
+				connected := !tc.banned || tc.bootstrap
+
+				if tc.outbound {
+					err := h.Connect(t.Context(), other.AddrInfo())
+					if !connected {
+						require.ErrorIs(t, err, swarm.ErrGaterDisallowedConnection)
+						return
+					}
+				} else {
+					_ = other.Connect(t.Context(), h.AddrInfo())
+				}
+
+				isConnected := func() bool { return h.Network().Connectedness(other.ID()) == network.Connected }
+				if connected {
+					require.Eventually(t, isConnected, 2*time.Second, 50*time.Millisecond)
+					return
+				}
+				require.Never(t, isConnected, 500*time.Millisecond, 50*time.Millisecond)
+			})
+		}
 	})
 
 	t.Run("maxPeers", func(t *testing.T) {
@@ -611,3 +680,7 @@ func makeTestHosts(t *testing.T, numHosts int, opts ...testOption) []*Host {
 
 	return hosts
 }
+
+type banList []peer.ID
+
+func (b banList) IsBanned(id peer.ID) bool { return slices.Contains(b, id) }

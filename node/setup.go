@@ -788,6 +788,7 @@ func createLibP2PPEXReactor(
 	}
 
 	book := lp2ppex.NewAddrBook(path, bookCfg)
+	host.SetBanChecker(book)
 	reactor = lp2ppex.NewReactor(book, host, config.MaxNumOutboundPeers)
 	reactor.SetLogger(logger.With("module", "pex"))
 

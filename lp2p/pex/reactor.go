@@ -124,7 +124,8 @@ func (r *Reactor) SetSwitch(sw p2p.Switcher) {
 	r.dialer, _ = sw.(dialer)
 }
 
-// OnStart loads the book, then starts asking, dialing and verifying inbound addresses.
+// OnStart loads the book and disconnects banned peers, then starts asking,
+// dialing and verifying inbound addresses.
 func (r *Reactor) OnStart() error {
 	if r.dialer == nil {
 		return errors.New("switch cannot dial peers")
@@ -132,6 +133,16 @@ func (r *Reactor) OnStart() error {
 
 	if err := r.book.Load(); err != nil {
 		r.Logger.Error("Failed to load address book, starting empty", "err", err)
+	}
+
+	// The host accepts connections before the bans are loaded.
+	for _, id := range r.host.Network().Peers() {
+		if r.book.IsBanned(id) {
+			r.Logger.Info("Disconnecting banned peer", "peer_id", id)
+			if err := r.host.Network().ClosePeer(id); err != nil {
+				r.Logger.Error("Failed to disconnect banned peer", "peer_id", id, "err", err)
+			}
+		}
 	}
 
 	sub, err := r.host.EventBus().Subscribe(new(event.EvtPeerIdentificationCompleted))
@@ -275,6 +286,7 @@ func (r *Reactor) receiveAddrs(src p2p.Peer, addrs []tmp2p.NetAddress) {
 }
 
 func (r *Reactor) punish(src p2p.Peer, id peer.ID, err error) {
+	r.Logger.Info("Banning peer", "peer_id", id, "duration", banDuration, "err", err)
 	r.book.Ban(id, r.now().Add(banDuration))
 	r.Switch.StopPeerForError(src, err)
 }

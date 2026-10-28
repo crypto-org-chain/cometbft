@@ -34,6 +34,8 @@ type Host struct {
 	// bootstrapPeers are initial peers specified in the address book
 	bootstrapPeers map[peer.ID]BootstrapPeer
 
+	connGater *ConnGater
+
 	logger log.Logger
 
 	peerFailureHandlers []func(id peer.ID, err error)
@@ -52,6 +54,11 @@ type BootstrapPeer struct {
 const TransportQUIC = "quic-v1"
 
 const connMgrBootstrapTag = "bootstrap"
+
+// BanChecker reports peers that must not connect.
+type BanChecker interface {
+	IsBanned(id peer.ID) bool
+}
 
 // NewHost Host constructor.
 func NewHost(config *config.P2PConfig, nodeKey cmcrypto.PrivKey, logger log.Logger) (*Host, error) {
@@ -129,6 +136,7 @@ func NewHost(config *config.P2PConfig, nodeKey cmcrypto.PrivKey, logger log.Logg
 	}
 
 	if connGaterEnabled {
+		h.connGater = connGater
 		connGater.SetHost(h)
 	}
 
@@ -154,6 +162,13 @@ func (h *Host) BootstrapPeer(id peer.ID) (BootstrapPeer, bool) {
 
 func (h *Host) Logger() log.Logger {
 	return h.logger
+}
+
+// SetBanChecker makes the connection gater refuse banned peers.
+func (h *Host) SetBanChecker(bans BanChecker) {
+	if h.connGater != nil && bans != nil {
+		h.connGater.bans.Store(&banChecker{bans})
+	}
 }
 
 // Ping pings peers and logs RTT latency (blocking)
@@ -263,30 +278,35 @@ func ResourceManagerFromConfig(cfg config.LibP2PConfig) (network.ResourceManager
 	return nil, nil, fmt.Errorf("unknown limits mode: %q", cfg.Limits.Mode)
 }
 
-// ConnGater limits the number of simultaneously connected peers.
-// It is only enabled when `lp2p.limits.mode = "custom"` and uses
-// `lp2p.limits.max_peers` as the cap. Bootstrap peers are never gated.
+// ConnGater refuses banned peers and, when `lp2p.limits.mode = "custom"`,
+// peers beyond `lp2p.limits.max_peers`. Bootstrap peers are never gated.
 //
 // The host is injected after host creation because libp2p requires the
 // connection gater option during `libp2p.New(...)`, before the host exists.
 type ConnGater struct {
 	host           atomic.Pointer[Host]
-	maxPeers       int
+	bans           atomic.Pointer[banChecker]
+	maxPeers       int // 0 means no cap
 	bootstrapPeers map[peer.ID]BootstrapPeer
 }
+
+type banChecker struct{ BanChecker }
 
 var _ connmgr.ConnectionGater = (*ConnGater)(nil)
 
 // ConnectionGaterFromConfig creates a connection gater from the given config or returns false if disabled.
 func ConnectionGaterFromConfig(cfg config.LibP2PConfig, bootstrapPeers map[peer.ID]BootstrapPeer) (*ConnGater, bool) {
-	if cfg.Limits.Mode != config.LibP2PLimitsModeCustom {
+	custom := cfg.Limits.Mode == config.LibP2PLimitsModeCustom
+	if !custom && !cfg.PEX.Enabled {
 		return nil, false
 	}
 
-	return &ConnGater{
-		maxPeers:       cfg.Limits.MaxPeers,
-		bootstrapPeers: bootstrapPeers,
-	}, true
+	gater := &ConnGater{bootstrapPeers: bootstrapPeers}
+	if custom {
+		gater.maxPeers = cfg.Limits.MaxPeers
+	}
+
+	return gater, true
 }
 
 // SetHost sets the host for the connection gater. The host is injected after creation
@@ -294,7 +314,7 @@ func ConnectionGaterFromConfig(cfg config.LibP2PConfig, bootstrapPeers map[peer.
 func (c *ConnGater) SetHost(host *Host) { c.host.Store(host) }
 
 // InterceptAccept allows every connection: the peer ID is not known yet,
-// so the peer limit is enforced in InterceptSecured.
+// so peer checks run in InterceptSecured.
 func (c *ConnGater) InterceptAccept(network.ConnMultiaddrs) bool {
 	return true
 }
@@ -307,7 +327,7 @@ func (c *ConnGater) InterceptPeerDial(pid peer.ID) bool {
 	return c.allowPeer(pid, "InterceptPeerDial")
 }
 
-// InterceptSecured rejects inbound connections once max_peers is reached.
+// InterceptSecured gates inbound connections.
 // Outbound connections were already checked when dialing.
 func (c *ConnGater) InterceptSecured(dir network.Direction, pid peer.ID, _ network.ConnMultiaddrs) bool {
 	if dir == network.DirOutbound {
@@ -329,6 +349,15 @@ func (c *ConnGater) allowPeer(pid peer.ID, caller string) bool {
 	h := c.host.Load()
 	if h == nil {
 		return false
+	}
+
+	if bans := c.bans.Load(); bans != nil && bans.IsBanned(pid) {
+		h.logger.Debug("Rejecting banned peer", "caller", caller, "peer_id", pid.String())
+		return false
+	}
+
+	if c.maxPeers == 0 {
+		return true
 	}
 
 	current := len(h.Network().Peers())
