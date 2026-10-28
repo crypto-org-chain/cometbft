@@ -39,6 +39,7 @@ import (
 	"github.com/cometbft/cometbft/types"
 	cmttime "github.com/cometbft/cometbft/types/time"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -232,6 +233,17 @@ func TestCreateLibP2PPEXReactor(t *testing.T) {
 			},
 		},
 		{
+			name: "gater refuses banned peers",
+			check: func(t *testing.T, book *lp2ppex.AddrBook, host *lp2p.Host, _ peer.ID) {
+				banned := peer.AddrInfo{ID: randomPeerID(t), Addrs: []multiaddr.Multiaddr{multiaddr.StringCast("/ip4/192.0.2.1/udp/1/quic-v1")}}
+				book.Ban(banned.ID, time.Now().Add(time.Hour))
+				ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+				defer cancel()
+
+				require.ErrorIs(t, host.Connect(ctx, banned), swarm.ErrGaterDisallowedConnection)
+			},
+		},
+		{
 			name:     "nothing is connected before the switch is set",
 			noSwitch: true,
 			check: func(t *testing.T, book *lp2ppex.AddrBook, _ *lp2p.Host, connected peer.ID) {
@@ -253,6 +265,7 @@ func TestCreateLibP2PPEXReactor(t *testing.T) {
 			config.P2P.AddrBookStrict = true
 			config.P2P.AllowDuplicateIP = false
 			config.P2P.LibP2PConfig.Enabled = true
+			config.P2P.LibP2PConfig.PEX.Enabled = true
 			config.P2P.LibP2PConfig.PrivatePeerIDs = []string{privateID.String()}
 			config.P2P.LibP2PConfig.BootstrapPeers = []cfg.LibP2PBootstrapPeer{
 				{Host: "127.0.0.1:1", ID: bootstrapID.String()},

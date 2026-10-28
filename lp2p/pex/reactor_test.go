@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
@@ -593,6 +594,24 @@ func (s *reactorSuite) TestStartLoadsAndStopSaves() {
 	s.True(ok)
 }
 
+func (s *reactorSuite) TestStartDisconnectsBannedPeers() {
+	banned, other := s.id(), s.id()
+	s.book.Ban(banned, s.clock.Add(time.Hour))
+	s.Require().NoError(s.book.Save())
+	s.net.conns[banned] = []network.Conn{&fakeConn{}}
+	s.net.conns[other] = []network.Conn{&fakeConn{}}
+
+	loaded := NewAddrBook(s.book.path, s.book.cfg)
+	loaded.now = s.book.now
+	r := NewReactor(loaded, &fakeHost{Host: s.host, net: s.net}, 10)
+	r.SetLogger(log.NewNopLogger())
+	r.SetSwitch(s.sw)
+	s.Require().NoError(r.Start())
+	s.T().Cleanup(func() { _ = r.Stop() })
+
+	s.Equal([]peer.ID{banned}, s.net.closed)
+}
+
 func (s *reactorSuite) TestStartNeedsADialingSwitch() {
 	r := NewReactor(s.book, s.host, 10)
 	r.SetLogger(log.NewNopLogger())
@@ -1013,10 +1032,18 @@ func (h *fakeHost) Network() network.Network { return h.net }
 
 type fakeNetwork struct {
 	network.Network
-	conns map[peer.ID][]network.Conn
+	conns  map[peer.ID][]network.Conn
+	closed []peer.ID
 }
 
 func (n *fakeNetwork) ConnsToPeer(id peer.ID) []network.Conn { return n.conns[id] }
+
+func (n *fakeNetwork) Peers() []peer.ID { return slices.Collect(maps.Keys(n.conns)) }
+
+func (n *fakeNetwork) ClosePeer(id peer.ID) error {
+	n.closed = append(n.closed, id)
+	return nil
+}
 
 type fakeConn struct {
 	network.Conn

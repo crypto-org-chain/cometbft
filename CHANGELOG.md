@@ -42,6 +42,8 @@
 
 ### FEATURES
 
+- `[lp2p]` refuse connections from banned peers
+  ([\#87](https://github.com/crypto-org-chain/cometbft/pull/87))
 - `[lp2p]` dial peers found by peer exchange
   ([\#86](https://github.com/crypto-org-chain/cometbft/pull/86))
 - `[lp2p]` gossip peer addresses when peer exchange is enabled
