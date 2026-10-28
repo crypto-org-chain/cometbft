@@ -46,6 +46,9 @@ type Switch struct {
 	disconnectQuit    chan struct{}
 	disconnectWorkers sync.WaitGroup
 
+	reconnectMu sync.Mutex
+	reconnects  map[peer.ID]*reconnectLoop
+
 	// active is used to track if the switch has started
 	// BaseService has similar field, but it triggered BEFORE OnStart().
 	// This leads to concurrent peers provisioning between bootstrapping peers and accepting incoming messages
@@ -87,6 +90,7 @@ func NewSwitch(
 		reconcileInterval: defaultReconcileInterval,
 		flaps:             newFlapBackoff(time.Second, MaxReconnectBackoff, time.Minute),
 		disconnects:       newDisconnectQueue(),
+		reconnects:        make(map[peer.ID]*reconnectLoop),
 
 		active: atomic.Bool{},
 	}
@@ -162,7 +166,7 @@ func (s *Switch) OnStart() error {
 					"err", err,
 				)
 
-				go s.reconnectPeer(bp.AddrInfo, MaxReconnectBackoff, opts)
+				s.scheduleReconnect(bp.AddrInfo, opts, 0)
 			}
 		}(bp)
 	}
@@ -345,15 +349,7 @@ func (s *Switch) onPeerRemoved(p *Peer, reason any) {
 		delay = s.flaps.next(p.addrInfo.ID)
 	}
 
-	go func() {
-		select {
-		case <-time.After(delay):
-		case <-s.Quit():
-			return
-		}
-
-		s.reconnectPeer(p.AddrInfo(), MaxReconnectBackoff, opts)
-	}()
+	s.scheduleReconnect(p.AddrInfo(), opts, delay)
 }
 
 func (s *Switch) closePeer(p *Peer) {
@@ -677,7 +673,7 @@ func (s *Switch) addPeer(addrInfo peer.AddrInfo, opts PeerAddOptions) (*Peer, er
 
 // reconnectPeer reconnects persistent peers back to the host.
 // uses exponential backoff to reconnect.
-func (s *Switch) reconnectPeer(addrInfo peer.AddrInfo, backoffMax time.Duration, opts PeerAddOptions) {
+func (s *Switch) reconnectPeer(addrInfo peer.AddrInfo, backoffMax time.Duration, opts PeerAddOptions, wake <-chan struct{}) {
 	defer func() {
 		if r := recover(); r != nil {
 			s.Logger.Error("Panic in (*lp2p.Switch).reconnectTo", "panic", r)
@@ -685,14 +681,16 @@ func (s *Switch) reconnectPeer(addrInfo peer.AddrInfo, backoffMax time.Duration,
 	}()
 
 	backoff := 1 * time.Second
-	sleep := func() {
+	sleep := func() bool {
 		jitter := time.Duration(rand.Intn(100)) * time.Millisecond
-		time.Sleep(backoff + jitter)
+		wait := backoff + jitter
 
 		backoff *= 2
 		if backoffMax > 0 && backoff > backoffMax {
 			backoff = backoffMax
 		}
+
+		return s.sleepUnlessWoken(wait, wake)
 	}
 
 	var (
@@ -723,24 +721,28 @@ func (s *Switch) reconnectPeer(addrInfo peer.AddrInfo, backoffMax time.Duration,
 				"backoff", backoff.String(),
 			)
 
-			sleep()
+			if !sleep() {
+				return
+			}
 			continue
 		}
 
 		// 2. add peer to the peer set
 		_, err := s.addDialedPeer(addrInfo, opts)
-		if errors.Is(err, errPeerRemovedDuringStart) {
+		if errors.Is(err, errPeerRemovedDuringStart) || errors.Is(err, ErrPeerExists) {
 			return
 		}
 
-		if err != nil && !errors.Is(err, ErrPeerExists) {
+		if err != nil {
 			s.Logger.Error(
 				"Failed to add peer after reconnection",
 				"peer_id", pid,
 				"err", err,
 				"backoff", backoff.String(),
 			)
-			sleep()
+			if !sleep() {
+				return
+			}
 			continue
 		}
 

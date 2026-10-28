@@ -18,6 +18,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	p2ptest "github.com/libp2p/go-libp2p/core/test"
 	"github.com/libp2p/go-libp2p/p2p/net/swarm"
 	"github.com/stretchr/testify/suite"
 )
@@ -261,23 +262,136 @@ func (s *disconnectSuite) TestPeerAddedAfterItsConnectionClosedIsRemoved() {
 }
 
 func (s *disconnectSuite) TestStopAbandonsPendingReconnect() {
-	sw, other, reactor, _ := s.newSwitch(time.Hour, func(local, remote *Host) {
-		local.bootstrapPeers[remote.ID()] = BootstrapPeer{AddrInfo: remote.AddrInfo()}
+	testCases := []struct {
+		name        string
+		delay       time.Duration
+		unreachable bool
+	}{
+		{name: "waiting out a delay", delay: time.Hour},
+		{name: "backing off a failed dial", unreachable: true},
+	}
+
+	for _, tc := range testCases {
+		s.Run(tc.name, func() {
+			sw, other, _, logs := s.newSwitch(time.Hour, nil)
+
+			addrInfo := other.AddrInfo()
+			if tc.unreachable {
+				addrInfo = unreachablePeer(s.T())
+			}
+
+			sw.scheduleReconnect(addrInfo, PeerAddOptions{}, tc.delay)
+			s.Require().Eventually(func() bool { return reconnectTaken(sw, addrInfo.ID) }, 5*time.Second, 10*time.Millisecond)
+			if tc.unreachable {
+				s.Require().Eventually(func() bool { return reconnectFailures(logs) == 1 }, 5*time.Second, 10*time.Millisecond)
+			}
+
+			s.Require().NoError(sw.Stop())
+
+			s.Eventually(func() bool { return reconnectLoops(sw) == 0 }, 500*time.Millisecond, 20*time.Millisecond)
+		})
+	}
+}
+
+func (s *disconnectSuite) TestReconnectWakesTheRunningLoop() {
+	sw, _, _, logs := s.newSwitch(time.Hour, nil)
+	unreachable := unreachablePeer(s.T())
+	failures := func(n int) func() bool {
+		return func() bool { return reconnectFailures(logs) == n }
+	}
+
+	sw.scheduleReconnect(unreachable, PeerAddOptions{}, 0)
+	s.Require().Eventually(failures(1), 5*time.Second, 10*time.Millisecond)
+
+	sw.scheduleReconnect(unreachable, PeerAddOptions{}, 400*time.Millisecond)
+	s.Require().Never(failures(2), 300*time.Millisecond, 10*time.Millisecond)
+	s.Require().Eventually(failures(2), 500*time.Millisecond, 10*time.Millisecond)
+
+	sw.scheduleReconnect(unreachable, PeerAddOptions{}, time.Hour)
+	sw.scheduleReconnect(unreachable, PeerAddOptions{}, 0)
+	s.Never(failures(3), 1500*time.Millisecond, 10*time.Millisecond)
+	s.Equal(1, reconnectLoops(sw))
+}
+
+func (s *disconnectSuite) TestConcurrentReconnectsRunOneLoop() {
+	sw, _, _, logs := s.newSwitch(time.Hour, nil)
+	unreachable := unreachablePeer(s.T())
+
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() { sw.scheduleReconnect(unreachable, PeerAddOptions{}, 300*time.Millisecond) })
+	}
+	wg.Wait()
+
+	s.Require().Eventually(func() bool { return reconnectFailures(logs) > 0 }, 5*time.Second, 10*time.Millisecond)
+	s.Require().Never(func() bool { return reconnectFailures(logs) > 1 }, 500*time.Millisecond, 10*time.Millisecond)
+	s.Eventually(func() bool { return reconnectFailures(logs) == 2 }, 2*time.Second, 10*time.Millisecond)
+	s.Equal(1, reconnectLoops(sw))
+}
+
+func (s *disconnectSuite) TestReconnectLoopTakesLatestRequestThenDeregisters() {
+	sw, other, _, _ := s.newSwitch(time.Hour, nil)
+	loop := newReconnectLoop()
+	sw.reconnectMu.Lock()
+	sw.reconnects[other.ID()] = loop
+	sw.reconnectMu.Unlock()
+
+	sw.scheduleReconnect(peer.AddrInfo{ID: other.ID()}, PeerAddOptions{}, time.Minute)
+	sw.scheduleReconnect(other.AddrInfo(), PeerAddOptions{Persistent: true}, 0)
+	s.Len(loop.wake, 1)
+
+	req, delay, ok := sw.takeReconnect(other.ID(), loop)
+	s.Require().True(ok)
+	s.Equal(reconnectRequest{addrInfo: other.AddrInfo(), opts: PeerAddOptions{Persistent: true}}, req)
+	s.InDelta(time.Minute, delay, float64(time.Second))
+	s.Empty(loop.wake)
+
+	_, _, ok = sw.takeReconnect(other.ID(), loop)
+	s.False(ok)
+	s.Zero(reconnectLoops(sw))
+}
+
+func (s *disconnectSuite) TestUnreachableBootstrapPeerIsRetried() {
+	unreachable := unreachablePeer(s.T())
+	_, _, _, logs := s.newSwitch(time.Hour, func(local, _ *Host) {
+		local.bootstrapPeers[unreachable.ID] = BootstrapPeer{AddrInfo: unreachable}
 	})
-	sw.flaps = newFlapBackoff(time.Hour, time.Hour, time.Hour)
 
-	s.Require().Eventually(func() bool { return len(reactor.peerEvents()) == 2 }, 5*time.Second, 10*time.Millisecond)
-	s.Require().NoError(other.Network().ClosePeer(sw.host.ID()))
-	s.Require().Eventually(func() bool { return len(reactor.peerEvents()) == 3 }, 5*time.Second, 10*time.Millisecond)
-	s.Require().Eventually(func() bool {
-		return strings.Contains(goroutineStacks(), "onPeerRemoved.func1")
-	}, 5*time.Second, 10*time.Millisecond)
+	s.Eventually(func() bool { return reconnectFailures(logs) > 0 }, 5*time.Second, 10*time.Millisecond)
+}
 
-	s.Require().NoError(sw.Stop())
+func (s *disconnectSuite) TestReconnectToExistingPeerIsSilent() {
+	sw, other, _, logs := s.newSwitch(time.Hour, nil)
+	_, err := sw.addPeer(other.AddrInfo(), reactorOpts(sw))
+	s.Require().NoError(err)
 
-	s.Eventually(func() bool {
-		return !strings.Contains(goroutineStacks(), "onPeerRemoved.func1")
-	}, 5*time.Second, 20*time.Millisecond)
+	sw.scheduleReconnect(other.AddrInfo(), PeerAddOptions{}, 0)
+
+	s.Eventually(func() bool { return reconnectLoops(sw) == 0 }, 5*time.Second, 10*time.Millisecond)
+	s.NotContains(logs.String(), "Reconnected to peer")
+}
+
+func reconnectLoops(sw *Switch) int {
+	sw.reconnectMu.Lock()
+	defer sw.reconnectMu.Unlock()
+
+	return len(sw.reconnects)
+}
+
+func reconnectTaken(sw *Switch, id peer.ID) bool {
+	sw.reconnectMu.Lock()
+	defer sw.reconnectMu.Unlock()
+
+	loop, ok := sw.reconnects[id]
+	return ok && loop.pending == nil
+}
+
+func unreachablePeer(t testing.TB) peer.AddrInfo {
+	return peer.AddrInfo{ID: p2ptest.RandPeerIDFatal(t)}
+}
+
+func reconnectFailures(logs *syncBuffer) int {
+	return strings.Count(logs.String(), "Failed to reconnect to peer")
 }
 
 func (s *disconnectSuite) TestStopPeerHonorsCondition() {
