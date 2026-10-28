@@ -70,6 +70,14 @@ var _ p2p.Switcher = (*Switch)(nil)
 
 var ErrUnsupportedPeerFormat = errors.New("unsupported peer format")
 
+// ErrDropMessage lets a reactor's MsgBytesFilter drop a message without stopping the peer.
+var ErrDropMessage = errors.New("message dropped")
+
+// PeerMarker is implemented by reactors that keep peer reputation.
+type PeerMarker interface {
+	MarkPeerAsGood(p2p.Peer)
+}
+
 // NewSwitch constructs a new Switch.
 func NewSwitch(
 	nodeInfo p2p.NodeInfo,
@@ -381,9 +389,9 @@ func (s *Switch) IsPeerUnconditional(id p2p.ID) bool {
 	return p.(*Peer).IsUnconditional()
 }
 
-func (s *Switch) MarkPeerAsGood(_ p2p.Peer) {
-	// used by consensus reactor
-	s.logUnimplemented("MarkPeerAsGood")
+// MarkPeerAsGood forwards to every reactor that implements PeerMarker.
+func (s *Switch) MarkPeerAsGood(p p2p.Peer) {
+	s.reactors.MarkPeerAsGood(p)
 }
 
 //--------------------------------
@@ -476,7 +484,12 @@ func (s *Switch) handleStream(stream network.Stream) {
 	// 4. Optional pre-unmarshal filter. Allow reactors to filter messages
 	// before unmarshalling them
 	if f, ok := reactor.Reactor.(p2p.MsgBytesFilter); ok {
-		if err := f.FilterMsgBytes(proto.descriptor.ID, peer, payload); err != nil {
+		err := f.FilterMsgBytes(proto.descriptor.ID, peer, payload)
+		if errors.Is(err, ErrDropMessage) {
+			s.Logger.Debug("Dropped msg bytes by reactor filter", "peer_id", peerID.String(), "protocol", protocolID)
+			return
+		}
+		if err != nil {
 			s.Logger.Error(
 				"Rejected msg bytes by reactor filter",
 				"peer_id", peerID.String(),

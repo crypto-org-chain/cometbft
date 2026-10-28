@@ -148,6 +148,14 @@ func (rs *reactorSet) RemovePeer(peer *Peer, reason any) {
 	}
 }
 
+func (rs *reactorSet) MarkPeerAsGood(p p2p.Peer) {
+	for _, reactor := range rs.reactors {
+		if marker, ok := reactor.Reactor.(PeerMarker); ok {
+			marker.MarkPeerAsGood(p)
+		}
+	}
+}
+
 func (rs *reactorSet) GetByName(name string) (p2p.Reactor, bool) {
 	reactor, ok := rs.getByName(name)
 	if !ok {

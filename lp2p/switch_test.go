@@ -431,84 +431,100 @@ func TestSwitch(t *testing.T) {
 		require.Len(t, reactorD.receivedEnvelopes(), 0)
 	})
 
-	t.Run("MsgBytesFilterRejects", func(t *testing.T) {
-		// ARRANGE
-		const channelID = 0xF2
+	for _, tc := range []struct {
+		name        string
+		channelID   byte
+		filterErr   error
+		disconnects bool
+	}{
+		{name: "MsgBytesFilterRejects", channelID: 0xF2, filterErr: errors.New("rejected by filter for test"), disconnects: true},
+		{name: "MsgBytesFilterDrops", channelID: 0xF4, filterErr: ErrDropMessage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// ARRANGE
+			channelID := tc.channelID
 
-		// Given 2 hosts: A and B
-		hosts := makeTestHosts(t, 2, withLogging())
-		hostA, hostB := hosts[0], hosts[1]
+			// Given 2 hosts: A and B
+			hosts := makeTestHosts(t, 2, withLogging())
+			hostA, hostB := hosts[0], hosts[1]
 
-		// Given a common channel descriptor
-		channelDescriptor := &conn.ChannelDescriptor{
-			ID:                  channelID,
-			Priority:            1,
-			RecvMessageCapacity: 1024,
-			MessageType:         &types.RequestEcho{},
-		}
+			// Given a common channel descriptor
+			channelDescriptor := &conn.ChannelDescriptor{
+				ID:                  channelID,
+				Priority:            1,
+				RecvMessageCapacity: 1024,
+				MessageType:         &types.RequestEcho{},
+			}
 
-		// Given switch A with a vanilla reactor
-		reactorA := newReactorMock([]*conn.ChannelDescriptor{channelDescriptor}, hostA.Logger())
-		switchA, err := NewSwitch(
-			nil,
-			hostA,
-			[]SwitchReactor{
-				{Name: "echoReactor", Reactor: reactorA},
-			},
-			p2p.NopMetrics(),
-			hostA.Logger(),
-		)
-		require.NoError(t, err)
+			// Given switch A with a vanilla reactor
+			reactorA := newReactorMock([]*conn.ChannelDescriptor{channelDescriptor}, hostA.Logger())
+			switchA, err := NewSwitch(
+				nil,
+				hostA,
+				[]SwitchReactor{
+					{Name: "echoReactor", Reactor: reactorA},
+				},
+				p2p.NopMetrics(),
+				hostA.Logger(),
+			)
+			require.NoError(t, err)
 
-		// Given switch B with a reactor that rejects all bytes on channelID
-		reactorB := newFilteringReactor(
-			[]*conn.ChannelDescriptor{channelDescriptor},
-			hostB.Logger(),
-			channelID,
-			errors.New("rejected by filter for test"),
-		)
-		switchB, err := NewSwitch(
-			nil,
-			hostB,
-			[]SwitchReactor{
-				{Name: "echoReactor", Reactor: reactorB},
-			},
-			p2p.NopMetrics(),
-			hostB.Logger(),
-		)
-		require.NoError(t, err)
+			// Given switch B with a reactor that filters all bytes on channelID
+			reactorB := newFilteringReactor(
+				[]*conn.ChannelDescriptor{channelDescriptor},
+				hostB.Logger(),
+				channelID,
+				tc.filterErr,
+			)
+			switchB, err := NewSwitch(
+				nil,
+				hostB,
+				[]SwitchReactor{
+					{Name: "echoReactor", Reactor: reactorB},
+				},
+				p2p.NopMetrics(),
+				hostB.Logger(),
+			)
+			require.NoError(t, err)
 
-		// Connect A and B
-		connectSwitches(t, []*Switch{switchA, switchB})
+			// Connect A and B
+			connectSwitches(t, []*Switch{switchA, switchB})
 
-		// Pre-condition: A has B as a peer (A bootstrapped to B).
-		require.Eventually(t, func() bool {
-			return switchA.Peers().Size() == 1
-		}, time.Second, 20*time.Millisecond, "A should see B")
+			// Pre-condition: A has B as a peer (A bootstrapped to B).
+			require.Eventually(t, func() bool {
+				return switchA.Peers().Size() == 1
+			}, time.Second, 20*time.Millisecond, "A should see B")
 
-		// ACT/ASSERT #1: Broadcast a message from A to B. BroadcastAsync is
-		// deliberately fire-and-forget, and peer-set membership does not imply
-		// that the underlying libp2p connection is ready to open a stream yet.
-		// Retry the broadcast while waiting for B's filter so this test does not
-		// fail when the first asynchronous send races connection establishment.
-		require.Eventually(t, func() bool {
-			switchA.BroadcastAsync(p2p.Envelope{
-				ChannelID: channelID,
-				Message:   &types.RequestEcho{Message: "should be filtered"},
-			})
+			// ACT/ASSERT #1: Broadcast a message from A to B. BroadcastAsync is
+			// deliberately fire-and-forget, and peer-set membership does not imply
+			// that the underlying libp2p connection is ready to open a stream yet.
+			// Retry the broadcast while waiting for B's filter so this test does not
+			// fail when the first asynchronous send races connection establishment.
+			require.Eventually(t, func() bool {
+				switchA.BroadcastAsync(p2p.Envelope{
+					ChannelID: channelID,
+					Message:   &types.RequestEcho{Message: "should be filtered"},
+				})
 
-			return reactorB.filterCalls.Load() >= 1
-		}, 2*time.Second, 20*time.Millisecond, "filter should have been called")
+				return reactorB.filterCalls.Load() >= 1
+			}, 2*time.Second, 20*time.Millisecond, "filter should have been called")
 
-		// ASSERT #2: B's Receive was never invoked (rejection happened pre-unmarshal)
-		require.Empty(t, reactorB.receivedEnvelopes(),
-			"Receive must not be called when FilterMsgBytes rejects bytes")
+			// ASSERT #2: B's Receive was never invoked (filtered pre-unmarshal)
+			require.Empty(t, reactorB.receivedEnvelopes(),
+				"Receive must not be called when FilterMsgBytes filters bytes")
 
-		// ASSERT #3: B disconnected A via StopPeerForError
-		require.Eventually(t, func() bool {
-			return switchB.Peers().Size() == 0
-		}, 2*time.Second, 20*time.Millisecond, "B should have disconnected A after filter rejection")
-	})
+			// ASSERT #3: B disconnected A via StopPeerForError, unless the filter only dropped the message
+			if !tc.disconnects {
+				require.Never(t, func() bool {
+					return switchB.Peers().Size() == 0
+				}, 500*time.Millisecond, 20*time.Millisecond, "B must keep A after a dropped message")
+				return
+			}
+			require.Eventually(t, func() bool {
+				return switchB.Peers().Size() == 0
+			}, 2*time.Second, 20*time.Millisecond, "B should have disconnected A after filter rejection")
+		})
+	}
 
 	t.Run("MsgBytesFilterAllows", func(t *testing.T) {
 		// ARRANGE
@@ -1113,3 +1129,24 @@ func (s *peerRemovalSuite) TestDialPathsLeaveReconnectToRemoval() {
 		})
 	}
 }
+
+func TestSwitchMarkPeerAsGood(t *testing.T) {
+	host := makeTestHosts(t, 1)[0]
+	plain := newReactorMock([]*conn.ChannelDescriptor{{ID: 0xF5}}, host.Logger())
+	marker := &markingReactor{reactorMock: newReactorMock([]*conn.ChannelDescriptor{{ID: 0xF6}}, host.Logger())}
+
+	sw, err := NewSwitch(nil, host, []SwitchReactor{{Name: "plain", Reactor: plain}, {Name: "marker", Reactor: marker}}, p2p.NopMetrics(), host.Logger())
+	require.NoError(t, err)
+
+	p := &Peer{}
+	sw.MarkPeerAsGood(p)
+
+	require.Equal(t, []p2p.Peer{p}, marker.marked)
+}
+
+type markingReactor struct {
+	*reactorMock
+	marked []p2p.Peer
+}
+
+func (r *markingReactor) MarkPeerAsGood(p p2p.Peer) { r.marked = append(r.marked, p) }
