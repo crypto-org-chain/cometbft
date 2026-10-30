@@ -18,12 +18,6 @@ func init() {
 	var err error
 	tmpl := template.New("configFileTemplate").Funcs(template.FuncMap{
 		"StringsJoin": strings.Join,
-		"DerefIntOrZero": func(p *int) int {
-			if p == nil {
-				return 0
-			}
-			return *p
-		},
 	})
 	if configTemplate, err = tmpl.Parse(defaultConfigTemplate); err != nil {
 		panic(err)
@@ -373,7 +367,7 @@ max_workers = {{ .P2P.LibP2PConfig.Scaler.MaxWorkers }}
 threshold_latency = "{{ .P2P.LibP2PConfig.Scaler.ThresholdLatency }}"
 
 # Maximum number of messages buffered per-reactor before drops begin (default: 200000).
-# 0 means unlimited (risks OOM under a sustained flood from a fast peer).
+# zero means unlimited
 max_queue_size = {{ .P2P.LibP2PConfig.Scaler.MaxQueueSize }}
 
 # Override a specific reactor (case-insensitive), for example:
@@ -383,6 +377,7 @@ max_queue_size = {{ .P2P.LibP2PConfig.Scaler.MaxQueueSize }}
 # max_workers = 16
 # threshold_latency = "250ms"
 # max_queue_size = 200000
+# Omit max_queue_size to inherit the global value; 0 means unbounded for that reactor.
 #
 # By default, MEMPOOL reactor is overridden to have increased throughput
 # If you want to disable this, explicitly set override to an empty list:
@@ -394,7 +389,7 @@ min_workers = {{ .MinWorkers }}
 max_workers = {{ .MaxWorkers }}
 threshold_latency = "{{ .ThresholdLatency }}"
 {{- if .MaxQueueSize }}
-max_queue_size = {{ DerefIntOrZero .MaxQueueSize }}
+max_queue_size = {{ .MaxQueueSize }}
 {{- end }}
 {{- end }}
 
