@@ -1377,7 +1377,7 @@ seen_cache_size = 100000
 
 | Value type          | integer |
 |:--------------------|:--------|
-| **Possible values** | &gt;= 0 |
+| **Possible values** | &gt; 0  |
 
 ### mempool.reap_max_bytes
 > App mempool only (`mempool.type = "app"`).
@@ -1409,6 +1409,21 @@ reap_max_gas = 0
 Interval between ReapTxs calls when streaming transactions from the app to broadcast to peers.
 ```toml
 reap_interval = "500ms"
+```
+
+| Value type          | duration |
+|:--------------------|:--------|
+| **Possible values** | &gt; 0   |
+
+### mempool.check_tx_retry_delay
+> App mempool only (`mempool.type = "app"`).
+
+How long a transaction that failed `CheckTx` or hit an app error stays in the seen cache before it can be resubmitted.
+Retryable codes (`>= 32000`) use a tenth of it.
+A transaction received from a peer is not forgotten when the app rejects it with a non-retryable code,
+panics on it or returns nil: it stays in the seen cache until LRU eviction, so peers can't make the app re-process it.
+```toml
+check_tx_retry_delay = "5s"
 ```
 
 | Value type          | duration |

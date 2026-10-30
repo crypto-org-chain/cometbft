@@ -31,7 +31,10 @@ type AppMempool struct {
 	guard             *guard.Guard[types.TxKey]
 	checkTxRetryDelay time.Duration
 
-	logger log.Logger
+	logger           log.Logger
+	panicStacks      *logThrottle
+	txPanicStacks    *logThrottle
+	checkTxErrorLogs *logThrottle
 }
 
 // AppMempoolClient is the interface for the app-side mempool.
@@ -77,6 +80,9 @@ func NewAppMempool(config *config.MempoolConfig, app AppMempoolClient, opts ...A
 		checkTxRetryDelay: config.CheckTxRetryDelay,
 		metrics:           NopMetrics(),
 		logger:            log.NewNopLogger(),
+		panicStacks:       newLogThrottle(),
+		txPanicStacks:     newLogThrottle(),
+		checkTxErrorLogs:  newLogThrottle(),
 	}
 
 	for _, opt := range opts {
@@ -92,6 +98,7 @@ func NewAppMempool(config *config.MempoolConfig, app AppMempoolClient, opts ...A
 
 // InsertTx inserts a tx into app-side mempool. The call is blocking, but thread-safe.
 // Concurrent calls are expected and are caller's responsibility to handle.
+// It panics on a nil response or an app panic and keeps the tx seen, so peers can't make the app re-process it.
 func (m *AppMempool) InsertTx(tx types.Tx) error {
 	if err := m.guardTx(tx); err != nil {
 		return err
@@ -102,7 +109,6 @@ func (m *AppMempool) InsertTx(tx types.Tx) error {
 	// todo (@swift1337): should we define more codes and handle them respectively?
 	switch {
 	case err != nil:
-		m.metrics.FailedTxs.Add(1)
 		return wrapErrCode("unable to insert tx", code, err)
 	case codeRetry(code):
 		// drop tx from seen cache (to retry later), but still return the error
@@ -150,21 +156,31 @@ func (m *AppMempool) forgetTx(tx types.Tx, retryable bool) {
 	m.guard.ForgetAfter(tx.Key(), delay)
 }
 
+func (m *AppMempool) recordAppFailure(tx types.Tx) {
+	m.metrics.FailedTxs.Add(1)
+	m.forgetTx(tx, false)
+}
+
 func (m *AppMempool) insertTx(tx types.Tx) (uint32, error) {
+	answered := false
+	defer func() {
+		if !answered {
+			m.metrics.FailedTxs.Add(1)
+		}
+	}()
+
 	// note: other ABCI methods panic if err is not nil
 	resp, err := m.app.InsertTx(m.ctx, &abci.RequestInsertTx{Tx: tx})
-	if err != nil {
-		if resp != nil {
-			return resp.Code, err
-		}
-		return 0, err
-	}
-
-	if resp == nil {
+	if err == nil && resp == nil {
 		panic("nil InsertTx response")
 	}
+	answered = true
 
-	return resp.Code, nil
+	if err != nil {
+		m.recordAppFailure(tx)
+	}
+
+	return resp.GetCode(), err
 }
 
 // TxStream spins up a channel that streams valid transactions from app-side mempool.
@@ -176,7 +192,7 @@ func (m *AppMempool) TxStream(ctx context.Context) <-chan types.Txs {
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
-				m.logger.Error("panic in AppMempool.reapTxs", "panic", p)
+				logRecoveredPanic(m.logger, m.panicStacks, "panic in AppMempool.reapTxs", p)
 			}
 			close(ch)
 		}()
@@ -185,6 +201,46 @@ func (m *AppMempool) TxStream(ctx context.Context) <-chan types.Txs {
 	}()
 
 	return ch
+}
+
+type reapPanicError struct {
+	value any
+	stack []byte
+}
+
+func (e reapPanicError) Error() string {
+	return "ReapTxs app panic: " + boundedString(e.value)
+}
+
+func (m *AppMempool) reapTxsOnce(ctx context.Context, req *abci.RequestReapTxs, stacks *logThrottle) (res *abci.ResponseReapTxs, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			res, err = nil, reapPanicError{value: p, stack: stacks.stack()}
+		}
+	}()
+
+	return m.app.ReapTxs(ctx, req)
+}
+
+const reapRecoverySuccesses = 10
+
+type reapStreak struct {
+	failures  int
+	successes int
+	reported  bool
+}
+
+func (m *AppMempool) logReapFailure(err error, streak *reapStreak, errorLogs *logThrottle) {
+	var stack []byte
+	var p reapPanicError
+	if errors.As(err, &p) {
+		stack = p.stack
+	}
+
+	promote := errorLogs.claim() || stack != nil
+	streak.reported = streak.reported || promote
+	logErrorWithStack(m.logger, promote, stack, "AppMempool.reapTxs: error reaping txs",
+		"error", boundedValue{err}, "failures", streak.failures)
 }
 
 func (m *AppMempool) reapTxs(ctx context.Context, channel chan<- types.Txs) {
@@ -196,21 +252,37 @@ func (m *AppMempool) reapTxs(ctx context.Context, channel chan<- types.Txs) {
 	ticker := time.NewTicker(m.config.ReapInterval)
 	defer ticker.Stop()
 
+	var streak reapStreak
+	reapPanicStacks, reapErrorLogs := newLogThrottle(), newLogThrottle()
+
 	for {
 		select {
 		case <-ctx.Done():
 			m.logger.Debug("AppMempool.reapTxs: context is done")
 			return
 		case <-ticker.C:
-			res, err := m.app.ReapTxs(ctx, req)
-			switch {
-			case isErrCtx(err):
-				m.logger.Debug("AppMempool.reapTxs: context done while reaping txs")
-				return
-			case err != nil:
-				m.logger.Error("AppMempool.reapTxs: error reaping txs", "error", err)
+			res, err := m.reapTxsOnce(ctx, req, reapPanicStacks)
+			if err != nil {
+				if ctx.Err() != nil {
+					m.logger.Debug("AppMempool.reapTxs: context done while reaping txs")
+					return
+				}
+
+				streak.failures++
+				streak.successes = 0
+				m.logReapFailure(err, &streak, reapErrorLogs)
 				continue
-			case res == nil || len(res.Txs) == 0:
+			}
+
+			if streak.failures > 0 {
+				streak.successes++
+				if streak.successes >= reapRecoverySuccesses {
+					logOrDebug(m.logger, streak.reported, log.Logger.Info, "AppMempool.reapTxs: reaping recovered", "failures", streak.failures)
+					streak = reapStreak{}
+				}
+			}
+
+			if res == nil || len(res.Txs) == 0 {
 				// no txs to send
 				continue
 			}
@@ -253,53 +325,59 @@ func (m *AppMempool) FlushAppConn() error {
 // CheckTx calls ABCI.CheckTx
 // This type of mempool assumes ABCI.CheckTx is safe to call LOCK-FREE.
 // It's a responsibility of application to handle concurrency safely.
-// Used only by RPC.BroadcastTxAsync and RPC.BroadcastTxSync.
 func (m *AppMempool) CheckTx(tx types.Tx, callback func(res *abci.ResponseCheckTx), _ TxInfo) error {
 	if err := m.guardTx(tx); err != nil {
 		return err
 	}
 
-	var (
-		ctx = client.LockFreeContext(m.ctx)
-		req = &abci.RequestCheckTx{Tx: tx}
-	)
+	ctx := client.LockFreeContext(m.ctx)
 
 	go func() {
 		defer func() {
 			if p := recover(); p != nil {
-				m.logger.Error("panic in AppMempool.CheckTx", "panic", p, "tx", txHash(tx))
+				logRecoveredPanic(m.logger, m.panicStacks, "panic in the AppMempool CheckTx goroutine", p, "tx", txHashValue(tx))
 			}
 		}()
 
-		res, err := m.app.CheckTx(ctx, req)
-		if err == nil && res == nil {
-			err = errors.New("nil CheckTx response")
-		}
-		if err != nil {
-			// CheckTx errors are non-fatal; other ABCI methods panic on error.
-			m.logger.Error("AppMempool.CheckTx: error checking tx", "error", err, "tx", txHash(tx))
-			if callback != nil {
-				callback(&abci.ResponseCheckTx{Code: abci.CodeTypeInternal, Log: fmt.Sprintf("CheckTx app client error: %v", err)})
-			}
-			return
-		}
-
-		// handle (non)retryable errors:
-		// allow RPC requests to be retryable while keeping DDoS vector small.
-		//
-		// - if app returns a retryable error code -> forget after a small delay
-		// - if app returns a non-retryable error code -> forget after a bigger delay
-		// - if a tx comes from other peers via m.InsertTx() -> it won't be cleaned (guardTx).
-		if res.Code != abci.CodeTypeOK {
-			m.forgetTx(tx, codeRetry(res.Code))
-		}
-
+		res := m.checkTx(ctx, tx)
 		if callback != nil {
 			callback(res)
 		}
 	}()
 
 	return nil
+}
+
+func (m *AppMempool) checkTx(ctx context.Context, tx types.Tx) (res *abci.ResponseCheckTx) {
+	defer func() {
+		if p := recover(); p != nil {
+			m.recordAppFailure(tx)
+			res = &abci.ResponseCheckTx{Code: abci.CodeTypeInternal, Log: "CheckTx app panic"}
+			logRecoveredTxPanic(m.logger, m.txPanicStacks, "panic in AppMempool.CheckTx", p, "tx", txHashValue(tx))
+		}
+	}()
+
+	res, err := m.app.CheckTx(ctx, &abci.RequestCheckTx{Tx: tx})
+	if err == nil && res == nil {
+		err = errors.New("nil CheckTx response")
+	}
+	if err != nil {
+		m.recordAppFailure(tx)
+		errMsg := boundedString(err)
+		logOrDebug(m.logger, m.checkTxErrorLogs.claim(), log.Logger.Error, "AppMempool.CheckTx: error checking tx", "error", errMsg, "tx", txHashValue(tx))
+		return &abci.ResponseCheckTx{Code: abci.CodeTypeInternal, Log: "CheckTx app client error: " + errMsg}
+	}
+
+	// handle (non)retryable errors:
+	// allow RPC requests to be retryable while keeping DDoS vector small.
+	//
+	// - if app returns a retryable error code -> forget after a small delay
+	// - if app returns a non-retryable error code -> forget after a bigger delay
+	if res.Code != abci.CodeTypeOK {
+		m.forgetTx(tx, codeRetry(res.Code))
+	}
+
+	return res
 }
 
 // Update does nothing for an app mempool
@@ -321,14 +399,6 @@ func (m *AppMempool) Flush()                                  {}
 
 func (m *AppMempool) Lock()   {}
 func (m *AppMempool) Unlock() {}
-
-func isErrCtx(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
-}
 
 func codeRetry(code uint32) bool {
 	return code >= abci.CodeTypeRetry
