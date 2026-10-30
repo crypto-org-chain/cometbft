@@ -15,6 +15,7 @@ import (
 	"github.com/cometbft/cometbft/p2p"
 	protomem "github.com/cometbft/cometbft/proto/tendermint/mempool"
 	"github.com/cometbft/cometbft/types"
+	"github.com/fortytw2/leaktest"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 )
@@ -88,6 +89,21 @@ func TestAppReactor(t *testing.T) {
 			})
 		}
 	})
+
+	t.Run("OnStop closes mempool", func(t *testing.T) {
+		checkLeaks := leaktest.CheckTimeout(t, 5*time.Second)
+
+		cfg := config.TestConfig().Mempool
+		m := NewAppMempool(cfg, abcimock.NewClient(t))
+		r := NewAppReactor(cfg, m, true)
+
+		require.NoError(t, r.Start())
+		require.NoError(t, r.Stop())
+		checkLeaks()
+
+		require.NotPanics(t, m.Close)
+	})
+
 	const (
 		timeout  = 5 * time.Second
 		interval = 200 * time.Millisecond

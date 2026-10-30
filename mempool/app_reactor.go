@@ -97,6 +97,7 @@ func (r *AppReactor) OnStart() error {
 func (r *AppReactor) OnStop() {
 	// cancel broadcast loop or unblock the pre-start wait on waitForSwitchingOnCh
 	r.cancelCtx()
+	r.mempool.Close()
 }
 
 // GetChannels implements p2p.BaseReactor.
@@ -195,8 +196,7 @@ func (r *AppReactor) insertTx(peerID p2p.ID, tx types.Tx) {
 // Previously batching was disabled.
 // @see https://github.com/tendermint/tendermint/issues/5796
 func (r *AppReactor) broadcastTransactionsBatch(ctx context.Context, maxBatchSizeBytes int) {
-	// will be closed when r.ctx is canceled, 8 is chan size,
-	// which is ok since we send async
+	// will be closed when r.ctx is canceled
 	stream := r.mempool.TxStream(ctx)
 
 	for txs := range stream {
