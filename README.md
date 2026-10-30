@@ -27,10 +27,10 @@ More on how releases are conducted can be found [here](./RELEASES.md).
 
 ## Minimum requirements
 
-| CometBFT version | Requirement | Notes             |
-|------------------|-------------|-------------------|
+| CometBFT version | Requirement | Notes                |
+|------------------|-------------|----------------------|
 | main             | Go version  | Go 1.26.10 or higher |
-| v0.38.x          | Go version  | Go 1.22 or higher |
+| v0.38.x          | Go version  | Go 1.22 or higher    |
 
 ### Install
 

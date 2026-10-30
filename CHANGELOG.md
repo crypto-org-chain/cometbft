@@ -4,7 +4,8 @@
 
 ### DEPENDENCIES
 
-- `[go]` Bump minimum Go version to 1.26.10 ([\#6114](https://github.com/cometbft/cometbft/pull/6114))
+- `[go/runtime]` Bump minimum Go version to 1.26.10
+  ([\#6114](https://github.com/cometbft/cometbft/pull/6114))
 
 ### BUG FIXES
 
