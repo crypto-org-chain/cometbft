@@ -30,6 +30,7 @@ type reactorItem struct {
 	p2p.Reactor
 	name          string
 	consumerQueue *autopool.Pool[pendingEnvelope]
+	queue         *autopool.PriorityQueue
 }
 
 // reactorProtocol represents mapping between [reactor, protocol, comet's channel descriptor]
@@ -41,8 +42,9 @@ type reactorProtocol struct {
 // pendingEnvelope is a wrapper around p2p.Envelope
 type pendingEnvelope struct {
 	p2p.Envelope
-	messageType string
-	addedAt     time.Time
+	messageType  string
+	addedAt      time.Time
+	payloadBytes int
 }
 
 func newReactorSet(switchRef *Switch) *reactorSet {
@@ -70,6 +72,8 @@ func (rs *reactorSet) Add(reactor p2p.Reactor, name string) error {
 		return fmt.Errorf("failed to create reactor scaler: %w", err)
 	}
 
+	maxMessageBytes := 0
+
 	// register channel descriptor to reactor & protocolID mapping
 	for i := range reactor.GetChannels() {
 		var (
@@ -85,12 +89,16 @@ func (rs *reactorSet) Add(reactor p2p.Reactor, name string) error {
 			reactorID:  nextID,
 			descriptor: channelDescriptor,
 		}
+		maxMessageBytes = max(maxMessageBytes, channelDescriptor.RecvMessageCapacity)
 	}
+
+	consumerQueue, queue := rs.newReactorPriorityQueue(nextID, name, scaler, maxMessageBytes)
 
 	rs.reactors = append(rs.reactors, reactorItem{
 		Reactor:       reactor,
 		name:          name,
-		consumerQueue: rs.newReactorPriorityQueue(nextID, name, scaler),
+		consumerQueue: consumerQueue,
+		queue:         queue,
 	})
 
 	// add name to mapping
@@ -185,7 +193,7 @@ func (rs *reactorSet) getReactorWithProtocol(id protocol.ID) (reactorProtocol, r
 // - All messages are sorted by priority, most important are processed first
 // - We can process as many concurrent messages as possible
 // - In case of latency degradation, the system is downscale to preserve processing speed.
-func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Envelope, priority int) {
+func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Envelope, priority, payloadBytes int) {
 	idx, ok := rs.reactorNames[reactorName]
 	if !ok {
 		rs.switchRef.Logger.Error("Receive: reactor not found", "reactor", reactorName)
@@ -202,9 +210,10 @@ func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Enve
 	now := time.Now()
 
 	pq := pendingEnvelope{
-		Envelope:    envelope,
-		messageType: messageType,
-		addedAt:     now,
+		Envelope:     envelope,
+		messageType:  messageType,
+		addedAt:      now,
+		payloadBytes: payloadBytes,
 	}
 
 	err := reactor.consumerQueue.PushPriority(pq, priority)
@@ -228,6 +237,7 @@ func (rs *reactorSet) Receive(reactorName, messageType string, envelope p2p.Enve
 
 func (rs *reactorSet) receiveQueued(reactorID int, e pendingEnvelope) {
 	reactor := rs.reactors[reactorID]
+	defer reactor.queue.Release(e)
 
 	labels := messageLabels(reactor.name, e.messageType)
 
@@ -284,7 +294,8 @@ func (rs *reactorSet) newReactorPriorityQueue(
 	reactorID int,
 	reactorName string,
 	scaler *autopool.ThroughputLatencyScaler,
-) *autopool.Pool[pendingEnvelope] {
+	maxMessageBytes int,
+) (*autopool.Pool[pendingEnvelope], *autopool.PriorityQueue) {
 	const (
 		// variety of priorities (cometbft has up to 10)
 		priorities = 10
@@ -294,25 +305,47 @@ func (rs *reactorSet) newReactorPriorityQueue(
 		concurrentPoolCapacity = 512
 	)
 
-	// override MaxQueueSize == nil means unset (old/partial config); non-nil
+	// an override bound of nil means unset (old/partial config); non-nil
 	// (including *0) is an explicit choice, e.g. an intentional unbounded reactor.
 	scalerCfg := rs.switchRef.host.config.Scaler
-	maxQueueSize := scalerCfg.MaxQueueSize
-	if override, ok := findScalerOverride(scalerCfg.Overrides, reactorName); ok && override.MaxQueueSize != nil {
-		maxQueueSize = *override.MaxQueueSize
+	maxQueueSize, maxQueueBytes := scalerCfg.MaxQueueSize, scalerCfg.MaxQueueBytes
+	if override, ok := findScalerOverride(scalerCfg.Overrides, reactorName); ok {
+		if override.MaxQueueSize != nil {
+			maxQueueSize = *override.MaxQueueSize
+		}
+		if override.MaxQueueBytes != nil {
+			maxQueueBytes = *override.MaxQueueBytes
+		}
+	}
+
+	if maxQueueBytes > 0 && maxQueueBytes < maxMessageBytes {
+		rs.switchRef.Logger.Error(
+			"max_queue_bytes is below the reactor's largest message; larger messages will always be dropped",
+			"reactor", reactorName,
+			"max_queue_bytes", maxQueueBytes,
+			"max_message_bytes", maxMessageBytes,
+		)
 	}
 
 	concurrencyCounter := rs.
 		switchRef.metrics.MessageReactorQueueConcurrency.
 		With("reactor", reactorName)
 
-	priorityQueue := autopool.NewPriorityQueueWithMax(priorities, maxQueueSize, autopool.WithOnEvict(func(v any) {
-		e, ok := v.(pendingEnvelope)
-		if !ok {
-			return
-		}
-		rs.recordDrop(messageLabels(reactorName, e.messageType))
-	}))
+	priorityQueue := autopool.NewPriorityQueueWithMax(
+		priorities,
+		maxQueueSize,
+		autopool.WithMaxBytes(maxQueueBytes, func(v any) int {
+			e, _ := v.(pendingEnvelope)
+			return e.payloadBytes
+		}),
+		autopool.WithOnEvict(func(v any) {
+			e, ok := v.(pendingEnvelope)
+			if !ok {
+				return
+			}
+			rs.recordDrop(messageLabels(reactorName, e.messageType))
+		}),
+	)
 
 	return autopool.New(
 		scaler,
@@ -328,7 +361,7 @@ func (rs *reactorSet) newReactorPriorityQueue(
 			concurrencyCounter.Add(-1)
 		}),
 		autopool.WithPriorityQueue[pendingEnvelope](priorityQueue),
-	)
+	), priorityQueue
 }
 
 func (rs *reactorSet) newReactorScaler(reactorName string) (*autopool.ThroughputLatencyScaler, error) {

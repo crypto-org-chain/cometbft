@@ -67,8 +67,12 @@ type PriorityQueue struct {
 	maxSize int
 	// size mirrors sum(levels[i].Len()); kept as a counter so Push doesn't need
 	// to scan all levels (and their locks) to check capacity.
-	size int
-	mu   sync.Mutex
+	size       int
+	maxBytes   int
+	bytes      int
+	levelBytes []int
+	sizeOf     func(value any) int
+	mu         sync.Mutex
 
 	// onEvict, if set, is called with the value dropped by evictLowerPriority.
 	onEvict func(value any)
@@ -88,13 +92,20 @@ func WithOnEvict(onEvict func(value any)) PriorityQueueOption {
 	return func(q *PriorityQueue) { q.onEvict = onEvict }
 }
 
+func WithMaxBytes(maxBytes int, sizeOf func(value any) int) PriorityQueueOption {
+	return func(q *PriorityQueue) {
+		q.maxBytes = maxBytes
+		q.sizeOf = sizeOf
+	}
+}
+
 func NewPriorityQueue(priorities int) *PriorityQueue {
 	return NewPriorityQueueWithMax(priorities, 0)
 }
 
 // NewPriorityQueueWithMax bounds total depth at maxSize (0 means unbounded).
-// Once full, Push evicts the oldest lower-priority item if there is one, else rejects, so low-priority bursts can't
-// starve high-priority admission.
+// Once full, Push evicts the oldest lower-priority items until the value fits both bounds, else rejects, so
+// low-priority bursts can't starve high-priority admission.
 func NewPriorityQueueWithMax(priorities, maxSize int, opts ...PriorityQueueOption) *PriorityQueue {
 	if priorities <= 0 {
 		priorities = 1
@@ -108,6 +119,7 @@ func NewPriorityQueueWithMax(priorities, maxSize int, opts ...PriorityQueueOptio
 	q := &PriorityQueue{
 		priorities:           priorities,
 		levels:               queues,
+		levelBytes:           make([]int, priorities),
 		highestNonEmptyLevel: -1,
 		maxSize:              maxSize,
 		mu:                   sync.Mutex{},
@@ -130,13 +142,22 @@ func (q *PriorityQueue) Push(value any, priority int) error {
 	defer q.mu.Unlock()
 
 	idx := priority - 1
+	n := q.valueBytes(value)
 
-	if q.maxSize > 0 && q.size >= q.maxSize && !q.evictLowerPriority(idx) {
+	if !q.canMakeRoom(idx, n) {
 		return ErrQueueFull
+	}
+
+	for q.exceeds(1, n) {
+		if !q.evictLowerPriority(idx) {
+			return ErrQueueFull
+		}
 	}
 
 	q.levels[idx].Push(value)
 	q.size++
+	q.bytes += n
+	q.levelBytes[idx] += n
 
 	if idx > q.highestNonEmptyLevel {
 		q.highestNonEmptyLevel = idx
@@ -147,11 +168,55 @@ func (q *PriorityQueue) Push(value any, priority int) error {
 	return nil
 }
 
+func (q *PriorityQueue) canMakeRoom(idx, n int) bool {
+	if !q.exceeds(1, n) {
+		return true
+	}
+
+	evictable, evictableBytes := 0, 0
+	for i := 0; i < idx; i++ {
+		evictable += q.levels[i].Len()
+		evictableBytes += q.levelBytes[i]
+	}
+
+	return !q.exceeds(1-evictable, n-evictableBytes)
+}
+
+func (q *PriorityQueue) exceeds(count, n int) bool {
+	return (q.maxSize > 0 && q.size+count > q.maxSize) ||
+		(q.maxBytes > 0 && q.bytes+n > q.maxBytes)
+}
+
+func (q *PriorityQueue) valueBytes(value any) int {
+	if q.sizeOf == nil {
+		return 0
+	}
+
+	return max(q.sizeOf(value), 0)
+}
+
+func (q *PriorityQueue) Release(value any) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.bytes = max(q.bytes-q.valueBytes(value), 0)
+}
+
+func (q *PriorityQueue) Bytes() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return q.bytes
+}
+
 // evictLowerPriority drops the oldest item from the lowest occupied level below newIdx; false if none to evict.
 func (q *PriorityQueue) evictLowerPriority(newIdx int) bool {
 	for i := 0; i < newIdx; i++ {
 		if v, ok := q.levels[i].Pop(); ok {
+			n := q.valueBytes(v)
 			q.size--
+			q.bytes -= n
+			q.levelBytes[i] -= n
 			if q.onEvict != nil {
 				q.onEvict(v)
 			}
@@ -182,6 +247,7 @@ func (q *PriorityQueue) Pop() (any, bool) {
 	for i := q.highestNonEmptyLevel; i >= 0; i-- {
 		if v, ok := q.levels[i].Pop(); ok {
 			q.size--
+			q.levelBytes[i] -= q.valueBytes(v)
 			q.updateHighestNonEmpty(i)
 			return v, ok
 		}

@@ -224,6 +224,97 @@ func TestPriorityQueueWithMaxEvictsLowerPriorityWhenFull(t *testing.T) {
 	require.ErrorIs(t, q.Push("no-room-either", 2), ErrQueueFull)
 }
 
+func TestPriorityQueueWithMaxBytes(t *testing.T) {
+	type push struct{ size, priority int }
+
+	for _, tt := range []struct {
+		name        string
+		maxSize     int
+		queued      []push
+		push        push
+		wantErr     error
+		wantEvicted []any
+		wantBytes   int
+	}{
+		{
+			name:      "fits under the limit",
+			queued:    []push{{4, 1}, {4, 1}},
+			push:      push{2, 1},
+			wantBytes: 10,
+		},
+		{
+			name:      "same priority over the limit is rejected",
+			queued:    []push{{6, 1}},
+			push:      push{5, 1},
+			wantErr:   ErrQueueFull,
+			wantBytes: 6,
+		},
+		{
+			name:        "higher priority evicts until it fits",
+			queued:      []push{{3, 1}, {3, 1}, {3, 1}},
+			push:        push{7, 2},
+			wantEvicted: []any{3, 3},
+			wantBytes:   10,
+		},
+		{
+			name:      "too small a lower-priority backlog evicts nothing",
+			queued:    []push{{3, 1}, {6, 2}},
+			push:      push{8, 2},
+			wantErr:   ErrQueueFull,
+			wantBytes: 9,
+		},
+		{
+			name:        "evicts until both limits fit",
+			maxSize:     2,
+			queued:      []push{{1, 1}, {1, 1}},
+			push:        push{9, 2},
+			wantEvicted: []any{1},
+			wantBytes:   10,
+		},
+		{
+			name:      "room in bytes but not in count evicts nothing",
+			maxSize:   1,
+			queued:    []push{{1, 2}},
+			push:      push{1, 2},
+			wantErr:   ErrQueueFull,
+			wantBytes: 1,
+		},
+		{
+			name:    "value larger than the limit is rejected",
+			push:    push{11, 3},
+			wantErr: ErrQueueFull,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var evicted []any
+			q := NewPriorityQueueWithMax(3, tt.maxSize,
+				WithMaxBytes(10, func(v any) int { return v.(int) }),
+				WithOnEvict(func(v any) { evicted = append(evicted, v) }),
+			)
+			for _, p := range tt.queued {
+				require.NoError(t, q.Push(p.size, p.priority))
+			}
+
+			require.ErrorIs(t, q.Push(tt.push.size, tt.push.priority), tt.wantErr)
+			require.Equal(t, tt.wantEvicted, evicted)
+			require.Equal(t, tt.wantBytes, q.Bytes())
+		})
+	}
+}
+
+func TestPriorityQueueWithMaxBytesHoldsPoppedUntilRelease(t *testing.T) {
+	q := NewPriorityQueueWithMax(1, 0, WithMaxBytes(10, func(v any) int { return v.(int) }))
+	require.NoError(t, q.Push(6, 1))
+
+	v, ok := q.Pop()
+	require.True(t, ok)
+	require.ErrorIs(t, q.Push(6, 1), ErrQueueFull)
+
+	q.Release(v)
+	require.Zero(t, q.Bytes())
+	require.NoError(t, q.Push(6, 1))
+}
+
 type testData struct {
 	priority uint64
 	value    string
