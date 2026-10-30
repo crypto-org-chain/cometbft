@@ -223,12 +223,29 @@ func TestP2PConfigValidateBasic(t *testing.T) {
 				errContains: "p2p.libp2p.scaler.overrides.0.max_queue_size can't be negative",
 			},
 			{
+				name: "rejectsNegativeScalerMaxQueueBytes",
+				mutate: func(cfg *config.P2PConfig) {
+					cfg.LibP2PConfig.Scaler.MaxQueueBytes = -1
+				},
+				errContains: "p2p.libp2p.scaler.max_queue_bytes can't be negative",
+			},
+			{
+				name: "rejectsNegativeOverrideMaxQueueBytes",
+				mutate: func(cfg *config.P2PConfig) {
+					negative := -1
+					cfg.LibP2PConfig.Scaler.Overrides = []config.LibP2PScalerOverride{
+						{Reactor: "MEMPOOL", MaxQueueBytes: &negative},
+					}
+				},
+				errContains: "p2p.libp2p.scaler.overrides.0.max_queue_bytes can't be negative",
+			},
+			{
 				name: "allowsUnsetAndExplicitZeroOverrideMaxQueueSize",
 				mutate: func(cfg *config.P2PConfig) {
 					zero := 0
 					cfg.LibP2PConfig.Scaler.Overrides = []config.LibP2PScalerOverride{
 						{Reactor: "MEMPOOL"},
-						{Reactor: "BLOCKSYNC", MaxQueueSize: &zero},
+						{Reactor: "BLOCKSYNC", MaxQueueSize: &zero, MaxQueueBytes: &zero},
 					}
 				},
 			},
@@ -423,19 +440,22 @@ max_workers = 16
 	defaults := config.DefaultLibP2PScaler()
 
 	for _, tc := range []struct {
-		name     string
-		toml     string
-		wantSize int
+		name      string
+		toml      string
+		wantSize  int
+		wantBytes int
 	}{
 		{
-			name:     "explicitGlobal",
-			toml:     "[p2p.libp2p.scaler]\nmax_queue_size = 50000\n" + override,
-			wantSize: 50000,
+			name:      "explicitGlobal",
+			toml:      "[p2p.libp2p.scaler]\nmax_queue_size = 50000\nmax_queue_bytes = 1024\n" + override,
+			wantSize:  50000,
+			wantBytes: 1024,
 		},
 		{
-			name:     "omittedGlobalKeepsDefault",
-			toml:     override,
-			wantSize: defaults.MaxQueueSize,
+			name:      "omittedGlobalKeepsDefault",
+			toml:      override,
+			wantSize:  defaults.MaxQueueSize,
+			wantBytes: defaults.MaxQueueBytes,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -448,10 +468,12 @@ max_workers = 16
 
 			scaler := cfg.P2P.LibP2PConfig.Scaler
 			require.Equal(t, tc.wantSize, scaler.MaxQueueSize)
+			require.Equal(t, tc.wantBytes, scaler.MaxQueueBytes)
 
 			require.Len(t, scaler.Overrides, 1)
 			require.Equal(t, "BLOCKSYNC", scaler.Overrides[0].Reactor)
 			assert.Nil(t, scaler.Overrides[0].MaxQueueSize, "omitted bound must stay nil so it inherits the global value")
+			assert.Nil(t, scaler.Overrides[0].MaxQueueBytes, "omitted bound must stay nil so it inherits the global value")
 		})
 	}
 }
@@ -459,8 +481,10 @@ max_workers = 16
 func TestDefaultLibP2PScalerQueueBounds(t *testing.T) {
 	scaler := config.DefaultLibP2PScaler()
 	require.Equal(t, 200_000, scaler.MaxQueueSize)
+	require.Equal(t, 200<<20, scaler.MaxQueueBytes)
 
 	for _, override := range scaler.Overrides {
 		assert.Nil(t, override.MaxQueueSize, "default override %q must not pin max_queue_size", override.Reactor)
+		assert.Nil(t, override.MaxQueueBytes, "default override %q must not pin max_queue_bytes", override.Reactor)
 	}
 }

@@ -6,6 +6,8 @@
 
 ### BUG FIXES
 
+- `[lp2p]` bound per-reactor queue by bytes
+  ([\#93](https://github.com/crypto-org-chain/cometbft/pull/93))
 - `[lp2p]` cap per-reactor priority queue to prevent memory-exhaustion DoS
   ([\#5955](https://github.com/cometbft/cometbft/pull/5955))
 - `[mempool]` AppMempool ABCI response handling, callback/cleanup, and lifecycle
