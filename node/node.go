@@ -327,6 +327,15 @@ func NewNodeWithContext(
 		return nil, err
 	}
 
+	if err := sm.ValidateMedianTimeActivation(genDoc.ChainID); err != nil {
+		return nil, err
+	}
+	if height, ok := sm.MedianTimeActivationHeight(genDoc.ChainID); ok {
+		logger.Info("Block time skips nil precommits from activation height", "chain_id", genDoc.ChainID, "activation_height", height)
+	} else {
+		logger.Info("Block time counts nil precommits", "chain_id", genDoc.ChainID)
+	}
+
 	csMetrics, p2pMetrics, memplMetrics, smMetrics, abciMetrics, bsMetrics, ssMetrics := metricsProvider(genDoc.ChainID)
 
 	// Create the proxyApp and establish connections to the ABCI app (consensus, mempool, query).

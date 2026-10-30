@@ -12,6 +12,8 @@
 
 ### STATE-BREAKING
 
+- `[state]` gate nil-precommit median time behind a per-chain activation height
+
 ### API-BREAKING
 
 ## v0.40.0

@@ -15,6 +15,7 @@ import (
 	abci "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/cometbft/cometbft/crypto/tmhash"
+	"github.com/cometbft/cometbft/internal/mediantime"
 	"github.com/cometbft/cometbft/internal/test"
 	"github.com/cometbft/cometbft/libs/log"
 	mpmocks "github.com/cometbft/cometbft/mempool/mocks"
@@ -374,7 +375,8 @@ func TestValidateBlockTime(t *testing.T) {
 	require.NoError(t, proxyApp.Start())
 	defer proxyApp.Stop() //nolint:errcheck // ignore for tests
 
-	state, stateDB, privVals := makeState(3, 1)
+	// Four validators, so three Commit votes still pass VerifyCommit next to a Nil one.
+	state, stateDB, privVals := makeState(4, 1)
 	stateStore := sm.NewStore(stateDB, sm.StoreOptions{
 		DiscardABCIResponses: false,
 	})
@@ -401,12 +403,15 @@ func TestValidateBlockTime(t *testing.T) {
 		blockStore,
 	)
 	lastCommit := &types.Commit{}
-	var lastExtCommit *types.ExtendedCommit
+	var (
+		lastBlockID   types.BlockID
+		lastExtCommit *types.ExtendedCommit
+	)
 
 	// Build up state for test
 	for height := int64(1); height < 3; height++ {
 		var err error
-		state, _, lastExtCommit, err = makeAndCommitGoodBlock(
+		state, lastBlockID, lastExtCommit, err = makeAndCommitGoodBlock(
 			state, height, lastCommit, state.Validators.GetProposer().Address, blockExec, privVals, nil)
 		require.NoError(t, err, "height %d", height)
 		lastCommit = lastExtCommit.ToCommit()
@@ -476,6 +481,67 @@ func TestValidateBlockTime(t *testing.T) {
 		require.NoError(t, err)
 		err = blockExecNoTol.ValidateBlock(state, block)
 		require.NoError(t, err)
+	})
+
+	t.Run("nil precommit median time activation", func(t *testing.T) {
+		// An early Nil precommit pulls the v0.39 median down by one Commit vote.
+		base := state.LastBlockTime
+		const nilVoteIdx = int32(3)
+		commit := &types.Commit{Height: 2, BlockID: lastBlockID}
+		for i := int32(0); i < int32(state.LastValidators.Size()); i++ {
+			_, val := state.LastValidators.GetByIndex(i)
+			blockID, ts := lastBlockID, base.Add(time.Duration(i+2)*time.Millisecond)
+			if i == nilVoteIdx {
+				blockID, ts = types.BlockID{}, base.Add(time.Millisecond)
+			}
+			vote, err := types.MakeVote(privVals[val.Address.String()], state.ChainID, i, 2, 0,
+				cmtproto.PrecommitType, blockID, ts)
+			require.NoError(t, err)
+			commit.Signatures = append(commit.Signatures, vote.CommitSig())
+		}
+		countsNil := base.Add(2 * time.Millisecond)
+		skipsNil := base.Add(3 * time.Millisecond)
+
+		const height = int64(3)
+		setActivation := func(activation int64) func(t *testing.T) {
+			return func(t *testing.T) { t.Cleanup(mediantime.SetForTesting(state.ChainID, activation)) }
+		}
+
+		testCases := []struct {
+			name      string
+			malleate  func(t *testing.T)
+			want      time.Time
+			wrongTime time.Time
+		}{
+			{"chain without entry counts nil precommits", func(*testing.T) {}, countsNil, skipsNil},
+			{"before activation counts nil precommits", setActivation(height + 1), countsNil, skipsNil},
+			{"at activation skips nil precommits", setActivation(height), skipsNil, countsNil},
+			{"after activation skips nil precommits", setActivation(height - 1), skipsNil, countsNil},
+		}
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				tc.malleate(t)
+
+				block, err := makeBlock(state, height, commit)
+				require.NoError(t, err)
+				require.WithinDuration(t, tc.want, block.Time, 0)
+				// state.ValidateBlock skips the executor's last-validated cache.
+				require.NoError(t, state.ValidateBlock(block))
+
+				block.Time = tc.wrongTime
+				require.ErrorContains(t, state.ValidateBlock(block), "invalid block time")
+			})
+		}
+
+		t.Run("unset activation height fails", func(t *testing.T) {
+			block, err := makeBlock(state, height, commit)
+			require.NoError(t, err)
+			setActivation(0)(t)
+
+			_, err = makeBlock(state, height, commit)
+			require.ErrorContains(t, err, "not set in this build")
+			require.ErrorContains(t, state.ValidateBlock(block), "not set in this build")
+		})
 	})
 }
 

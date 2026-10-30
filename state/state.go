@@ -12,7 +12,6 @@ import (
 	cmtstate "github.com/cometbft/cometbft/proto/tendermint/state"
 	cmtversion "github.com/cometbft/cometbft/proto/tendermint/version"
 	"github.com/cometbft/cometbft/types"
-	cmttime "github.com/cometbft/cometbft/types/time"
 	"github.com/cometbft/cometbft/version"
 )
 
@@ -246,7 +245,7 @@ func (state State) MakeBlock(
 	if height == state.InitialHeight {
 		timestamp = state.LastBlockTime // genesis time
 	} else {
-		ts, err := MedianTime(lastCommit, state.LastValidators)
+		ts, err := blockMedianTime(state, height, lastCommit)
 		if err != nil {
 			return nil, fmt.Errorf("error making block while calculating median time: %w", err)
 		}
@@ -273,28 +272,14 @@ func (state State) ValidateBlock(block *types.Block) error {
 // MedianTime computes a median time for a given Commit (based on Timestamp field of votes messages) and the
 // corresponding validator set. The computed time is always between timestamps of
 // the votes sent by honest processes, i.e., a faulty processes can not arbitrarily increase or decrease the
-// computed value.
+// computed value. Consensus uses it only from a chain's median time activation
+// height on (see MedianTimeActivationHeight).
 func MedianTime(commit *types.Commit, validators *types.ValidatorSet) (time.Time, error) {
-	weightedTimes := make([]*cmttime.WeightedTime, len(commit.Signatures))
-	totalVotingPower := int64(0)
-
-	for i, commitSig := range commit.Signatures {
-		// Only commit votes justify the block (see VerifyCommit); Nil/Absent
-		// votes must not contribute to the time.
-		if commitSig.BlockIDFlag != types.BlockIDFlagCommit {
-			continue
-		}
-		_, validator := validators.GetByAddress(commitSig.ValidatorAddress)
-		// If there's no condition, TestValidateBlockCommit panics; not needed normally.
-		if validator == nil {
-			return time.Time{}, fmt.Errorf("commit validator not found in validator set: %X",
-				commitSig.ValidatorAddress)
-		}
-		totalVotingPower += validator.VotingPower
-		weightedTimes[i] = cmttime.NewWeightedTime(commitSig.Timestamp, validator.VotingPower)
-	}
-
-	return cmttime.WeightedMedian(weightedTimes, totalVotingPower), nil
+	// Only commit votes justify the block (see VerifyCommit); Nil/Absent
+	// votes must not contribute to the time.
+	return weightedMedianTime(commit, validators, func(flag types.BlockIDFlag) bool {
+		return flag == types.BlockIDFlagCommit
+	})
 }
 
 //------------------------------------------------------------------------
