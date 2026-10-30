@@ -682,6 +682,7 @@ type LibP2PScaler struct {
 	MaxWorkers       int                    `mapstructure:"max_workers"`
 	ThresholdLatency time.Duration          `mapstructure:"threshold_latency"`
 	MaxQueueSize     int                    `mapstructure:"max_queue_size"`
+	MaxQueueBytes    int                    `mapstructure:"max_queue_bytes"`
 	Overrides        []LibP2PScalerOverride `mapstructure:"overrides"`
 }
 
@@ -692,6 +693,7 @@ type LibP2PScalerOverride struct {
 	MaxWorkers       int           `mapstructure:"max_workers"`
 	ThresholdLatency time.Duration `mapstructure:"threshold_latency"`
 	MaxQueueSize     *int          `mapstructure:"max_queue_size"`
+	MaxQueueBytes    *int          `mapstructure:"max_queue_bytes"`
 }
 
 // LibP2PLimits parameters for lib-p2p resource manager.
@@ -821,14 +823,15 @@ func DefaultLibP2PScaler() LibP2PScaler {
 		MaxWorkers:       32,
 		ThresholdLatency: 100 * time.Millisecond,
 		MaxQueueSize:     200_000,
+		MaxQueueBytes:    200 << 20,
 		Overrides: []LibP2PScalerOverride{
 			{
 				Reactor:          "MEMPOOL",
 				MinWorkers:       8,
 				MaxWorkers:       512,
 				ThresholdLatency: 500 * time.Millisecond,
-				// MaxQueueSize stays nil: a non-nil default would survive config reload
-				// into overrides[0] that omit it, masking the global cap.
+				// The queue bounds stay nil: a non-nil default would survive config reload
+				// into overrides[0] that omit them, masking the global caps.
 			},
 		},
 	}
@@ -853,6 +856,8 @@ func (s *LibP2PScaler) ValidateBasic() error {
 		return cmterrors.ErrNegativeField{Field: key("threshold_latency")}
 	case s.MaxQueueSize < 0:
 		return cmterrors.ErrNegativeField{Field: key("max_queue_size")}
+	case s.MaxQueueBytes < 0:
+		return cmterrors.ErrNegativeField{Field: key("max_queue_bytes")}
 	case len(s.Overrides) > 0:
 		for i, item := range s.Overrides {
 			switch {
@@ -871,6 +876,8 @@ func (s *LibP2PScaler) ValidateBasic() error {
 				return cmterrors.ErrNegativeField{Field: key("overrides.%d.threshold_latency", i)}
 			case item.MaxQueueSize != nil && *item.MaxQueueSize < 0:
 				return cmterrors.ErrNegativeField{Field: key("overrides.%d.max_queue_size", i)}
+			case item.MaxQueueBytes != nil && *item.MaxQueueBytes < 0:
+				return cmterrors.ErrNegativeField{Field: key("overrides.%d.max_queue_bytes", i)}
 			}
 		}
 	}
