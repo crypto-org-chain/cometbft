@@ -13,6 +13,7 @@
 ### STATE-BREAKING
 
 - `[state]` gate nil-precommit median time behind a per-chain activation height
+  ([\#94](https://github.com/crypto-org-chain/cometbft/pull/94))
 
 ### API-BREAKING
 
