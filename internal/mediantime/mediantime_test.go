@@ -6,8 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A missing or misspelled entry silently turns a network into an unknown chain
-// that counts Nil precommits forever.
+// A missing or misspelled entry would silently keep the v0.39 rule forever.
 func TestReleaseHeightsListKnownChains(t *testing.T) {
 	for _, chainID := range []string{"cronosmainnet_25-1", "cronostestnet_338-3"} {
 		_, ok := ActivationHeight(chainID)

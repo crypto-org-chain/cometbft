@@ -1365,9 +1365,7 @@ func TestHandshakeUpdatesValidators(t *testing.T) {
 	assert.Equal(t, newValAddr, expectValAddr)
 }
 
-// Mirrors a v0.39 → v0.40 upgrade: block H was committed under the v0.39 median
-// time rule, then the app halted before applying it, so app = state = H-1 and
-// store = H when the new binary replays H.
+// v0.39 committed block H and halted before applying it; the new binary replays H.
 func TestHandshakeReplayNilPrecommitBlockAtUpgrade(t *testing.T) {
 	const (
 		chainID       = "median_time_replay_chain"
@@ -1410,8 +1408,6 @@ func TestHandshakeReplayNilPrecommitBlockAtUpgrade(t *testing.T) {
 	}
 }
 
-// The tip's last commit has an early Nil precommit, so the v0.40 rule gives a
-// later block time than the v0.39 one the tip carries.
 func makeChainWithNilPrecommitTip(t *testing.T, chainID string, tipHeight int64) (
 	sm.Store, sm.State, *mockBlockStore, *types.GenesisDoc, abci.Application,
 ) {
@@ -1473,6 +1469,7 @@ func makeChainWithNilPrecommitTip(t *testing.T, chainID string, tipHeight int64)
 		for i, privVal := range privVals {
 			valIdx, _ := state.LastValidators.GetByAddress(genVals[i].Address)
 			voteBlockID, ts := blockID, block.Time.Add(time.Duration(i+2)*time.Millisecond)
+			// Early Nil vote: v0.39 counts it, v0.40 skips it, so the rules give different tip times.
 			if height == tipHeight-1 && i == nilVoteIdx {
 				voteBlockID, ts = types.BlockID{}, block.Time.Add(time.Millisecond)
 			}

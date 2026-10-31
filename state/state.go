@@ -272,8 +272,7 @@ func (state State) ValidateBlock(block *types.Block) error {
 // MedianTime computes a median time for a given Commit (based on Timestamp field of votes messages) and the
 // corresponding validator set. The computed time is always between timestamps of
 // the votes sent by honest processes, i.e., a faulty processes can not arbitrarily increase or decrease the
-// computed value. Consensus uses it only from a chain's median time activation
-// height on (see MedianTimeActivationHeight).
+// computed value. Consensus uses it only on known chains, from MedianTimeActivationHeight on.
 func MedianTime(commit *types.Commit, validators *types.ValidatorSet) (time.Time, error) {
 	// Only commit votes justify the block (see VerifyCommit); Nil/Absent
 	// votes must not contribute to the time.

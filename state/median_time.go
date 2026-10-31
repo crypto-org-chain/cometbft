@@ -9,15 +9,13 @@ import (
 	cmttime "github.com/cometbft/cometbft/types/time"
 )
 
-// MedianTimeActivationHeight returns the height from which block time skips
-// Nil precommits on chainID. ok is false for chains that always count them.
-// Exported so downstream binaries can report it, e.g. in version output.
+// MedianTimeActivationHeight is where block time starts skipping Nil precommits;
+// ok is false for chains that never do. Exported so downstream binaries can report it.
 func MedianTimeActivationHeight(chainID string) (height int64, ok bool) {
 	return mediantime.ActivationHeight(chainID)
 }
 
-// ValidateMedianTimeActivation fails for a known chain whose activation height
-// is unset in this build, so a node refuses to start before it validates blocks.
+// ValidateMedianTimeActivation fails for a known chain with no height in this build.
 func ValidateMedianTimeActivation(chainID string) error {
 	if height, ok := mediantime.ActivationHeight(chainID); ok && height <= 0 {
 		return errMedianTimeActivationUnset(chainID)
@@ -29,9 +27,8 @@ func errMedianTimeActivationUnset(chainID string) error {
 	return fmt.Errorf("median time activation height for chain %q is not set in this build", chainID)
 }
 
-// blockMedianTime picks the median time rule for the block at height, so the
-// proposer and every validator agree on it. A known chain with an unset height
-// fails here too, for paths that never run the node startup check.
+// Proposer and validators must pick the same rule. Rejects an unset height for
+// paths that skip the node startup check.
 func blockMedianTime(state State, height int64, commit *types.Commit) (time.Time, error) {
 	activation, ok := mediantime.ActivationHeight(state.ChainID)
 	if ok && activation <= 0 {
