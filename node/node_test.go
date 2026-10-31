@@ -19,6 +19,7 @@ import (
 	cfg "github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	"github.com/cometbft/cometbft/evidence"
+	"github.com/cometbft/cometbft/internal/mediantime"
 	"github.com/cometbft/cometbft/internal/test"
 	"github.com/cometbft/cometbft/libs/log"
 	cmtrand "github.com/cometbft/cometbft/libs/rand"
@@ -112,6 +113,16 @@ func TestNodeDelayedStart(t *testing.T) {
 
 	startTime := cmttime.Now()
 	assert.Equal(t, true, startTime.After(n.GenesisDoc().GenesisTime))
+}
+
+func TestNodeRefusesUnsetMedianTimeActivation(t *testing.T) {
+	const chainID = "median_time_unset_chain"
+	t.Cleanup(mediantime.SetForTesting(chainID, 0))
+	config := test.ResetTestRootWithChainID("node_median_time_activation_test", chainID)
+	defer os.RemoveAll(config.RootDir)
+
+	_, err := DefaultNewNode(config, log.TestingLogger())
+	require.ErrorContains(t, err, "median time activation height")
 }
 
 func TestNodeSetAppVersion(t *testing.T) {

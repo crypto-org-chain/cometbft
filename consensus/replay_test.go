@@ -24,6 +24,7 @@ import (
 	"github.com/cometbft/cometbft/abci/types/mocks"
 	cfg "github.com/cometbft/cometbft/config"
 	cryptoenc "github.com/cometbft/cometbft/crypto/encoding"
+	"github.com/cometbft/cometbft/internal/mediantime"
 	"github.com/cometbft/cometbft/internal/test"
 	"github.com/cometbft/cometbft/libs/log"
 	cmtrand "github.com/cometbft/cometbft/libs/rand"
@@ -1362,4 +1363,121 @@ func TestHandshakeUpdatesValidators(t *testing.T) {
 	expectValAddr := val.Address
 	assert.NotEqual(t, oldValAddr, newValAddr)
 	assert.Equal(t, newValAddr, expectValAddr)
+}
+
+// v0.39 committed block H and halted before applying it; the new binary replays H.
+func TestHandshakeReplayNilPrecommitBlockAtUpgrade(t *testing.T) {
+	const (
+		chainID       = "median_time_replay_chain"
+		upgradeHeight = int64(3)
+	)
+
+	testCases := []struct {
+		name       string
+		activation int64
+		expErr     bool
+	}{
+		{"activation after upgrade height replays the block", upgradeHeight + 1, false},
+		{"activation at upgrade height halts on the block", upgradeHeight, true},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			stateStore, state, store, genDoc, app := makeChainWithNilPrecommitTip(t, chainID, upgradeHeight)
+
+			t.Cleanup(mediantime.SetForTesting(chainID, tc.activation))
+
+			proxyApp := proxy.NewAppConns(proxy.NewLocalClientCreator(app), proxy.NopMetrics())
+			require.NoError(t, proxyApp.Start())
+			t.Cleanup(func() {
+				if err := proxyApp.Stop(); err != nil {
+					t.Error(err)
+				}
+			})
+
+			err := NewHandshaker(stateStore, state, store, genDoc).Handshake(proxyApp)
+			if tc.expErr {
+				require.ErrorContains(t, err, "invalid block time")
+				return
+			}
+			require.NoError(t, err)
+
+			res, err := proxyApp.Query().Info(context.Background(), proxy.RequestInfo)
+			require.NoError(t, err)
+			require.Equal(t, upgradeHeight, res.LastBlockHeight)
+		})
+	}
+}
+
+func makeChainWithNilPrecommitTip(t *testing.T, chainID string, tipHeight int64) (
+	sm.Store, sm.State, *mockBlockStore, *types.GenesisDoc, abci.Application,
+) {
+	t.Helper()
+
+	// Four validators, so three Commit votes still pass VerifyCommit next to a Nil one.
+	const nilVoteIdx = 3
+	privVals := make([]types.PrivValidator, 4)
+	genVals := make([]types.GenesisValidator, len(privVals))
+	for i := range privVals {
+		privVal := types.NewMockPV()
+		pubKey, err := privVal.GetPubKey()
+		require.NoError(t, err)
+		privVals[i] = privVal
+		genVals[i] = types.GenesisValidator{Address: pubKey.Address(), PubKey: pubKey, Power: 10}
+	}
+	genDoc := &types.GenesisDoc{ChainID: chainID, Validators: genVals}
+	require.NoError(t, genDoc.ValidateAndComplete())
+	state, err := sm.MakeGenesisState(genDoc)
+	require.NoError(t, err)
+	state.Version.Consensus.App = kvstore.AppVersion
+
+	stateStore := sm.NewStore(dbm.NewMemDB(), sm.StoreOptions{DiscardABCIResponses: false})
+	t.Cleanup(func() { _ = stateStore.Close() })
+	require.NoError(t, stateStore.Save(state))
+	store := newMockBlockStore(t, nil, state.ConsensusParams)
+
+	app := kvstore.NewInMemoryApplication()
+	proxyApp := proxy.NewAppConns(proxy.NewLocalClientCreator(app), proxy.NopMetrics())
+	require.NoError(t, proxyApp.Start())
+	t.Cleanup(func() {
+		if err := proxyApp.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
+	_, err = proxyApp.Consensus().InitChain(context.Background(), &abci.RequestInitChain{
+		Validators: types.TM2PB.ValidatorUpdates(state.Validators),
+	})
+	require.NoError(t, err)
+
+	blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyApp.Consensus(),
+		emptyMempool{}, sm.EmptyEvidencePool{}, store)
+	lastCommit := &types.Commit{}
+	for height := int64(1); height <= tipHeight; height++ {
+		block, err := state.MakeBlock(height, nil, lastCommit, nil, state.Validators.GetProposer().Address)
+		require.NoError(t, err)
+		store.chain = append(store.chain, block)
+		if height == tipHeight {
+			break
+		}
+
+		parts, err := block.MakePartSet(types.BlockPartSizeBytes)
+		require.NoError(t, err)
+		blockID := types.BlockID{Hash: block.Hash(), PartSetHeader: parts.Header()}
+		state, err = blockExec.ApplyBlock(state, blockID, block)
+		require.NoError(t, err)
+
+		lastCommit = &types.Commit{Height: height, BlockID: blockID, Signatures: make([]types.CommitSig, len(privVals))}
+		for i, privVal := range privVals {
+			valIdx, _ := state.LastValidators.GetByAddress(genVals[i].Address)
+			voteBlockID, ts := blockID, block.Time.Add(time.Duration(i+2)*time.Millisecond)
+			// Early Nil vote: v0.39 counts it, v0.40 skips it, so the rules give different tip times.
+			if height == tipHeight-1 && i == nilVoteIdx {
+				voteBlockID, ts = types.BlockID{}, block.Time.Add(time.Millisecond)
+			}
+			vote, err := types.MakeVote(privVal, chainID, valIdx, height, 0, cmtproto.PrecommitType, voteBlockID, ts)
+			require.NoError(t, err)
+			lastCommit.Signatures[valIdx] = vote.CommitSig()
+		}
+	}
+
+	return stateStore, state, store, genDoc, app
 }

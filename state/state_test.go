@@ -17,6 +17,7 @@ import (
 	abci "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/crypto/ed25519"
 	cryptoenc "github.com/cometbft/cometbft/crypto/encoding"
+	"github.com/cometbft/cometbft/internal/mediantime"
 	"github.com/cometbft/cometbft/internal/test"
 	cmtrand "github.com/cometbft/cometbft/libs/rand"
 	sm "github.com/cometbft/cometbft/state"
@@ -1239,4 +1240,33 @@ func TestMedianTime(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, now, medianTime)
 	})
+}
+
+func TestValidateMedianTimeActivation(t *testing.T) {
+	const chainID = "median_time_activation_chain"
+
+	testCases := []struct {
+		name     string
+		malleate func(t *testing.T)
+		expErr   bool
+	}{
+		{"chain without entry", func(*testing.T) {}, false},
+		{"chain with unset height", func(t *testing.T) {
+			t.Cleanup(mediantime.SetForTesting(chainID, 0))
+		}, true},
+		{"chain with height", func(t *testing.T) {
+			t.Cleanup(mediantime.SetForTesting(chainID, 100))
+		}, false},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.malleate(t)
+			err := sm.ValidateMedianTimeActivation(chainID)
+			if tc.expErr {
+				require.ErrorContains(t, err, "median time activation height")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
 }
