@@ -519,18 +519,35 @@ func (h *Handshaker) replayBlocks(
 	return appHash, nil
 }
 
-// ApplyBlock on the proxyApp with the last block.
+// replayBlock applies the stored block at height, checking only that it extends state.
 func (h *Handshaker) replayBlock(state sm.State, height int64, proxyApp proxy.AppConnConsensus) (sm.State, error) {
 	block := h.store.LoadBlock(height)
+	if block == nil {
+		return sm.State{}, fmt.Errorf("stored block %d not found", height)
+	}
 	meta := h.store.LoadBlockMeta(height)
+	if meta == nil {
+		return sm.State{}, fmt.Errorf("stored block meta %d not found", height)
+	}
+
+	if !block.LastBlockID.Equals(state.LastBlockID) {
+		return sm.State{}, fmt.Errorf("stored block %d does not extend state: wrong LastBlockID. Expected %v, got %v",
+			height, state.LastBlockID, block.LastBlockID)
+	}
+	if !bytes.Equal(block.AppHash, state.AppHash) {
+		return sm.State{}, fmt.Errorf("stored block %d does not extend state: wrong AppHash. Expected %X, got %X",
+			height, state.AppHash, block.AppHash)
+	}
 
 	// Use stubs for both mempool and evidence pool since no transactions nor
 	// evidence are needed here - block already exists.
 	blockExec := sm.NewBlockExecutor(h.stateStore, h.logger, proxyApp, emptyMempool{}, sm.EmptyEvidencePool{}, h.store)
 	blockExec.SetEventBus(h.eventBus)
 
+	// Stored blocks were validated before saving, possibly by the previous binary
+	// in an upgrade; newer rules (such as median block time) could reject them.
 	var err error
-	state, err = blockExec.ApplyBlock(state, meta.BlockID, block)
+	state, err = blockExec.ApplyVerifiedBlock(state, meta.BlockID, block)
 	if err != nil {
 		return sm.State{}, err
 	}

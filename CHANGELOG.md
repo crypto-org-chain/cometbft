@@ -9,6 +9,9 @@
 
 ### BUG FIXES
 
+- `[consensus]` skip validation of the stored tip block replayed in the handshake
+  ([\#94](https://github.com/crypto-org-chain/cometbft/pull/94))
+
 ### IMPROVEMENTS
 
 ### FEATURES

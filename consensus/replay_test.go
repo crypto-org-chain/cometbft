@@ -1363,3 +1363,184 @@ func TestHandshakeUpdatesValidators(t *testing.T) {
 	assert.NotEqual(t, oldValAddr, newValAddr)
 	assert.Equal(t, newValAddr, expectValAddr)
 }
+
+// The previous binary stored the tip with Nil precommits counted in its time
+// and halted before saving state; the upgraded binary replays it.
+func TestHandshakeReplayTipBlockFromPreviousBinary(t *testing.T) {
+	const (
+		chainID   = "replay_previous_binary_tip"
+		tipHeight = int64(3)
+	)
+
+	testCases := []struct {
+		name            string
+		appCommittedTip bool
+		malleate        func(*sm.State, *mockBlockStore)
+		expErr          string
+	}{
+		{name: "real app replays the tip"},
+		{name: "mock app replays the tip the app already committed", appCommittedTip: true},
+		{
+			name:     "tip not extending state LastBlockID is rejected",
+			malleate: func(s *sm.State, _ *mockBlockStore) { s.LastBlockID = types.BlockID{Hash: make([]byte, 32)} },
+			expErr:   "wrong LastBlockID",
+		},
+		{
+			name:     "tip not extending state AppHash is rejected",
+			malleate: func(s *sm.State, _ *mockBlockStore) { s.AppHash = []byte("other app hash") },
+			expErr:   "wrong AppHash",
+		},
+		{
+			name:     "missing tip block is rejected",
+			malleate: func(_ *sm.State, bs *mockBlockStore) { bs.chain[tipHeight-1] = nil },
+			expErr:   "stored block 3 not found",
+		},
+		{
+			name:            "tip not extending state AppHash is rejected with mock app",
+			appCommittedTip: true,
+			malleate:        func(s *sm.State, _ *mockBlockStore) { s.AppHash = []byte("other app hash") },
+			expErr:          "wrong AppHash",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			stateStore, state, store, genDoc, proxyApp := makeChainWithCountNilTip(t, chainID, tipHeight)
+			tip := store.LoadBlock(tipHeight)
+
+			if tc.appCommittedTip {
+				resp, err := proxyApp.Consensus().FinalizeBlock(ctx, &abci.RequestFinalizeBlock{
+					Hash:               tip.Hash(),
+					NextValidatorsHash: tip.NextValidatorsHash,
+					ProposerAddress:    tip.ProposerAddress,
+					Height:             tip.Height,
+					Time:               tip.Time,
+				})
+				require.NoError(t, err)
+				_, err = proxyApp.Consensus().Commit(ctx)
+				require.NoError(t, err)
+				require.NoError(t, stateStore.SaveFinalizeBlockResponse(tipHeight, resp))
+			}
+
+			// Outside the handshake, such as in blocksync, the tip is still checked and rejected.
+			blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyApp.Consensus(),
+				emptyMempool{}, sm.EmptyEvidencePool{}, store)
+			require.ErrorContains(t, blockExec.ValidateBlock(state, tip), "invalid block time")
+
+			if tc.malleate != nil {
+				tc.malleate(&state, store)
+			}
+			err := NewHandshaker(stateStore, state, store, genDoc).Handshake(proxyApp)
+			if tc.expErr != "" {
+				require.ErrorContains(t, err, tc.expErr)
+				return
+			}
+			require.NoError(t, err)
+
+			res, err := proxyApp.Query().Info(ctx, proxy.RequestInfo)
+			require.NoError(t, err)
+			require.Equal(t, tipHeight, res.LastBlockHeight)
+
+			state, err = stateStore.Load()
+			require.NoError(t, err)
+			require.Equal(t, tipHeight, state.LastBlockHeight)
+			require.True(t, tip.Time.Equal(state.LastBlockTime))
+		})
+	}
+}
+
+// makeChainWithCountNilTip stores blocks up to tipHeight, applying all but the
+// tip. The tip's last commit has an early Nil precommit, and its time counts
+// that vote, so it differs from what MedianTime gives.
+func makeChainWithCountNilTip(t *testing.T, chainID string, tipHeight int64) (
+	sm.Store, sm.State, *mockBlockStore, *types.GenesisDoc, proxy.AppConns,
+) {
+	t.Helper()
+
+	// Four validators, so three Commit votes still pass VerifyCommit next to a Nil one.
+	const nilVoteIdx = 3
+	privVals := make([]types.PrivValidator, 4)
+	genVals := make([]types.GenesisValidator, len(privVals))
+	for i := range privVals {
+		privVal := types.NewMockPV()
+		pubKey, err := privVal.GetPubKey()
+		require.NoError(t, err)
+		privVals[i] = privVal
+		genVals[i] = types.GenesisValidator{Address: pubKey.Address(), PubKey: pubKey, Power: 10}
+	}
+	genDoc := &types.GenesisDoc{ChainID: chainID, Validators: genVals}
+	require.NoError(t, genDoc.ValidateAndComplete())
+	state, err := sm.MakeGenesisState(genDoc)
+	require.NoError(t, err)
+	state.Version.Consensus.App = kvstore.AppVersion
+
+	stateStore := sm.NewStore(dbm.NewMemDB(), sm.StoreOptions{DiscardABCIResponses: false})
+	t.Cleanup(func() { _ = stateStore.Close() })
+	require.NoError(t, stateStore.Save(state))
+	store := newMockBlockStore(t, nil, state.ConsensusParams)
+
+	app := kvstore.NewInMemoryApplication()
+	proxyApp := proxy.NewAppConns(proxy.NewLocalClientCreator(app), proxy.NopMetrics())
+	require.NoError(t, proxyApp.Start())
+	t.Cleanup(func() {
+		if err := proxyApp.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
+	_, err = proxyApp.Consensus().InitChain(context.Background(), &abci.RequestInitChain{
+		Validators: types.TM2PB.ValidatorUpdates(state.Validators),
+	})
+	require.NoError(t, err)
+
+	blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyApp.Consensus(),
+		emptyMempool{}, sm.EmptyEvidencePool{}, store)
+	lastCommit := &types.Commit{}
+	for height := int64(1); height <= tipHeight; height++ {
+		block, err := state.MakeBlock(height, nil, lastCommit, nil, state.Validators.GetProposer().Address)
+		require.NoError(t, err)
+		if height == tipHeight {
+			countNil := medianTimeCountingNil(t, lastCommit, state.LastValidators)
+			require.False(t, countNil.Equal(block.Time), "the two median rules must disagree")
+			block.Time = countNil
+			store.chain = append(store.chain, block)
+			break
+		}
+		store.chain = append(store.chain, block)
+
+		parts, err := block.MakePartSet(types.BlockPartSizeBytes)
+		require.NoError(t, err)
+		blockID := types.BlockID{Hash: block.Hash(), PartSetHeader: parts.Header()}
+		state, err = blockExec.ApplyBlock(state, blockID, block)
+		require.NoError(t, err)
+
+		lastCommit = &types.Commit{Height: height, BlockID: blockID, Signatures: make([]types.CommitSig, len(privVals))}
+		for i, privVal := range privVals {
+			valIdx, _ := state.LastValidators.GetByAddress(genVals[i].Address)
+			voteBlockID, ts := blockID, block.Time.Add(time.Duration(i+2)*time.Millisecond)
+			if height == tipHeight-1 && i == nilVoteIdx {
+				voteBlockID, ts = types.BlockID{}, block.Time.Add(time.Millisecond)
+			}
+			vote, err := types.MakeVote(privVal, chainID, valIdx, height, 0, cmtproto.PrecommitType, voteBlockID, ts)
+			require.NoError(t, err)
+			lastCommit.Signatures[valIdx] = vote.CommitSig()
+		}
+	}
+
+	return stateStore, state, store, genDoc, proxyApp
+}
+
+// medianTimeCountingNil is the block time rule before Nil precommits were skipped.
+func medianTimeCountingNil(t *testing.T, commit *types.Commit, vals *types.ValidatorSet) time.Time {
+	t.Helper()
+	counted := *commit
+	counted.Signatures = make([]types.CommitSig, len(commit.Signatures))
+	for i, commitSig := range commit.Signatures {
+		if commitSig.BlockIDFlag == types.BlockIDFlagNil {
+			commitSig.BlockIDFlag = types.BlockIDFlagCommit
+		}
+		counted.Signatures[i] = commitSig
+	}
+	medianTime, err := sm.MedianTime(&counted, vals)
+	require.NoError(t, err)
+	return medianTime
+}
