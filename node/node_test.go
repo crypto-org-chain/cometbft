@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -75,6 +77,71 @@ func TestNodeStartStop(t *testing.T) {
 		fmt.Println(err)
 		t.Fatal("timed out waiting for shutdown")
 	}
+}
+
+func TestNodeClosesAppMempool(t *testing.T) {
+	testCases := []struct {
+		name     string
+		malleate func(*cfg.Config)
+		run      func(*testing.T, *Node)
+	}{
+		{
+			name:     "on stop",
+			malleate: func(*cfg.Config) {},
+			run: func(t *testing.T, n *Node) {
+				t.Helper()
+				require.NoError(t, n.Start())
+				require.NoError(t, n.Stop())
+			},
+		},
+		{
+			name: "on start failure after switch start",
+			malleate: func(c *cfg.Config) {
+				c.P2P.PersistentPeers = "bad-addr-without-id"
+			},
+			run: func(t *testing.T, n *Node) {
+				t.Helper()
+				require.ErrorContains(t, n.Start(), "could not dial peers from persistent_peers field")
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := newNodeTestConfig(t, "node_app_mempool_test")
+			defer os.RemoveAll(config.RootDir)
+			config.Mempool.Type = cfg.MempoolTypeApp
+
+			before := guardRoutines()
+			n, err := DefaultNewNode(config, log.TestingLogger())
+			require.NoError(t, err)
+			require.IsType(t, &mempl.AppMempool{}, n.Mempool())
+			require.Greater(t, guardRoutines(), before)
+
+			tc.malleate(config)
+			tc.run(t, n)
+			require.Eventually(t, func() bool { return guardRoutines() == before }, 5*time.Second, 10*time.Millisecond)
+		})
+	}
+}
+
+func guardRoutines() int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	count := 0
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "internal/guard.NewWithInterval") {
+			count++
+		}
+	}
+	return count
 }
 
 func TestSplitAndTrimEmpty(t *testing.T) {

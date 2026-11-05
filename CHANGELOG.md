@@ -9,6 +9,10 @@
 
 ### BUG FIXES
 
+- `[lp2p]` cap per-reactor priority queue to prevent memory-exhaustion DoS
+  ([\#5955](https://github.com/cometbft/cometbft/pull/5955))
+- `[mempool]` AppMempool ABCI response handling, callback/cleanup, and lifecycle
+  ([\#5942](https://github.com/cometbft/cometbft/pull/5942))
 - `[consensus]` skip validation of the stored tip block replayed in the handshake
   ([\#94](https://github.com/crypto-org-chain/cometbft/pull/94))
 

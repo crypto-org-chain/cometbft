@@ -640,6 +640,7 @@ func (n *Node) OnStart() error {
 			if err := n.sw.Stop(); err != nil {
 				n.Logger.Error("error stopping switch during OnStart cleanup", "err", err)
 			}
+			n.closeAppMempool()
 		}
 		if mpListening {
 			if mp, isMP := n.transport.(*p2p.MultiplexTransport); isMP {
@@ -730,6 +731,12 @@ func (n *Node) OnStart() error {
 	return nil
 }
 
+func (n *Node) closeAppMempool() {
+	if amp, ok := n.mempool.(*mempl.AppMempool); ok {
+		amp.Close()
+	}
+}
+
 // OnStop stops the Node. It implements service.Service.
 func (n *Node) OnStop() {
 	n.BaseService.OnStop()
@@ -775,6 +782,7 @@ func (n *Node) OnStop() {
 			n.Logger.Error("Error closing listener", "listener", l, "err", err)
 		}
 	}
+	n.closeAppMempool()
 
 	if pvsc, ok := n.privValidator.(service.Service); ok {
 		if err := pvsc.Stop(); err != nil {

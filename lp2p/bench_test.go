@@ -198,6 +198,7 @@ func (b *perfBench) ConfigLP2PModifier(c *config.LibP2PConfig) {
 	c.Scaler.MinWorkers = 64
 	c.Scaler.MaxWorkers = 128
 	c.Scaler.ThresholdLatency = 500 * time.Millisecond
+	c.Scaler.MaxQueueSize = 0
 }
 
 // CometP2PConfig "maxed out" config for comet-p2p

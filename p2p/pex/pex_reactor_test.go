@@ -14,6 +14,7 @@ import (
 
 	"github.com/cometbft/cometbft/config"
 	"github.com/cometbft/cometbft/libs/log"
+	"github.com/cometbft/cometbft/libs/service"
 	"github.com/cometbft/cometbft/p2p"
 	"github.com/cometbft/cometbft/p2p/mock"
 	tmp2p "github.com/cometbft/cometbft/proto/tendermint/p2p"
@@ -479,11 +480,12 @@ func TestPEXReactorSeedModeFlushStop(t *testing.T) {
 	}
 
 	// by now the FlushStop should have happened. Try stopping the peer.
-	// it should be safe to do this.
+	// it should be safe to do this. The seed may have already disconnected it.
 	peers := switches[0].Peers().Copy()
 	for _, peer := range peers {
-		err := peer.Stop()
-		require.NoError(t, err)
+		if err := peer.Stop(); err != nil {
+			require.ErrorIs(t, err, service.ErrAlreadyStopped)
+		}
 	}
 
 	// stop the switches
