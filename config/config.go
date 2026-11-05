@@ -1022,7 +1022,10 @@ type MempoolConfig struct {
 	ReapMaxGas uint64 `mapstructure:"reap_max_gas"`
 	// App mempool only: interval between ReapTxs calls when streaming txs from app.
 	ReapInterval time.Duration `mapstructure:"reap_interval"`
-	// App mempool only: delay after which a tx is forgotten for ABCI.CheckTx
+	// App mempool only: how long a tx that failed CheckTx or hit an app error stays in the seen
+	// cache before it can be resubmitted. Retryable codes (>= 32000) use a tenth of it.
+	// A peer tx stays cached until evicted when the app rejects it with a non-retryable code,
+	// panics on it or returns nil.
 	CheckTxRetryDelay time.Duration `mapstructure:"check_tx_retry_delay"`
 }
 
@@ -1101,8 +1104,14 @@ func (cfg *MempoolConfig) ValidateBasic() error {
 		if cfg.SeenCacheSize < 0 {
 			return cmterrors.ErrNegativeField{Field: "seen_cache_size"}
 		}
+		if cfg.SeenCacheSize == 0 {
+			return errors.New("seen_cache_size must be positive when mempool type is \"app\"")
+		}
 		if cfg.ReapInterval <= 0 {
 			return errors.New("reap_interval must be positive when mempool type is \"app\"")
+		}
+		if cfg.CheckTxRetryDelay <= 0 {
+			return errors.New("check_tx_retry_delay must be positive when mempool type is \"app\"")
 		}
 	}
 	return nil
