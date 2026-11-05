@@ -156,7 +156,7 @@ func TestReactorSet(t *testing.T) {
 		}
 
 		// ACT #1: receive for known reactor A
-		rs.Receive("A", "PexRequest", envelopeA, 5)
+		rs.Receive("A", "PexRequest", envelopeA, 5, 0)
 
 		// ASSERT #1: envelope is processed by reactor A
 		require.Eventually(t, func() bool {
@@ -170,7 +170,7 @@ func TestReactorSet(t *testing.T) {
 		assert.Len(t, reactorB.receivedEnvelopes(), 0)
 
 		// ACT #2: receive for unknown reactor name
-		rs.Receive("unknown", "FooBar", envelopeUnknown, 1)
+		rs.Receive("unknown", "FooBar", envelopeUnknown, 1, 0)
 
 		// ASSERT #2: no additional messages are processed
 		assert.Len(t, reactorA.receivedEnvelopes(), 1)
@@ -231,13 +231,13 @@ func TestReactorSet(t *testing.T) {
 
 				// ACT: fill with low priority, push high priority, then overflow low priority
 				for i := 0; i < fillLows; i++ {
-					rs.Receive("A", "Low", envelope, 1)
+					rs.Receive("A", "Low", envelope, 1, 0)
 				}
 				for i := 0; i < highs; i++ {
-					rs.Receive("A", "High", envelope, 5)
+					rs.Receive("A", "High", envelope, 5, 0)
 				}
 				for i := 0; i < extraLows; i++ {
-					rs.Receive("A", "Low", envelope, 1)
+					rs.Receive("A", "Low", envelope, 1, 0)
 				}
 
 				// ASSERT
@@ -257,6 +257,67 @@ func TestReactorSet(t *testing.T) {
 				require.Equal(t, float64(tc.expectedCap-highs), inFlight.value(low))
 				require.Equal(t, float64(highs+extraLows), dropped.value(low))
 				require.True(t, ts.logBuffer.HasMatchingLine("Reactor queue full, dropping message", "reactor=A", "message_type=Low"))
+			})
+		}
+	})
+
+	t.Run("receiveByteBoundedQueue", func(t *testing.T) {
+		const (
+			globalCap   = 16
+			overrideCap = 8
+			messages    = 8
+			msgBytes    = 4
+		)
+		explicitUnbounded, capped := 0, overrideCap
+
+		for _, tc := range []struct {
+			name        string
+			overrides   []config.LibP2PScalerOverride
+			expectedCap int
+		}{
+			{name: "globalCap", expectedCap: globalCap},
+			{
+				name:        "partialOverrideInheritsGlobalCap",
+				overrides:   []config.LibP2PScalerOverride{{Reactor: "A", MaxQueueSize: &capped}},
+				expectedCap: globalCap,
+			},
+			{
+				name:        "overrideCapBeatsGlobalCap",
+				overrides:   []config.LibP2PScalerOverride{{Reactor: "A", MaxQueueBytes: &capped}},
+				expectedCap: overrideCap,
+			},
+			{
+				name:      "explicitZeroOverrideIsUnbounded",
+				overrides: []config.LibP2PScalerOverride{{Reactor: "A", MaxQueueBytes: &explicitUnbounded}},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				configOverride := func(cfg *config.LibP2PConfig) {
+					cfg.Scaler.MaxQueueSize = 0
+					cfg.Scaler.MaxQueueBytes = globalCap
+					cfg.Scaler.Overrides = tc.overrides
+				}
+				ts := newReactorSetTestSuite(t, withLogging(), withModifiedConfig(configOverride))
+				dropped := newMetricRecorder()
+				ts.sw.metrics.MessagesReactorDropped = recordedCounter{dropped, ""}
+
+				rs := newReactorSet(ts.sw)
+				channel := &conn.ChannelDescriptor{ID: 0xF2, RecvMessageCapacity: globalCap + 1}
+				require.NoError(t, rs.Add(ts.newReactor([]*conn.ChannelDescriptor{channel}), "A"))
+
+				envelope := p2p.Envelope{ChannelID: 0xF2, Message: &tmp2p.PexRequest{}}
+				for i := 0; i < messages; i++ {
+					rs.Receive("A", "Low", envelope, 1, msgBytes)
+				}
+
+				queued := messages * msgBytes
+				if tc.expectedCap > 0 {
+					queued = tc.expectedCap
+				}
+				require.Equal(t, queued, rs.reactors[0].queue.Bytes())
+				require.Equal(t, float64(messages-queued/msgBytes), dropped.value("message_type,Low,reactor,A"))
+				require.Equal(t, tc.expectedCap > 0,
+					ts.logBuffer.HasMatchingLine("max_queue_bytes is below the reactor's largest message", "reactor=A"))
 			})
 		}
 	})
@@ -284,7 +345,7 @@ func TestReactorSet(t *testing.T) {
 			Message:   &tmp2p.PexRequest{},
 		}
 
-		rs.Receive("A", "PexRequest", envelopeA, 5)
+		rs.Receive("A", "PexRequest", envelopeA, 5, 7)
 
 		// ASSERT
 		// No panic the in the background workers
@@ -303,6 +364,7 @@ func TestReactorSet(t *testing.T) {
 		}
 
 		require.Eventually(t, checkLogContainsPanic, 2*time.Second, 10*time.Millisecond)
+		require.Eventually(t, func() bool { return rs.reactors[0].queue.Bytes() == 0 }, 2*time.Second, 10*time.Millisecond)
 	})
 }
 

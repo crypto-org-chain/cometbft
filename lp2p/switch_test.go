@@ -392,6 +392,11 @@ func TestSwitch(t *testing.T) {
 		switchC, reactorC := switchMaker(hostC)
 		switchD, reactorD := switchMaker(hostD)
 
+		var heldBytes atomic.Int64
+		reactorB.OnReceive(func(p2p.Envelope) {
+			heldBytes.Store(int64(switchB.reactors.reactors[0].queue.Bytes()))
+		})
+
 		// Connect all switches to each other.
 		connectSwitches(t, []*Switch{switchA, switchB, switchC, switchD})
 
@@ -405,10 +410,8 @@ func TestSwitch(t *testing.T) {
 
 		// ACT
 		// Broadcast message from A to everyone.
-		switchA.BroadcastAsync(p2p.Envelope{
-			ChannelID: channelID,
-			Message:   &types.RequestEcho{Message: "to infinity and beyond"},
-		})
+		echo := &types.RequestEcho{Message: "to infinity and beyond"}
+		switchA.BroadcastAsync(p2p.Envelope{ChannelID: channelID, Message: echo})
 
 		// ASSERT
 		// All switches use the same protocol derived from channelID.
@@ -421,6 +424,8 @@ func TestSwitch(t *testing.T) {
 
 		require.Eventually(t, msgsChecker(reactorB), time.Second, 20*time.Millisecond)
 		require.Eventually(t, msgsChecker(reactorC), time.Second, 20*time.Millisecond)
+		require.Eventually(t, func() bool { return heldBytes.Load() == int64(echo.Size()) }, time.Second, 20*time.Millisecond)
+		require.Eventually(t, func() bool { return switchB.reactors.reactors[0].queue.Bytes() == 0 }, time.Second, 20*time.Millisecond)
 
 		// A should not receive own broadcast and D is disconnected from A.
 		require.Len(t, reactorA.receivedEnvelopes(), 0)

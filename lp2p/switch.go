@@ -463,7 +463,7 @@ func (s *Switch) handleStream(stream network.Stream) {
 
 	priority := proto.descriptor.Priority
 
-	s.reactors.Receive(reactor.name, messageType, envelope, priority)
+	s.reactors.Receive(reactor.name, messageType, envelope, priority, len(payload))
 }
 
 func (s *Switch) resolvePeer(id peer.ID, connRemoteAddr ma.Multiaddr) (p2p.Peer, error) {
