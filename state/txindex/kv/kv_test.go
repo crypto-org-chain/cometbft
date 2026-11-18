@@ -348,6 +348,202 @@ func TestTxSearchWithCancelation(t *testing.T) {
 	assert.Empty(t, results)
 }
 
+// getCountingDB counts point reads, which TxIndex.Get uses to load a tx.
+type getCountingDB struct {
+	db.DB
+	gets int
+}
+
+func (d *getCountingDB) Get(key []byte) ([]byte, error) {
+	d.gets++
+	return d.DB.Get(key)
+}
+
+func TestTxSearchPagination(t *testing.T) {
+	store := &getCountingDB{DB: db.NewMemDB()}
+	indexer := NewTxIndex(store)
+
+	// Each tx emits the queried event twice, so the index holds two keys per tx.
+	owner := abci.Event{Type: "account", Attributes: []abci.EventAttribute{{Key: "owner", Value: "Ivan", Index: true}}}
+	var txResults []*abci.TxResult
+	for height := int64(1); height <= 3; height++ {
+		for index := uint32(0); index < 2; index++ {
+			txResult := txResultWithEvents([]abci.Event{owner, owner})
+			txResult.Tx = types.Tx(fmt.Sprintf("tx-%d-%d", height, index))
+			txResult.Height = height
+			txResult.Index = index
+			require.NoError(t, indexer.Index(txResult))
+			txResults = append(txResults, txResult)
+		}
+	}
+
+	testCases := []struct {
+		name        string
+		pagSettings txindex.Pagination
+		expected    []int // positions in txResults, which is in ascending order
+	}{
+		{"all ascending", txindex.Pagination{}, []int{0, 1, 2, 3, 4, 5}},
+		{"all descending", txindex.Pagination{OrderDesc: true}, []int{5, 4, 3, 2, 1, 0}},
+		{"first page ascending", txindex.Pagination{Page: 1, PerPage: 4}, []int{0, 1, 2, 3}},
+		{"last partial page", txindex.Pagination{Page: 2, PerPage: 4}, []int{4, 5}},
+		{"first page descending", txindex.Pagination{OrderDesc: true, Page: 1, PerPage: 4}, []int{5, 4, 3, 2}},
+		{"page out of range", txindex.Pagination{Page: 3, PerPage: 4}, nil},
+		{"page zero", txindex.Pagination{Page: 0, PerPage: 4}, nil},
+		{"negative per page", txindex.Pagination{Page: 1, PerPage: -1}, nil},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			store.gets = 0
+
+			results, totalCount, err := indexer.SearchPage(context.Background(), query.MustCompile(`account.owner = 'Ivan'`), tc.pagSettings)
+			require.NoError(t, err)
+			require.Equal(t, len(txResults), totalCount)
+			require.Len(t, results, len(tc.expected))
+			for i, pos := range tc.expected {
+				require.True(t, proto.Equal(txResults[pos], results[i]), "result %d", i)
+			}
+			// only the returned page is loaded from the store
+			require.Equal(t, len(tc.expected), store.gets)
+		})
+	}
+}
+
+func TestTxSearchPageByHash(t *testing.T) {
+	indexer := NewTxIndex(db.NewMemDB())
+	txResult := txResultWithEvents(nil)
+	require.NoError(t, indexer.Index(txResult))
+	q := query.MustCompile(fmt.Sprintf("tx.hash = '%X'", types.Tx(txResult.Tx).Hash()))
+
+	results, totalCount, err := indexer.SearchPage(context.Background(), q, txindex.Pagination{Page: 1, PerPage: 1})
+	require.NoError(t, err)
+	require.Equal(t, 1, totalCount)
+	require.Len(t, results, 1)
+
+	results, totalCount, err = indexer.SearchPage(context.Background(), q, txindex.Pagination{Page: 2, PerPage: 1})
+	require.NoError(t, err)
+	require.Equal(t, 1, totalCount)
+	require.Empty(t, results)
+}
+
+func TestSortTxInfos(t *testing.T) {
+	a1 := txInfo{hash: "a", height: 1, index: 0}
+	b1 := txInfo{hash: "b", height: 1, index: 0} // same position as a1, e.g. corrupt index
+	c2 := txInfo{hash: "c", height: 2, index: 1}
+
+	testCases := []struct {
+		name     string
+		txs      []txInfo
+		desc     bool
+		expected []txInfo
+	}{
+		{"empty", nil, false, nil},
+		{"ascending", []txInfo{c2, b1, a1}, false, []txInfo{a1, b1, c2}},
+		{"descending", []txInfo{a1, c2, b1}, true, []txInfo{c2, b1, a1}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			sortTxInfos(tc.txs, tc.desc)
+			require.Equal(t, tc.expected, tc.txs)
+		})
+	}
+}
+
+// A tx indexed again at another height keeps the event keys of the first one.
+// It must still be returned once, in its latest position.
+func TestTxSearchReindexedTx(t *testing.T) {
+	indexer := NewTxIndex(db.NewMemDB())
+	owner := abci.Event{Type: "account", Attributes: []abci.EventAttribute{{Key: "owner", Value: "Ivan", Index: true}}}
+
+	failed := txResultWithEvents([]abci.Event{owner})
+	failed.Tx = types.Tx("retried")
+	failed.Height = 5
+	failed.Result.Code = abci.CodeTypeOK + 1
+	require.NoError(t, indexer.Index(failed))
+
+	other := txResultWithEvents([]abci.Event{owner})
+	other.Tx = types.Tx("other")
+	other.Height = 7
+	require.NoError(t, indexer.Index(other))
+
+	retried := txResultWithEvents([]abci.Event{owner})
+	retried.Tx = types.Tx("retried")
+	retried.Height = 10
+	require.NoError(t, indexer.Index(retried))
+
+	testCases := []struct {
+		name        string
+		query       string
+		pagSettings txindex.Pagination
+		expected    []*abci.TxResult
+	}{
+		{"ascending", `account.owner = 'Ivan'`, txindex.Pagination{}, []*abci.TxResult{other, retried}},
+		{"descending", `account.owner = 'Ivan'`, txindex.Pagination{OrderDesc: true}, []*abci.TxResult{retried, other}},
+		{"first page", `account.owner = 'Ivan'`, txindex.Pagination{Page: 1, PerPage: 1}, []*abci.TxResult{other}},
+		// the old and new tx.height keys share the same map entry
+		{"height range", `tx.height > 0`, txindex.Pagination{}, []*abci.TxResult{other, retried}},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			results, totalCount, err := indexer.SearchPage(context.Background(), query.MustCompile(tc.query), tc.pagSettings)
+			require.NoError(t, err)
+			require.Equal(t, 2, totalCount)
+			require.Len(t, results, len(tc.expected))
+			for i := range tc.expected {
+				require.True(t, proto.Equal(tc.expected[i], results[i]), "result %d", i)
+			}
+		})
+	}
+}
+
+func TestTxSearchSkipsMissingTx(t *testing.T) {
+	store := db.NewMemDB()
+	indexer := NewTxIndex(store)
+
+	txResult := txResultWithEvents([]abci.Event{
+		{Type: "account", Attributes: []abci.EventAttribute{{Key: "owner", Value: "Ivan", Index: true}}},
+	})
+	require.NoError(t, indexer.Index(txResult))
+	require.NoError(t, store.Delete(types.Tx(txResult.Tx).Hash()))
+
+	results, err := indexer.Search(context.Background(), query.MustCompile(`account.owner = 'Ivan'`))
+	require.NoError(t, err)
+	require.Empty(t, results)
+}
+
+func TestExtractIndexAndEventSeqFromKey(t *testing.T) {
+	testCases := []struct {
+		name     string
+		key      string
+		index    uint32
+		eventSeq string
+		expErr   bool
+	}{
+		{"event key", "account.owner/Ivan/12/3$es$7", 3, "7", false},
+		{"key without event sequence", "sender/addr1/12/3", 3, "0", false},
+		{"value containing separator", "account.owner/a/b/12/3$es$7", 3, "7", false},
+		{"height key", "tx.height/12/12/3$es$0", 3, "0", false},
+		{"non-numeric index", "account.owner/Ivan/12/x$es$7", 0, "", true},
+		{"index overflows uint32", "account.owner/Ivan/12/4294967296$es$7", 0, "", true},
+		{"no separator", "account.owner", 0, "", true},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			index, eventSeq, err := extractIndexAndEventSeqFromKey([]byte(tc.key))
+			if tc.expErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.index, index)
+			require.Equal(t, tc.eventSeq, string(eventSeq))
+		})
+	}
+}
+
 func TestTxSearchDeprecatedIndexing(t *testing.T) {
 	indexer := NewTxIndex(db.NewMemDB())
 
