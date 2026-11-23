@@ -39,6 +39,45 @@ type Batch struct {
 	Ops []*abci.TxResult
 }
 
+// PageSearcher is implemented by indexers that can order and paginate matches
+// before loading them, so a page costs less than loading every match.
+type PageSearcher interface {
+	// SearchPage returns one page of the transactions matching q, ordered by
+	// height and index, and the total number of matches.
+	SearchPage(ctx context.Context, q *query.Query, pagSettings Pagination) ([]*abci.TxResult, int, error)
+}
+
+// Pagination selects one page of search results. A PerPage of 0 returns all
+// matches.
+type Pagination struct {
+	OrderDesc bool
+	Page      int
+	PerPage   int
+}
+
+// Paginate returns the requested page of s, or nil when page is out of range;
+// callers validate page against len(s). A perPage of 0 returns all of s,
+// whatever the page.
+func Paginate[T any](s []T, page, perPage int) []T {
+	if perPage == 0 {
+		return s
+	}
+	// page comes from the request; checking it before multiplying keeps
+	// (page-1)*perPage from overflowing.
+	if page < 1 || perPage < 1 || page-1 > len(s)/perPage {
+		return nil
+	}
+	start := (page - 1) * perPage
+	if start >= len(s) {
+		return nil
+	}
+	end := start + perPage
+	if end > len(s) {
+		end = len(s)
+	}
+	return s[start:end]
+}
+
 // NewBatch creates a new Batch.
 func NewBatch(n int64) *Batch {
 	return &Batch{
